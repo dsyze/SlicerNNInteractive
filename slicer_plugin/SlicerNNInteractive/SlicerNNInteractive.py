@@ -1,5 +1,6 @@
 import io
 import gzip
+import math
 import requests
 import copy
 import threading
@@ -31,6 +32,15 @@ from PythonQt.QtGui import QMessageBox
 
 DEBUG_MODE = False
 
+PLUGIN_VERSION = "1.1.0"
+print("[nni] SlicerNNInteractive build loaded:", PLUGIN_VERSION)
+
+# A volume counts as oblique (and gets rotated to its own acquisition plane) when
+# any IJK axis tilts more than ~2.5 degrees off the nearest RAS axis. The test
+# compares each axis' largest direction-cosine against cos(2.5deg).
+OBLIQUE_COS_THRESHOLD = 0.999
+
+
 PLANE_DISPLAY_SELECTOR_NAMES = {
     "Red": "cbRedDisplayVolume",
     "Yellow": "cbYellowDisplayVolume",
@@ -51,6 +61,16 @@ OUTPUT_SPACING_MAX_MM = 10.0
 # many voxels; reject (truly oblique / multi-slice) when it exceeds it.
 LASSO_SLICE_AXIS_MAX_SPREAD = 2
 
+# Hidden linear transform that aligns a supplemental series to the source volume
+# when their DICOM frames of reference differ (auto-registration).
+SERIES_ALIGNMENT_TRANSFORM_NODE_NAME = "NNInteractiveSeriesAlignment (do not touch)"
+# A registered translation larger than this (mm) is flagged for visual review.
+REGISTRATION_OFFSET_WARN_MM = 30.0
+# Below these magnitudes a registration result is treated as identity (series
+# already aligned) and the transform is discarded to avoid needless resampling.
+REGISTRATION_IDENTITY_TRANSLATION_MM = 1.0
+REGISTRATION_IDENTITY_ROTATION_DEG = 1.0
+
 
 def debug_print(*args):
     if DEBUG_MODE:
@@ -64,6 +84,12 @@ def ensure_synched(func):
     """
 
     def inner(self, *args, **kwargs):
+        if getattr(self, "_alignment_in_progress", False):
+            slicer.util.showStatusMessage(
+                "Series registration in progress; prompt was not sent.", 4000
+            )
+            return
+
         failed_to_sync = False
         uploaded_image = False
 
@@ -118,8 +144,10 @@ class SlicerNNInteractive(ScriptedLoadableModule):
         self.parent.helpText = """
             This is an 3D Slicer extension for using nnInteractive.
 
+            Build: %s
+
             Read more about this plugin here: https://github.com/coendevente/SlicerNNInteractive.
-            """
+            """ % PLUGIN_VERSION
         self.parent.acknowledgementText = """When using SlicerNNInteractive, please cite as described here: https://github.com/coendevente/SlicerNNInteractive?tab=readme-ov-file#citation."""
 
 
@@ -194,6 +222,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Selection Operations-private undo stack: list of (segment_id, mask_uint8).
         self._sel_op_undo_stack = []
         self._sel_op_undo_stack_limit = 10
+        # Series alignment: auto-registration of a supplemental series to the
+        # source volume. Maps (supplemental_id, source_id) -> linear transform
+        # node. While a registration CLI runs, prompts and sync are blocked.
+        self._alignment_transforms = {}
+        self._alignment_cli_node = None
+        self._alignment_cli_observer = None
+        self._alignment_pending = None
+        self._alignment_in_progress = False
+        # Pending (moving_id, source_id) pairs waiting for a free CLI slot. The
+        # three multi-plane display volumes can each need their own registration.
+        self._alignment_queue = []
 
     def setup(self):
         """
@@ -217,6 +256,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             "NativeSeriesInferencePreviewSegmentNode (do not touch)"
         )
         self.output_geometry_node_name = OUTPUT_GEOMETRY_NODE_NAME
+        self.series_alignment_transform_node_name = (
+            SERIES_ALIGNMENT_TRANSFORM_NODE_NAME
+        )
 
         # Set up editor widget
         self.ui.editor_widget.setMaximumNumberOfUndoStates(10)
@@ -275,6 +317,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.setup_prompts()
 
         self.enable_slice_intersections()
+        # Snap slice-view scrolling to each view's own voxel grid so the mouse
+        # wheel lands on real slices, not interpolated in-between frames. State is
+        # installed here from the persisted setting; init_ui_functionality only
+        # reflects it in the checkbox (with signals blocked).
+        self._slice_snap_observers = []
+        self._snapping_in_progress = False
+        self._snap_last_offset = {}
+        self._refresh_slice_snap()
         self.init_ui_functionality()
 
         _ = self.get_current_segment_id()
@@ -321,6 +371,190 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         )
         return True
 
+    def _get_snap_slices_setting(self):
+        """Read whether scrolling snaps to the original voxel grid. Default True."""
+        v = qt.QSettings().value("SlicerNNInteractive/snap_slices_to_grid", True)
+        if isinstance(v, str):
+            return v.lower() == "true"
+        return bool(v)
+
+    def _iter_standard_slice_logics(self):
+        """Yield (view_name, sliceLogic, sliceNode) for the three standard views.
+
+        Views not currently realized in the layout are skipped.
+        """
+        layout_manager = slicer.app.layoutManager()
+        if layout_manager is None:
+            return
+        for view_name in PLANE_DISPLAY_SELECTOR_NAMES:
+            slice_widget = layout_manager.sliceWidget(view_name)
+            if slice_widget is None:
+                continue
+            slice_logic = slice_widget.sliceLogic()
+            slice_node = slice_widget.mrmlSliceNode()
+            if slice_logic is None or slice_node is None:
+                continue
+            yield view_name, slice_logic, slice_node
+
+    def _view_background_volume(self, view_name):
+        """Return the background volume node for one slice view, or None."""
+        layout_manager = slicer.app.layoutManager()
+        if layout_manager is None:
+            return None
+        slice_widget = layout_manager.sliceWidget(view_name)
+        if slice_widget is None:
+            return None
+        composite_node = slice_widget.mrmlSliceCompositeNode()
+        if composite_node is None:
+            return None
+        volume_id = composite_node.GetBackgroundVolumeID()
+        if not volume_id:
+            return None
+        return slicer.mrmlScene.GetNodeByID(volume_id)
+
+    def _volume_is_oblique(self, volume):
+        """True when the volume's axes are not aligned with the RAS axes.
+
+        Each column of the IJK-to-RAS direction matrix is a unit IJK axis. An
+        axis-aligned volume has one component at magnitude 1 and the rest near 0
+        in every column. We flag the volume oblique when any column's largest
+        component drops below cos(threshold), i.e. that axis is tilted off RAS.
+        """
+        if volume is None:
+            return False
+        get_dirs = getattr(volume, "GetIJKToRASDirectionMatrix", None)
+        if get_dirs is None:
+            return False
+        matrix = vtk.vtkMatrix4x4()
+        get_dirs(matrix)
+        for col in range(3):
+            largest = max(abs(matrix.GetElement(row, col)) for row in range(3))
+            if largest < OBLIQUE_COS_THRESHOLD:
+                return True
+        return False
+
+    def _align_views_to_volume_planes(self):
+        """Rotate oblique-series views to their acquisition plane, then snap.
+
+        For an obliquely acquired series the standard RAS views reslice it at an
+        angle, so scrolling never lands on the real acquired slices. Rotating each
+        view to the volume plane straightens the image, aligns the slice-
+        intersection cross to the real series axes, and makes one view step
+        through the original slices. Axis-aligned volumes are left untouched
+        (rotating would be a no-op and could override a manual orientation). After
+        rotating, snap the offset onto the nearest slice center.
+        """
+        if getattr(self, "_snapping_in_progress", False):
+            return
+        self._snapping_in_progress = True
+        try:
+            for view_name, slice_logic, slice_node in (
+                self._iter_standard_slice_logics()
+            ):
+                volume = self._view_background_volume(view_name)
+                rotated = False
+                if volume is not None and self._volume_is_oblique(volume):
+                    slice_node.RotateToVolumePlane(volume)
+                    rotated = True
+                slice_logic.SnapSliceOffsetToIJK()
+                self._snap_last_offset[view_name] = slice_logic.GetSliceOffset()
+        finally:
+            self._snapping_in_progress = False
+
+    def _on_slice_node_modified(
+        self, view_name, slice_logic, caller=None, event=None
+    ):
+        """Re-snap one slice view after its offset changed (guards recursion).
+
+        SnapSliceOffsetToIJK modifies the slice node, which re-fires this same
+        observer; the in-progress flag short-circuits that recursion. ModifiedEvent
+        also fires for non-offset changes (field of view, orientation), so we only
+        act when the offset actually moved since we last saw this view.
+
+        Slicer's default scroll step (~1-2 mm) is often smaller than the voxel
+        spacing (e.g. 5 mm), so a naive nearest-voxel snap bounces back to the
+        same slice every tick. When that happens we detect the scroll direction and
+        force exactly one voxel step so every wheel event advances one real slice.
+        """
+        if self._snapping_in_progress:
+            return
+        before = slice_logic.GetSliceOffset()
+        last = self._snap_last_offset.get(view_name)
+        if last is not None and abs(before - last) < 1e-4:
+            # Offset unchanged; this Modified came from something else. Ignore.
+            return
+        direction = 1.0 if (last is None or before > last) else -1.0
+        self._snapping_in_progress = True
+        try:
+            slice_logic.SnapSliceOffsetToIJK()
+            snapped = slice_logic.GetSliceOffset()
+            # If the snap landed back on the same slice (scroll delta was too
+            # small to cross the half-voxel threshold), nudge one full step in
+            # the scroll direction so every wheel tick advances exactly one layer.
+            if last is not None and abs(snapped - last) < 1e-4:
+                spacing = slice_logic.GetLowestVolumeSliceSpacing()
+                step = spacing[2] if spacing and len(spacing) > 2 else 0.0
+                if step > 1e-4:
+                    slice_logic.SetSliceOffset(last + direction * step)
+                    slice_logic.SnapSliceOffsetToIJK()
+        finally:
+            self._snapping_in_progress = False
+        self._snap_last_offset[view_name] = slice_logic.GetSliceOffset()
+
+    def _install_slice_snap_observers(self):
+        """Observe the three standard slice nodes and snap offsets to the grid."""
+        self._remove_slice_snap_observers()
+        self._snap_last_offset = {}
+        installed = []
+        for view_name, slice_logic, slice_node in self._iter_standard_slice_logics():
+            # Bind this view per-iteration so each callback snaps its own view
+            # (default-arg capture avoids late binding in the loop).
+            callback = (
+                lambda caller, event, name=view_name, logic=slice_logic: (
+                    self._on_slice_node_modified(name, logic, caller, event)
+                )
+            )
+            tag = slice_node.AddObserver(vtk.vtkCommand.ModifiedEvent, callback)
+            self._slice_snap_observers.append((slice_node, tag))
+        # Align the current views at once so the effect is visible immediately.
+        self._align_views_to_volume_planes()
+
+    def _remove_slice_snap_observers(self):
+        """Drop any installed slice-node snap observers."""
+        for slice_node, tag in getattr(self, "_slice_snap_observers", []):
+            if slice_node is not None:
+                slice_node.RemoveObserver(tag)
+        self._slice_snap_observers = []
+
+    def _refresh_slice_snap(self):
+        """Install or remove the snap observers to match the persisted setting."""
+        if not hasattr(self, "_slice_snap_observers"):
+            self._slice_snap_observers = []
+        if not hasattr(self, "_snapping_in_progress"):
+            self._snapping_in_progress = False
+        if not hasattr(self, "_snap_last_offset"):
+            self._snap_last_offset = {}
+        enabled = self._get_snap_slices_setting()
+        if enabled:
+            self._install_slice_snap_observers()
+        else:
+            self._remove_slice_snap_observers()
+
+    def _on_snap_slices_changed(self, checked):
+        """Persist the snap-to-grid toggle and (un)install the observers."""
+        qt.QSettings().setValue(
+            "SlicerNNInteractive/snap_slices_to_grid", bool(checked)
+        )
+        self._refresh_slice_snap()
+        if checked:
+            slicer.util.showStatusMessage(
+                "Slice scrolling now snaps to the original voxel grid.", 4000
+            )
+        else:
+            slicer.util.showStatusMessage(
+                "Slice scrolling restored to Slicer default.", 4000
+            )
+
     def _apply_plane_display_volumes(self, show_status=False):
         """Apply the configured supplemental backgrounds to standard slice views."""
         source_volume = self.get_volume_node()
@@ -354,6 +588,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 )
             return False
 
+        # A new background may be an oblique series; re-align views to it.
+        # Changing the composite node does not fire the slice-node observer.
+        if self._get_snap_slices_setting():
+            self._align_views_to_volume_planes()
+
         if show_status:
             slicer.util.showStatusMessage(
                 "Applied registered per-plane display volumes. "
@@ -381,6 +620,34 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._plane_display_volumes_active = self._apply_plane_display_volumes(
             show_status=True
         )
+        self._align_display_volumes()
+
+    def _align_display_volumes(self):
+        """Auto-register each per-plane display volume to the source volume.
+
+        Display volumes only sharpen the 2D views, but a background drawn from a
+        series with a different DICOM frame of reference would still be shown at
+        the wrong physical location. Aligning them keeps the slice intersections
+        honest. Registration is asynchronous; the slice view follows the
+        volume's parent transform live, so backgrounds re-place themselves once
+        each registration completes.
+        """
+        source_volume = self.get_volume_node()
+        if source_volume is None or not self._plane_display_snapshot:
+            return
+        # Drop transforms left over from a previous (now stale) source volume so
+        # they are not orphaned when a new alignment overwrites the parent.
+        self._prune_alignment_for_source(source_volume.GetID())
+        seen = set()
+        for volume_id in self._plane_display_snapshot.values():
+            if not volume_id or volume_id == source_volume.GetID():
+                continue
+            if volume_id in seen:
+                continue
+            seen.add(volume_id)
+            display_volume = slicer.mrmlScene.GetNodeByID(volume_id)
+            if display_volume is not None:
+                self._ensure_alignment(display_volume, source_volume)
 
     def _reapply_plane_display_volumes_if_active(self):
         """Restore sticky per-plane backgrounds after Segment Editor activity."""
@@ -424,6 +691,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 4000,
             )
             return
+
+        # Backgrounds changed; re-align views (and straighten any oblique series).
+        if self._get_snap_slices_setting():
+            self._align_views_to_volume_planes()
 
         slicer.util.showStatusMessage(
             "Restored the Segment Editor source volume in all slice views.",
@@ -686,15 +957,28 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._output_geometry_source_id = source_volume.GetID()
         return node
 
-    def _refresh_native_series_inference_ui(self):
+    def _refresh_native_series_inference_ui(self, *args):
         """Update controls after enabling, disabling, or changing the working volume."""
         enabled = self.ui.cbEnableNativeSeriesInference.isChecked()
         active = self._is_native_series_inference_active()
         has_preview = self._inference_result_source_mask is not None
-        self.ui.cbInferenceWorkingVolume.setEnabled(enabled)
+        registering = self._alignment_in_progress
+        self.ui.cbInferenceWorkingVolume.setEnabled(enabled and not registering)
         self.ui.cbInferenceSyncMode.setEnabled(active)
-        self.ui.pbSyncInferenceResult.setEnabled(active and has_preview)
+        # Block sync while a registration runs so a stale preview built on the
+        # old geometry is not merged with the freshly aligned grid.
+        self.ui.pbSyncInferenceResult.setEnabled(
+            active and has_preview and not registering
+        )
         self.ui.pbClearInferencePreview.setEnabled(has_preview)
+        # Alignment preferences also serve the multi-plane display volumes, so
+        # they stay available even when native-series inference is off.
+        self.ui.cbAutoRegisterSupplemental.setEnabled(not registering)
+        self.ui.cbConfirmSeriesAligned.setEnabled(not registering)
+        self.ui.pbRegisterSupplemental.setEnabled(active and not registering)
+        self.ui.pbClearAlignment.setEnabled(
+            bool(self._alignment_transforms) and not registering
+        )
 
     def _on_native_series_inference_settings_changed(self, *args):
         """
@@ -706,6 +990,432 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self.previous_states.pop("image_data", None)
             self.previous_states.pop("image_volume_id", None)
             self.previous_states.pop("segment_data", None)
+        self._sync_supplemental_alignment()
+        self._refresh_native_series_inference_ui()
+
+    # -- Supplemental-series alignment (auto-registration) -------------------
+
+    def _set_registration_status(self, text, warn=False):
+        """Show alignment status both in the panel label and the status bar."""
+        if not hasattr(self, "ui"):
+            return
+        label = self.ui.lblRegistrationStatus
+        label.setText(text)
+        label.setStyleSheet("color: #c0392b;" if warn else "")
+        if text:
+            slicer.util.showStatusMessage(text, 5000)
+
+    def _frame_of_reference_uid(self, volume_node):
+        """
+        Return the DICOM FrameOfReferenceUID (0020,0052) for a volume, or None.
+
+        Two volumes are physically comparable in RAS only when they share this
+        UID. A new mid-exam localizer or repositioning yields a different UID,
+        so equal UIDs mean aligned and different UIDs mean registration is
+        needed. Non-DICOM volumes have no UID and return None (unknown).
+        """
+        if volume_node is None:
+            return None
+        try:
+            db = slicer.dicomDatabase
+            sh = slicer.mrmlScene.GetSubjectHierarchyNode()
+            item = sh.GetItemByDataNode(volume_node) if sh is not None else 0
+            series_uid = sh.GetItemUID(item, "DICOM") if item else ""
+            if series_uid:
+                files = db.filesForSeries(series_uid)
+                if files:
+                    value = db.fileValue(files[0], "0020,0052")
+                    if value:
+                        return value
+            instance_uids = volume_node.GetAttribute("DICOM.instanceUIDs")
+            if instance_uids:
+                first = instance_uids.split()[0]
+                value = db.fileValueForInstance(first, "0020,0052")
+                if value:
+                    return value
+        except Exception as exc:
+            print("[nni] frame-of-reference lookup failed: %s" % exc)
+        return None
+
+    def _series_aligned(self, supplemental, source):
+        """True/False if both frames of reference are known, else None."""
+        supp_for = self._frame_of_reference_uid(supplemental)
+        src_for = self._frame_of_reference_uid(source)
+        if not supp_for or not src_for:
+            return None
+        return supp_for == src_for
+
+    def _attach_alignment_transform(self, supplemental, transform):
+        """Parent the supplemental volume under its alignment transform."""
+        if supplemental is not None and transform is not None:
+            supplemental.SetAndObserveTransformNodeID(transform.GetID())
+
+    def _drop_alignment_entry(self, key):
+        """Detach and delete the transform cached for one (supp, source) pair."""
+        transform = self._alignment_transforms.pop(key, None)
+        supp = slicer.mrmlScene.GetNodeByID(key[0])
+        if (
+            supp is not None
+            and transform is not None
+            and supp.GetTransformNodeID() == transform.GetID()
+        ):
+            supp.SetAndObserveTransformNodeID(None)
+        if transform is not None and slicer.mrmlScene.IsNodePresent(transform):
+            slicer.mrmlScene.RemoveNode(transform)
+
+    def _remove_alignment_transforms(self):
+        """Detach and delete every cached alignment transform."""
+        self._alignment_queue = []
+        for key in list(self._alignment_transforms.keys()):
+            self._drop_alignment_entry(key)
+
+    def _cancel_active_registration(self):
+        """Tear down an in-flight registration so cleanup cannot dangle.
+
+        The CLI observer is added directly on the node (not via
+        VTKObservationMixin), so removeObservers() would not catch it, and the
+        pending transform is not yet cached. Remove both explicitly.
+        """
+        cli = self._alignment_cli_node
+        if cli is not None:
+            if self._alignment_cli_observer is not None:
+                try:
+                    cli.RemoveObserver(self._alignment_cli_observer)
+                except Exception:
+                    pass
+            try:
+                cli.Cancel()
+            except Exception:
+                pass
+        if self._alignment_pending is not None:
+            node = slicer.mrmlScene.GetNodeByID(self._alignment_pending[2])
+            if node is not None and slicer.mrmlScene.IsNodePresent(node):
+                slicer.mrmlScene.RemoveNode(node)
+        self._alignment_cli_observer = None
+        self._alignment_cli_node = None
+        self._alignment_pending = None
+        self._alignment_in_progress = False
+        self._alignment_queue = []
+
+    def _prune_alignment_for_source(self, source_id):
+        """Drop cached transforms that target a stale (no longer current) source."""
+        for key in list(self._alignment_transforms.keys()):
+            if key[1] != source_id:
+                self._drop_alignment_entry(key)
+
+    def _on_alignment_geometry_changed(self):
+        """Force the next prompt to re-upload after the working geometry moved."""
+        self._destroy_inference_preview()
+        if hasattr(self, "previous_states"):
+            self.previous_states.pop("image_data", None)
+            self.previous_states.pop("image_volume_id", None)
+            self.previous_states.pop("segment_data", None)
+
+    def _sync_supplemental_alignment(self):
+        """Align the native-series working volume after a settings change."""
+        if not hasattr(self, "ui"):
+            return
+        source = self.get_volume_node()
+        if source is not None:
+            # A stale source invalidates transforms that targeted it; drop them.
+            # Transforms for the current source stay attached and cached.
+            self._prune_alignment_for_source(source.GetID())
+        if not self._is_native_series_inference_active():
+            self._set_registration_status("", False)
+            return
+        self._ensure_alignment(self.get_inference_volume_node(), source)
+
+    def _ensure_alignment(self, supplemental, source, force=False):
+        """
+        Make sure the supplemental volume is aligned to the source volume.
+
+        Reuses a cached transform when present; otherwise inspects the DICOM
+        frame of reference and, when it differs (or force is set), starts a
+        rigid registration. Unknown frames of reference never auto-register.
+        """
+        if supplemental is None or source is None:
+            return
+        if supplemental.GetID() == source.GetID():
+            return
+        key = (supplemental.GetID(), source.GetID())
+
+        if force:
+            # Re-registering: discard the previous transform so it is not leaked
+            # when the cache entry is overwritten on completion.
+            self._drop_alignment_entry(key)
+
+        cached = self._alignment_transforms.get(key)
+        if (
+            not force
+            and cached is not None
+            and slicer.mrmlScene.IsNodePresent(cached)
+        ):
+            self._attach_alignment_transform(supplemental, cached)
+            self._set_registration_status(
+                "Reusing the existing registration for the supplemental series.",
+                False,
+            )
+            return
+
+        if not force:
+            aligned = self._series_aligned(supplemental, source)
+            if aligned is True:
+                self._set_registration_status(
+                    "Supplemental series shares the source frame of reference; "
+                    "no registration needed.",
+                    False,
+                )
+                return
+            if aligned is None:
+                if self.ui.cbConfirmSeriesAligned.isChecked():
+                    self._set_registration_status(
+                        "Alignment confirmed manually; registration skipped.",
+                        False,
+                    )
+                    return
+                self._set_registration_status(
+                    "Could not read the DICOM frame of reference. Verify "
+                    "alignment visually or click Register now.",
+                    True,
+                )
+                return
+            if not self.ui.cbAutoRegisterSupplemental.isChecked():
+                self._set_registration_status(
+                    "Supplemental series uses a different frame of reference. "
+                    "Click Register now to align it to the source volume.",
+                    True,
+                )
+                return
+
+        self._enqueue_alignment(supplemental, source)
+
+    def _enqueue_alignment(self, moving, fixed):
+        """Queue a (moving -> fixed) registration and start it when a slot frees."""
+        pair = (moving.GetID(), fixed.GetID())
+        pending_pair = (
+            self._alignment_pending[:2] if self._alignment_pending else None
+        )
+        if pair == pending_pair or pair in self._alignment_queue:
+            return
+        self._alignment_queue.append(pair)
+        self._pump_alignment_queue()
+
+    def _pump_alignment_queue(self):
+        """Start the next queued registration if none is currently running."""
+        if self._alignment_in_progress or not self._alignment_queue:
+            return
+        moving_id, fixed_id = self._alignment_queue.pop(0)
+        moving = slicer.mrmlScene.GetNodeByID(moving_id)
+        fixed = slicer.mrmlScene.GetNodeByID(fixed_id)
+        if moving is None or fixed is None:
+            # A queued volume disappeared; skip it and try the next one.
+            self._pump_alignment_queue()
+            return
+        self._start_registration(moving, fixed)
+
+    def _start_registration(self, moving, fixed):
+        """Launch an asynchronous BRAINSFit registration (moving -> fixed)."""
+        if self._alignment_in_progress:
+            return
+        try:
+            brainsfit = slicer.modules.brainsfit
+        except AttributeError:
+            self._set_registration_status(
+                "Registration module (BRAINSFit) is unavailable in this Slicer "
+                "build; cannot auto-align the supplemental series.",
+                True,
+            )
+            return
+
+        transform = slicer.mrmlScene.AddNewNodeByClass(
+            "vtkMRMLLinearTransformNode",
+            self.series_alignment_transform_node_name,
+        )
+        transform.HideFromEditorsOn()
+        transform.SetAttribute(
+            "NNInteractive.AlignmentPair",
+            "%s|%s" % (moving.GetID(), fixed.GetID()),
+        )
+        # Rigid handles patient motion / repositioning; Affine is an escape hatch
+        # when a rigid fit leaves a large residual.
+        transform_type = "Rigid"
+        if (
+            hasattr(self.ui, "cbRegistrationMode")
+            and self.ui.cbRegistrationMode.currentText == "Affine"
+        ):
+            transform_type = "Rigid,Affine"
+        params = {
+            "fixedVolume": fixed.GetID(),
+            "movingVolume": moving.GetID(),
+            "linearTransform": transform.GetID(),
+            "transformType": transform_type,
+            "initializeTransformMode": "useMomentsAlign",
+            "costMetric": "MMI",
+            "samplingPercentage": 0.02,
+        }
+        self._alignment_in_progress = True
+        self._alignment_pending = (
+            moving.GetID(),
+            fixed.GetID(),
+            transform.GetID(),
+        )
+        self._set_registration_status(
+            "Registering the supplemental series to the source volume...",
+            False,
+        )
+        self._refresh_native_series_inference_ui()
+        try:
+            cli_node = slicer.cli.run(
+                brainsfit, None, params, wait_for_completion=False
+            )
+        except Exception as exc:
+            slicer.mrmlScene.RemoveNode(transform)
+            self._alignment_in_progress = False
+            self._alignment_pending = None
+            self._set_registration_status(
+                "Could not start registration: %s" % exc, True
+            )
+            self._refresh_native_series_inference_ui()
+            return
+        self._alignment_cli_node = cli_node
+        self._alignment_cli_observer = cli_node.AddObserver(
+            slicer.vtkMRMLCommandLineModuleNode.StatusModifiedEvent,
+            self._on_registration_status_modified,
+        )
+
+    def _on_registration_status_modified(self, cli_node, event):
+        """Finish once the registration CLI reaches a terminal state."""
+        if cli_node.IsBusy():
+            return
+        self._finish_registration(cli_node, cli_node.GetStatusString())
+
+    def _finish_registration(self, cli_node, status):
+        """Attach the transform on success or clean up and warn on failure."""
+        if not self._alignment_in_progress:
+            return
+        self._alignment_in_progress = False
+        pending = self._alignment_pending
+        self._alignment_pending = None
+        if self._alignment_cli_observer is not None:
+            cli_node.RemoveObserver(self._alignment_cli_observer)
+        self._alignment_cli_observer = None
+        self._alignment_cli_node = None
+
+        moving_id, fixed_id, transform_id = pending
+        moving = slicer.mrmlScene.GetNodeByID(moving_id)
+        transform = slicer.mrmlScene.GetNodeByID(transform_id)
+        if slicer.mrmlScene.IsNodePresent(cli_node):
+            slicer.mrmlScene.RemoveNode(cli_node)
+
+        if status == "Completed" and moving is not None and transform is not None:
+            offset = self._transform_translation_mm(transform)
+            rotation = self._transform_rotation_deg(transform)
+            if (
+                offset <= REGISTRATION_IDENTITY_TRANSLATION_MM
+                and rotation <= REGISTRATION_IDENTITY_ROTATION_DEG
+            ):
+                # Frames of reference differ in name only; the series are already
+                # aligned. Drop the transform to avoid needless resampling.
+                slicer.mrmlScene.RemoveNode(transform)
+                self._set_registration_status(
+                    "Supplemental series is already aligned with the source "
+                    "volume (registration was near-identity).",
+                    False,
+                )
+            else:
+                self._attach_alignment_transform(moving, transform)
+                self._alignment_transforms[(moving_id, fixed_id)] = transform
+                self._enable_slice_intersections()
+                self._set_registration_status(
+                    "Registered the supplemental series to the source volume "
+                    "(translation %.1f mm, rotation %.1f deg). Verify alignment "
+                    "with slice intersections." % (offset, rotation),
+                    offset > REGISTRATION_OFFSET_WARN_MM,
+                )
+        else:
+            if transform is not None and slicer.mrmlScene.IsNodePresent(transform):
+                slicer.mrmlScene.RemoveNode(transform)
+            self._set_registration_status(
+                "Registration failed (%s). The supplemental series is NOT "
+                "aligned; results may be misplaced." % status,
+                True,
+            )
+        # Any outcome (attach, near-identity discard, or failure) can change the
+        # working grid relative to what the server last received -- a forced
+        # re-registration already detached the previous transform. Force the next
+        # prompt to re-upload whenever the active working volume was involved.
+        if self._is_active_working_volume(moving_id):
+            self._on_alignment_geometry_changed()
+        self._refresh_native_series_inference_ui()
+        # Hand off to the next queued registration, if any.
+        self._pump_alignment_queue()
+
+    def _is_active_working_volume(self, volume_id):
+        """True when volume_id is the volume nnInteractive currently analyzes."""
+        if not self._is_native_series_inference_active():
+            return False
+        working = self.get_inference_volume_node()
+        return working is not None and working.GetID() == volume_id
+
+    @staticmethod
+    def _enable_slice_intersections():
+        """Turn on slice intersections so the user can verify alignment."""
+        try:
+            view_nodes = slicer.util.getNodesByClass("vtkMRMLSliceDisplayNode")
+            for node in view_nodes:
+                node.SetIntersectingSlicesVisibility(True)
+        except Exception:
+            # Older Slicer builds expose this differently; verification is a
+            # convenience, so a failure here is non-fatal.
+            pass
+
+    @staticmethod
+    def _transform_translation_mm(transform):
+        """Magnitude of the translation column of a linear transform, in mm."""
+        matrix = vtk.vtkMatrix4x4()
+        transform.GetMatrixTransformToParent(matrix)
+        return (
+            matrix.GetElement(0, 3) ** 2
+            + matrix.GetElement(1, 3) ** 2
+            + matrix.GetElement(2, 3) ** 2
+        ) ** 0.5
+
+    @staticmethod
+    def _transform_rotation_deg(transform):
+        """Rotation angle of a linear transform's 3x3 block, in degrees."""
+        matrix = vtk.vtkMatrix4x4()
+        transform.GetMatrixTransformToParent(matrix)
+        trace = (
+            matrix.GetElement(0, 0)
+            + matrix.GetElement(1, 1)
+            + matrix.GetElement(2, 2)
+        )
+        # Clamp to acos's domain to absorb floating-point and scale/shear noise.
+        cos_angle = max(-1.0, min(1.0, (trace - 1.0) / 2.0))
+        return math.degrees(math.acos(cos_angle))
+
+    def on_register_supplemental_clicked(self, checked=False):
+        """Manually register the current working volume to the source volume."""
+        source = self.get_volume_node()
+        working = self.get_inference_volume_node()
+        if source is None or working is None or source.GetID() == working.GetID():
+            self._set_registration_status(
+                "Select a supplemental working volume different from the source "
+                "volume before registering.",
+                True,
+            )
+            return
+        self._ensure_alignment(working, source, force=True)
+
+    def on_clear_alignment_clicked(self, checked=False):
+        """Remove all alignment transforms and restore original positions."""
+        self._remove_alignment_transforms()
+        self._on_alignment_geometry_changed()
+        self._set_registration_status(
+            "Cleared series alignment; the supplemental series is back to its "
+            "original position.",
+            False,
+        )
         self._refresh_native_series_inference_ui()
 
     @staticmethod
@@ -1046,6 +1756,20 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.pbClearInferencePreview.clicked.connect(
             self.on_clear_inference_preview_clicked
         )
+        self.ui.pbRegisterSupplemental.clicked.connect(
+            self.on_register_supplemental_clicked
+        )
+        self.ui.pbClearAlignment.clicked.connect(
+            self.on_clear_alignment_clicked
+        )
+        # Both alignment preferences change whether/how registration happens, so
+        # toggling either re-evaluates alignment (and discards a stale preview).
+        self.ui.cbAutoRegisterSupplemental.toggled.connect(
+            self._on_native_series_inference_settings_changed
+        )
+        self.ui.cbConfirmSeriesAligned.toggled.connect(
+            self._on_native_series_inference_settings_changed
+        )
         self._refresh_native_series_inference_ui()
 
         # High-resolution output geometry (load persisted prefs with signals
@@ -1058,6 +1782,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         blocked = self.ui.cbEnableHighResOutput.blockSignals(True)
         self.ui.cbEnableHighResOutput.setChecked(self._get_high_res_enabled_setting())
         self.ui.cbEnableHighResOutput.blockSignals(blocked)
+
+        # Snap slice scrolling to the original voxel grid (no interpolated frames).
+        # Observers are already installed from the constructor per the persisted
+        # setting, so set the widget with signals blocked to avoid a redundant
+        # reinstall here.
+        self.ui.cbSnapSlicesToGrid.toggled.connect(self._on_snap_slices_changed)
+        blocked = self.ui.cbSnapSlicesToGrid.blockSignals(True)
+        self.ui.cbSnapSlicesToGrid.setChecked(self._get_snap_slices_setting())
+        self.ui.cbSnapSlicesToGrid.blockSignals(blocked)
 
         # Smooth (interpolated) results. Only honor the persisted preference when
         # the high-resolution output it depends on is actually enabled; otherwise
@@ -1110,6 +1843,24 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         )
         self.ui.pbUndoSelectionOp.clicked.connect(self.on_undo_selection_op_clicked)
         self.ui.sldSegmentOpacity.valueChanged.connect(self._on_segment_opacity_changed)
+        # Non-destructive display smoothing (load persisted prefs with signals
+        # blocked so restoring the widgets does not apply smoothing at startup).
+        self.ui.cbDisplaySmooth.toggled.connect(
+            self._on_display_smooth_enabled_changed
+        )
+        self.ui.sbDisplaySmoothStrength.valueChanged.connect(
+            self._on_display_smooth_strength_changed
+        )
+        self.ui.pbBakeDisplaySmooth.clicked.connect(
+            self.on_bake_display_smooth_clicked
+        )
+        blocked = self.ui.sbDisplaySmoothStrength.blockSignals(True)
+        self.ui.sbDisplaySmoothStrength.setValue(self._get_display_smooth_strength())
+        self.ui.sbDisplaySmoothStrength.blockSignals(blocked)
+        blocked = self.ui.cbDisplaySmooth.blockSignals(True)
+        self.ui.cbDisplaySmooth.setChecked(self._get_display_smooth_enabled())
+        self.ui.cbDisplaySmooth.blockSignals(blocked)
+        self._refresh_display_smooth_ui()
         self.ui.cbEnableLassoClip.toggled.connect(self._on_lasso_clip_enabled_changed)
         self.ui.sbLassoClipN.valueChanged.connect(self._on_lasso_clip_n_changed)
         # Load persisted lasso-clip prefs into the widgets (block signals so
@@ -1244,11 +1995,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         Clean up resources when the module is closed.
         """
         self.removeObservers()
+        self._remove_slice_snap_observers()
 
         # Tear down the hidden lasso (3D) Scissors editor and region/preview nodes.
         self._destroy_lasso3d()
         self._destroy_inference_preview()
         self._remove_output_geometry_node()
+        self._cancel_active_registration()
+        self._remove_alignment_transforms()
 
         if hasattr(self, "_qt_event_filters"):
             for slice_view, event_filter in self._qt_event_filters:
@@ -1558,6 +2312,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         Called when a point is placed in the scene. Grabs the point position
         and sends it to the server.
         """
+        if self._alignment_in_progress:
+            # A registration is running and the prompt would be blocked anyway;
+            # drop the just-placed marker so it does not linger unsent.
+            n = caller.GetNumberOfControlPoints()
+            if n > 0:
+                caller.RemoveNthControlPoint(n - 1)
+            slicer.util.showStatusMessage(
+                "Series registration in progress; point was not sent.", 4000
+            )
+            return
+
         xyz = self.xyz_from_caller(
             caller, volume_node=self.get_inference_volume_node()
         )
@@ -1594,6 +2359,16 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         Every time a control point is placed/moved for the bounding box ROI node.
         Once two corners are placed, we send the bounding box to the server.
         """
+        if self._alignment_in_progress:
+            # A registration is running; discard the partial box and reset the
+            # two-corner state so the next placement starts cleanly.
+            caller.RemoveAllControlPoints()
+            self.prev_caller = None
+            slicer.util.showStatusMessage(
+                "Series registration in progress; box was not sent.", 4000
+            )
+            return
+
         xyz = self.xyz_from_caller(
             caller, volume_node=self.get_inference_volume_node()
         )
@@ -2170,6 +2945,225 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             "SlicerNNInteractive/segment_opacity", float(value)
         )
 
+    # -- Non-destructive display smoothing (2D + 3D from the closed surface) --
+
+    def _existing_segmentation_node(self):
+        """The current editor segmentation node, or None (never creates one)."""
+        node = self.ui.editor_widget.segmentationNode()
+        if node is None:
+            return None
+        internal_names = {
+            self.scribble_segment_node_name,
+            self.wand_preview_segment_node_name,
+            self.lasso3d_input_segment_node_name,
+            self.lasso3d_preview_segment_node_name,
+            self.inference_preview_segment_node_name,
+        }
+        if node.GetName() in internal_names:
+            return None
+        return node
+
+    @staticmethod
+    def _closed_surface_name():
+        return (
+            slicer.vtkSegmentationConverter
+            .GetSegmentationClosedSurfaceRepresentationName()
+        )
+
+    @staticmethod
+    def _binary_labelmap_name():
+        return (
+            slicer.vtkSegmentationConverter
+            .GetSegmentationBinaryLabelmapRepresentationName()
+        )
+
+    def _get_display_smooth_enabled(self):
+        """Read whether non-destructive display smoothing is on. Default False."""
+        v = qt.QSettings().value(
+            "SlicerNNInteractive/display_smooth_enabled", False
+        )
+        if isinstance(v, str):
+            return v.lower() == "true"
+        return bool(v)
+
+    def _get_display_smooth_strength(self):
+        """Read the display smoothing strength in [0, 1]. Default 0.5."""
+        try:
+            v = float(
+                qt.QSettings().value(
+                    "SlicerNNInteractive/display_smooth_strength", 0.5
+                )
+            )
+        except (TypeError, ValueError):
+            v = 0.5
+        return float(min(1.0, max(0.0, v)))
+
+    def _current_display_smooth_strength(self):
+        """Strength from the spin box, falling back to the persisted value."""
+        if hasattr(self, "ui"):
+            try:
+                v = float(self.ui.sbDisplaySmoothStrength.value)
+            except (TypeError, ValueError):
+                v = self._get_display_smooth_strength()
+            return float(min(1.0, max(0.0, v)))
+        return self._get_display_smooth_strength()
+
+    def _apply_display_smoothing(self):
+        """Smooth the closed surface and render 2D + 3D from it (non-destructive).
+
+        Sets a segmentation-level "Smoothing factor" (a windowed-sinc pass that
+        Slicer re-applies whenever the surface is rebuilt) and points the segment
+        display node's 2D and 3D preferred representations at the closed surface.
+        The binary labelmap (the stored data) is never modified.
+        """
+        seg_node = self._existing_segmentation_node()
+        if seg_node is None:
+            return
+        display_node = seg_node.GetDisplayNode()
+        if display_node is None:
+            return
+        try:
+            segmentation = seg_node.GetSegmentation()
+            strength = self._current_display_smooth_strength()
+            segmentation.SetConversionParameter("Smoothing factor", str(strength))
+            # Drop any stale surface so it is rebuilt with the current factor.
+            segmentation.RemoveRepresentation(self._closed_surface_name())
+            seg_node.CreateClosedSurfaceRepresentation()
+            surface_name = self._closed_surface_name()
+            display_node.SetPreferredDisplayRepresentationName2D(surface_name)
+            display_node.SetPreferredDisplayRepresentationName3D(surface_name)
+        except Exception as exc:  # noqa: BLE001 - degrade gracefully
+            print("[nni] apply display smoothing failed: %s" % exc)
+
+    def _clear_display_smoothing(self):
+        """Render 2D + 3D from the binary labelmap again (data untouched)."""
+        seg_node = self._existing_segmentation_node()
+        if seg_node is None:
+            return
+        display_node = seg_node.GetDisplayNode()
+        if display_node is None:
+            return
+        try:
+            labelmap_name = self._binary_labelmap_name()
+            display_node.SetPreferredDisplayRepresentationName2D(labelmap_name)
+            display_node.SetPreferredDisplayRepresentationName3D(labelmap_name)
+        except Exception as exc:  # noqa: BLE001 - degrade gracefully
+            print("[nni] clear display smoothing failed: %s" % exc)
+
+    def _refresh_display_smooth_ui(self):
+        """Enable strength/bake only when display smoothing is on."""
+        if not hasattr(self, "ui"):
+            return
+        enabled = self.ui.cbDisplaySmooth.isChecked()
+        self.ui.sbDisplaySmoothStrength.setEnabled(enabled)
+        self.ui.pbBakeDisplaySmooth.setEnabled(enabled)
+
+    def _on_display_smooth_enabled_changed(self, checked):
+        """Persist the toggle and apply or clear the display-only smoothing."""
+        qt.QSettings().setValue(
+            "SlicerNNInteractive/display_smooth_enabled", bool(checked)
+        )
+        if checked:
+            self._apply_display_smoothing()
+        else:
+            self._clear_display_smoothing()
+        self._refresh_display_smooth_ui()
+
+    def _on_display_smooth_strength_changed(self, value):
+        """Persist the strength and re-apply if display smoothing is active."""
+        qt.QSettings().setValue(
+            "SlicerNNInteractive/display_smooth_strength",
+            self._current_display_smooth_strength(),
+        )
+        if hasattr(self, "ui") and self.ui.cbDisplaySmooth.isChecked():
+            self._apply_display_smoothing()
+
+    def _reapply_display_smoothing_if_active(self):
+        """Re-apply display smoothing after the active segmentation changes."""
+        if hasattr(self, "ui") and self.ui.cbDisplaySmooth.isChecked():
+            self._apply_display_smoothing()
+
+    def on_bake_display_smooth_clicked(self, checked=False):
+        """Bake the currently displayed smooth surface back into the segment.
+
+        This is the explicit, destructive "export" step: convert the smoothed
+        closed surface to a binary labelmap on the output grid and store it as
+        the segment data. A snapshot of the original labelmap is restored if any
+        step fails, so a bad conversion never corrupts the segment.
+        """
+        seg_node = self._existing_segmentation_node()
+        segment_id = self.get_current_segment_id()
+        if seg_node is None or not segment_id:
+            slicer.util.showStatusMessage("No segment selected to bake.", 4000)
+            return
+        output_volume = self.get_output_volume_node()
+        if output_volume is None:
+            slicer.util.showStatusMessage("No output volume available.", 4000)
+            return
+
+        original = None
+        try:
+            original = slicer.util.arrayFromSegmentBinaryLabelmap(
+                seg_node, segment_id, output_volume
+            )
+            if original is not None:
+                original = original.copy()
+
+            segmentation = seg_node.GetSegmentation()
+            strength = self._current_display_smooth_strength()
+            segmentation.SetConversionParameter("Smoothing factor", str(strength))
+            segmentation.RemoveRepresentation(self._closed_surface_name())
+            seg_node.CreateClosedSurfaceRepresentation()
+
+            # Rebuild the binary labelmap from the smoothed surface on the output
+            # grid, then read it back as the new segment data.
+            segmentation.SetReferenceImageGeometryParameterFromVolumeNode(
+                output_volume
+            )
+            segmentation.RemoveRepresentation(self._binary_labelmap_name())
+            seg_node.CreateBinaryLabelmapRepresentation()
+            baked = slicer.util.arrayFromSegmentBinaryLabelmap(
+                seg_node, segment_id, output_volume
+            )
+            if baked is None:
+                raise RuntimeError("Could not rebuild labelmap from surface.")
+
+            slicer.util.updateSegmentBinaryLabelmapFromArray(
+                baked.astype(np.uint8), seg_node, segment_id, output_volume
+            )
+        except Exception as exc:  # noqa: BLE001 - never leave bad data
+            print("[nni] bake smoothed surface failed: %s" % exc)
+            if original is not None:
+                try:
+                    slicer.util.updateSegmentBinaryLabelmapFromArray(
+                        original.astype(np.uint8),
+                        seg_node,
+                        segment_id,
+                        output_volume,
+                    )
+                except Exception:
+                    pass
+            slicer.util.showStatusMessage(
+                "Bake failed; the original segment was restored.", 5000
+            )
+            return
+
+        # The stored data is now smooth, so drop the display-only override and
+        # push the baked mask to the server.
+        if hasattr(self, "ui"):
+            blocked = self.ui.cbDisplaySmooth.blockSignals(True)
+            self.ui.cbDisplaySmooth.setChecked(False)
+            self.ui.cbDisplaySmooth.blockSignals(blocked)
+            qt.QSettings().setValue(
+                "SlicerNNInteractive/display_smooth_enabled", False
+            )
+        self._clear_display_smoothing()
+        self._refresh_display_smooth_ui()
+        self.upload_segment_to_server()
+        slicer.util.showStatusMessage(
+            "Smoothed surface baked into the segment.", 4000
+        )
+
     # -- Lasso slice-range clipping (keep only the lasso slice +/- N) --
 
     def _get_lasso_clip_enabled(self):
@@ -2726,12 +3720,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """Refresh the operand selector when segments are added/removed/renamed."""
         self.populate_operand_selector()
         self._sync_opacity_slider_from_segment()
+        self._reapply_display_smoothing_if_active()
 
     def on_segment_editor_node_modified(self, caller, event):
         """Refresh observers and operand list when the node/segment selection changes."""
         self._observe_active_segmentation()
         self.populate_operand_selector()
         self._sync_opacity_slider_from_segment()
+        self._reapply_display_smoothing_if_active()
 
     # -- ROI operand --
 
