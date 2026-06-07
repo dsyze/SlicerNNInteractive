@@ -3,6 +3,7 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 必须用中文和我交流。这个仓库是用来对这个插件进行二次开发，以满足我们自己的需要。
 dev_docs目录是用来放计划文档跟随进度的，你会和codex协同工作，请合理使用说明文档交流。AGENTS.md是codex的记忆文件。
+加调试输出debug时，如果我没有明确说问题已解决，就不准擅自删除调试代码。
 ## Overview
 
 `SlicerNNInteractive` brings [nnInteractive](https://github.com/MIC-DKFZ/nnInteractive) (deep-learning-based interactive 3D image segmentation) into [3D Slicer](https://www.slicer.org/). It has two independently deployed halves that talk over HTTP:

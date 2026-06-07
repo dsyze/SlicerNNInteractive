@@ -325,15 +325,22 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._snapping_in_progress = False
         self._snap_last_offset = {}
         self._refresh_slice_snap()
-        self.init_ui_functionality()
-
-        _ = self.get_current_segment_id()
-        self.previous_states = {}
 
         # (numpy_axis, center) describing the slice plane of the last lasso
         # prompt. Set only by lasso_points_to_mask and consumed (reset to None)
         # by show_segmentation, so only lasso results get slice-range clipped.
         self._last_lasso_slice = None
+
+        # Multi-view lasso accumulation: OR-combined mask from multiple planes
+        # before a single joint submission.
+        self._accumulated_lasso_mask = None
+        self._multiview_lasso_count = 0
+        self._multiview_lasso_nodes = []  # accumulated lasso nodes kept visible
+
+        self.init_ui_functionality()
+
+        _ = self.get_current_segment_id()
+        self.previous_states = {}
 
         # Sweep any orphaned magic wand seed nodes left behind by earlier
         # versions / earlier reloads so the scene is clean on module load.
@@ -990,6 +997,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self.previous_states.pop("image_data", None)
             self.previous_states.pop("image_volume_id", None)
             self.previous_states.pop("segment_data", None)
+        self._reset_multiview_lasso_accumulation()
         self._sync_supplemental_alignment()
         self._refresh_native_series_inference_ui()
 
@@ -1871,6 +1879,18 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         blocked = self.ui.sbLassoClipN.blockSignals(True)
         self.ui.sbLassoClipN.setValue(self._get_lasso_clip_n())
         self.ui.sbLassoClipN.blockSignals(blocked)
+        # Multi-view lasso controls
+        self.ui.cbLassoMultiView.toggled.connect(self._on_lasso_multiview_toggled)
+        self.ui.pbLassoMultiViewSubmit.clicked.connect(
+            self._on_lasso_multiview_submit_clicked
+        )
+        self.ui.pbLassoMultiViewClear.clicked.connect(
+            self._on_lasso_multiview_clear_clicked
+        )
+        blocked = self.ui.cbLassoMultiView.blockSignals(True)
+        self.ui.cbLassoMultiView.setChecked(self._get_lasso_multiview_enabled())
+        self.ui.cbLassoMultiView.blockSignals(blocked)
+        self._update_multiview_lasso_ui()
         self.populate_operand_selector()
         self._install_selection_op_observers()
         # Initialize operand-row visibility and Apply enable state for the
@@ -2243,6 +2263,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             for i in range(n):
                 node.RemoveNthControlPoint(0)
 
+        self._reset_multiview_lasso_accumulation()
+
     def on_place_button_clicked(self, checked, prompt_name):
         self.setup_prompts(skip_if_exists=True)
 
@@ -2299,6 +2321,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         display_node.SetLineThickness(0.3)
         display_node.SetHandlesInteractive(False)
         display_node.SetTextScale(0)
+        display_node.SetVisibility3D(False)
 
     ###############################################################################
     # Event handlers for prompts
@@ -2452,16 +2475,28 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         Submits the currently open lasso. We gather all the control points,
         rasterize them into a mask, and send the mask to the server.
         """
+        print("[DEBUG submit_lasso] called, multiview={}".format(
+            self._get_lasso_multiview_enabled()))
         caller = self.prompt_types["lasso"]["node"]
         inference_volume = self.get_inference_volume_node()
+
+        # Grab raw RAS curve points for world-space planarity check (robust for
+        # oblique volumes where the RAS->IJK transform scatters voxel indices).
+        from vtk.util.numpy_support import vtk_to_numpy as _vtk_to_numpy
+        _vtk_pts = caller.GetCurvePointsWorld()
+        _ras_pts = _vtk_to_numpy(_vtk_pts.GetData()) if _vtk_pts is not None else np.zeros((0, 3))
+        print("[DEBUG submit_lasso] _ras_pts count:", len(_ras_pts))
+
         xyzs = self.xyz_from_caller(
             caller,
             point_type="curve_point",
             volume_node=inference_volume,
         )
+        print("[DEBUG submit_lasso] xyzs count:", len(xyzs))
 
         if len(xyzs) < 3:
             slicer.util.showStatusMessage("Lasso needs at least 3 points.", 4000)
+            print("[DEBUG submit_lasso] RETURN: fewer than 3 points")
             return
 
         # The lasso prompt only supports points on a single slice plane.
@@ -2469,8 +2504,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # points span multiple slices, lasso_points_to_mask raises -- swallow
         # the error, clear the lasso, and tell the user.
         try:
-            mask = self.lasso_points_to_mask(xyzs, volume_node=inference_volume)
-        except ValueError:
+            mask = self.lasso_points_to_mask(xyzs, ras_points=_ras_pts,
+                                             volume_node=inference_volume)
+            print("[DEBUG submit_lasso] mask ok, sum={}".format(mask.sum()))
+        except ValueError as e:
+            print("[DEBUG submit_lasso] RETURN: ValueError:", e)
             slicer.util.showStatusMessage(
                 "Lasso must be drawn on a slice aligned with the "
                 "segmentation/inference volume; cleared.",
@@ -2481,7 +2519,49 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             return
 
         volume_node = self.get_volume_node()
-        if volume_node:
+        if not volume_node:
+            slicer.util.showStatusMessage("No source volume selected.", 4000)
+            print("[DEBUG submit_lasso] RETURN: no volume node")
+            return
+
+        if self._get_lasso_multiview_enabled():
+            # Multi-view mode: accumulate this plane's mask, don't submit yet.
+            if self._accumulated_lasso_mask is None:
+                self._accumulated_lasso_mask = mask.copy()
+            else:
+                self._accumulated_lasso_mask = np.logical_or(
+                    self._accumulated_lasso_mask, mask
+                ).astype(np.uint8)
+            self._multiview_lasso_count += 1
+            # Disable slice-range clip; multi-view spans multiple planes.
+            self._last_lasso_slice = None
+            self._update_multiview_lasso_ui()
+            slicer.util.showStatusMessage(
+                "Multi-view lasso: {} view(s) accumulated. "
+                "Click Submit to run.".format(self._multiview_lasso_count),
+                3000,
+            )
+
+            def _next_mv():
+                # Rename the just-accumulated node so remove_prompt_nodes
+                # won't destroy it, then style it as an "accumulated" overlay.
+                current_node = self.prompt_types["lasso"]["node"]
+                if current_node is not None:
+                    idx = len(self._multiview_lasso_nodes)
+                    current_node.SetName("LassoPromptMV_{}".format(idx))
+                    dn = current_node.GetDisplayNode()
+                    if dn:
+                        dn.SetSliceProjection(True)
+                        dn.SetHandlesInteractive(False)
+                        dn.SetOutlineOpacity(0.35)
+                        dn.SetColor(0.4, 0.6, 1.0)
+                        dn.SetVisibility3D(False)
+                    self._multiview_lasso_nodes.append(current_node)
+                self.setup_prompts()
+                self.ui.pbInteractionLasso.click()
+
+            qt.QTimer.singleShot(0, _next_mv)
+        else:
             self.lasso_or_scribble_prompt(
                 mask=mask,
                 positive_click=self.is_positive,
@@ -2495,8 +2575,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 self.ui.pbInteractionLasso.click()
 
             qt.QTimer.singleShot(0, _next)
-        else:
-            slicer.util.showStatusMessage("No source volume selected.", 4000)
 
     #
     #  -- Scribble
@@ -3191,6 +3269,100 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def _on_lasso_clip_n_changed(self, value):
         """Persist the lasso-clip +/- N slices spin box."""
         qt.QSettings().setValue("SlicerNNInteractive/lasso_clip_n", int(value))
+
+    # -- Multi-view lasso accumulation --
+
+    def _get_lasso_multiview_enabled(self):
+        v = qt.QSettings().value(
+            "SlicerNNInteractive/lasso_multiview_enabled", False
+        )
+        if isinstance(v, str):
+            return v.lower() == "true"
+        return bool(v)
+
+    def _set_lasso_multiview_enabled(self, val):
+        qt.QSettings().setValue(
+            "SlicerNNInteractive/lasso_multiview_enabled", bool(val)
+        )
+
+    def _on_lasso_multiview_toggled(self, checked):
+        self._set_lasso_multiview_enabled(checked)
+        self._accumulated_lasso_mask = None
+        self._multiview_lasso_count = 0
+        self._clear_multiview_lasso_nodes()
+        self._reset_active_lasso_node()
+        self._update_multiview_lasso_ui()
+
+    def _on_lasso_multiview_submit_clicked(self):
+        if self._accumulated_lasso_mask is None or not np.any(
+            self._accumulated_lasso_mask
+        ):
+            return
+        mask = self._accumulated_lasso_mask
+        self._accumulated_lasso_mask = None
+        self._multiview_lasso_count = 0
+        self._clear_multiview_lasso_nodes()
+        self._update_multiview_lasso_ui()
+        inference_volume = self.get_inference_volume_node()
+        if inference_volume is None:
+            slicer.util.showStatusMessage("No inference volume available.", 4000)
+            return
+        self.lasso_or_scribble_prompt(
+            mask=mask,
+            positive_click=self.is_positive,
+            tp="lasso",
+            mask_volume_node=inference_volume,
+        )
+
+    def _on_lasso_multiview_clear_clicked(self):
+        self._accumulated_lasso_mask = None
+        self._multiview_lasso_count = 0
+        self._clear_multiview_lasso_nodes()
+        self._reset_active_lasso_node()
+        self._update_multiview_lasso_ui()
+        slicer.util.showStatusMessage(
+            "Multi-view lasso accumulation cleared.", 2000
+        )
+
+    def _update_multiview_lasso_ui(self):
+        enabled = self._get_lasso_multiview_enabled()
+        has_mask = self._accumulated_lasso_mask is not None and np.any(
+            self._accumulated_lasso_mask
+        )
+        self.ui.pbLassoMultiViewSubmit.setVisible(enabled)
+        self.ui.pbLassoMultiViewClear.setVisible(enabled)
+        self.ui.pbLassoMultiViewSubmit.setEnabled(bool(has_mask))
+        self.ui.pbLassoMultiViewClear.setEnabled(bool(has_mask))
+        count = self._multiview_lasso_count if has_mask else 0
+        self.ui.pbLassoMultiViewSubmit.setText("Submit ({})".format(count))
+
+    def _clear_multiview_lasso_nodes(self):
+        for node in self._multiview_lasso_nodes:
+            try:
+                if slicer.mrmlScene.IsNodePresent(node):
+                    slicer.mrmlScene.RemoveNode(node)
+            except Exception:
+                pass
+        self._multiview_lasso_nodes = []
+
+    def _reset_active_lasso_node(self):
+        """Remove all drawn points from the current active lasso node so it
+        stops rendering in all views (including 3D) without destroying the node."""
+        try:
+            node = self.prompt_types["lasso"]["node"]
+            if node is not None:
+                node.RemoveAllControlPoints()
+        except Exception:
+            pass
+        if hasattr(self, "ui"):
+            self.ui.pbInteractionLassoCancel.setVisible(False)
+
+    def _reset_multiview_lasso_accumulation(self):
+        self._accumulated_lasso_mask = None
+        self._multiview_lasso_count = 0
+        self._clear_multiview_lasso_nodes()
+        if hasattr(self, "ui"):
+            self._update_multiview_lasso_ui()
 
     def _get_high_res_enabled_setting(self):
         """Read whether the high-resolution output grid is enabled. Default False."""
@@ -5425,10 +5597,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         else:
             raise ValueError(f'Unknown point_type {point_type}')
 
-    def lasso_points_to_mask(self, points, volume_node=None):
+    def lasso_points_to_mask(self, points, ras_points=None, volume_node=None):
         """
         Given a list of voxel coords (defining a polygon in one slice),
         returns a 3D mask with that polygon filled in the appropriate slice.
+        ras_points: optional array of world-space (RAS, mm) coordinates for the
+        same curve points -- used for a more robust planarity check on oblique
+        volumes where the RAS->IJK transform inflates voxel-space spread.
         """
         from skimage.draw import polygon
 
@@ -5444,10 +5619,40 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # curve that cannot be treated as a single-slice 2D lasso).
         spreads = [int(pts[:, i].max() - pts[:, i].min()) for i in range(3)]
         const_axis = int(np.argmin(spreads))
-        if spreads[const_axis] > LASSO_SLICE_AXIS_MAX_SPREAD:
-            raise ValueError(
-                "Expected the lasso points to lie on a single slice plane"
-            )
+        print("[DEBUG lasso_to_mask] pts shape={}, spreads={}, const_axis={}, threshold={}".format(
+            pts.shape, spreads, const_axis, LASSO_SLICE_AXIS_MAX_SPREAD))
+        print("[DEBUG lasso_to_mask] pts[:,0] range=[{:.2f},{:.2f}], pts[:,1] range=[{:.2f},{:.2f}], pts[:,2] range=[{:.2f},{:.2f}]".format(
+            float(pts[:,0].min()), float(pts[:,0].max()),
+            float(pts[:,1].min()), float(pts[:,1].max()),
+            float(pts[:,2].min()), float(pts[:,2].max())))
+
+        if ras_points is not None and len(ras_points) >= 3:
+            # SVD-based planarity check in world space (mm).
+            # Works for any slice orientation, including highly oblique volumes
+            # where no RAS axis is "constant" even for a valid single-plane lasso.
+            # For a planar point cloud the smallest singular value s[2] -> 0;
+            # out_of_plane_rms = s[2]/sqrt(N) is the RMS distance from the best-fit
+            # plane and should be < 0.1mm for any slice-view lasso.
+            rp = np.array(ras_points)
+            centered = rp - rp.mean(axis=0)
+            _, s, _ = np.linalg.svd(centered, full_matrices=False)
+            out_of_plane_rms = float(s[2]) / np.sqrt(len(rp))
+            print("[DEBUG lasso_to_mask] SVD s={}, out_of_plane_rms={:.3f}mm".format(
+                [round(float(v), 2) for v in s], out_of_plane_rms))
+            if out_of_plane_rms > 2.0:
+                print("[DEBUG lasso_to_mask] FAIL(SVD): {:.3f}mm > 2mm".format(
+                    out_of_plane_rms))
+                raise ValueError(
+                    "Expected the lasso points to lie on a single slice plane"
+                )
+        else:
+            # Fallback: voxel-space check when no RAS points supplied.
+            if spreads[const_axis] > LASSO_SLICE_AXIS_MAX_SPREAD:
+                print("[DEBUG lasso_to_mask] FAIL(voxel): spread[{}]={} > threshold {}".format(
+                    const_axis, spreads[const_axis], LASSO_SLICE_AXIS_MAX_SPREAD))
+                raise ValueError(
+                    "Expected the lasso points to lie on a single slice plane"
+                )
         const_val = int(round(np.median(pts[:, const_axis])))
 
         # Create a blank 3D mask

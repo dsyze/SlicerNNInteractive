@@ -283,6 +283,52 @@
                 </item>
                </layout>
               </item>
+              <item>
+               <layout class="QHBoxLayout" name="horizontalLayout_lassoMultiView">
+                <item>
+                 <widget class="QCheckBox" name="cbLassoMultiView">
+                  <property name="toolTip">
+                   <string>Accumulate lasso drawings from multiple views before submitting. Draw in each slice plane, then click Submit.</string>
+                  </property>
+                  <property name="text">
+                   <string>Multi-view</string>
+                  </property>
+                 </widget>
+                </item>
+                <item>
+                 <widget class="QPushButton" name="pbLassoMultiViewSubmit">
+                  <property name="enabled">
+                   <bool>false</bool>
+                  </property>
+                  <property name="visible">
+                   <bool>false</bool>
+                  </property>
+                  <property name="toolTip">
+                   <string>Submit all accumulated multi-view lasso masks at once.</string>
+                  </property>
+                  <property name="text">
+                   <string>Submit (0)</string>
+                  </property>
+                 </widget>
+                </item>
+                <item>
+                 <widget class="QPushButton" name="pbLassoMultiViewClear">
+                  <property name="enabled">
+                   <bool>false</bool>
+                  </property>
+                  <property name="visible">
+                   <bool>false</bool>
+                  </property>
+                  <property name="toolTip">
+                   <string>Discard all accumulated multi-view lasso masks.</string>
+                  </property>
+                  <property name="text">
+                   <string>Discard</string>
+                  </property>
+                 </widget>
+                </item>
+               </layout>
+              </item>
              </layout>
             </item>
            </layout>
