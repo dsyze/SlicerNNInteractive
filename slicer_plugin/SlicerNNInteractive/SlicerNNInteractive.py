@@ -331,9 +331,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # by show_segmentation, so only lasso results get slice-range clipped.
         self._last_lasso_slice = None
 
-        # Multi-view lasso accumulation: OR-combined mask from multiple planes
-        # before a single joint submission.
-        self._accumulated_lasso_mask = None
+        # Multi-view lasso accumulation: one mask per drawn plane. On submit
+        # each is sent as a separate lasso interaction (the session accumulates
+        # them), which matches the model's single-plane lasso training better
+        # than OR-ing them into one cross-shaped mask.
+        self._multiview_lasso_masks = []
         self._multiview_lasso_count = 0
         self._multiview_lasso_nodes = []  # accumulated lasso nodes kept visible
 
@@ -2525,14 +2527,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             return
 
         if self._get_lasso_multiview_enabled():
-            # Multi-view mode: accumulate this plane's mask, don't submit yet.
-            if self._accumulated_lasso_mask is None:
-                self._accumulated_lasso_mask = mask.copy()
-            else:
-                self._accumulated_lasso_mask = np.logical_or(
-                    self._accumulated_lasso_mask, mask
-                ).astype(np.uint8)
-            self._multiview_lasso_count += 1
+            # Multi-view mode: keep this plane's mask, don't submit yet. Each
+            # plane is sent as its own lasso interaction on Submit.
+            self._multiview_lasso_masks.append(mask.copy())
+            self._multiview_lasso_count = len(self._multiview_lasso_masks)
             # Disable slice-range clip; multi-view spans multiple planes.
             self._last_lasso_slice = None
             self._update_multiview_lasso_ui()
@@ -3287,19 +3285,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _on_lasso_multiview_toggled(self, checked):
         self._set_lasso_multiview_enabled(checked)
-        self._accumulated_lasso_mask = None
+        self._multiview_lasso_masks = []
         self._multiview_lasso_count = 0
         self._clear_multiview_lasso_nodes()
         self._reset_active_lasso_node()
         self._update_multiview_lasso_ui()
 
     def _on_lasso_multiview_submit_clicked(self):
-        if self._accumulated_lasso_mask is None or not np.any(
-            self._accumulated_lasso_mask
-        ):
+        masks = self._multiview_lasso_masks
+        if not masks:
             return
-        mask = self._accumulated_lasso_mask
-        self._accumulated_lasso_mask = None
+        self._multiview_lasso_masks = []
         self._multiview_lasso_count = 0
         self._clear_multiview_lasso_nodes()
         self._update_multiview_lasso_ui()
@@ -3307,15 +3303,18 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if inference_volume is None:
             slicer.util.showStatusMessage("No inference volume available.", 4000)
             return
-        self.lasso_or_scribble_prompt(
-            mask=mask,
-            positive_click=self.is_positive,
-            tp="lasso",
-            mask_volume_node=inference_volume,
-        )
+        # Send each plane as its own lasso interaction; the server session
+        # accumulates them so the result is constrained by all views.
+        for m in masks:
+            self.lasso_or_scribble_prompt(
+                mask=m,
+                positive_click=self.is_positive,
+                tp="lasso",
+                mask_volume_node=inference_volume,
+            )
 
     def _on_lasso_multiview_clear_clicked(self):
-        self._accumulated_lasso_mask = None
+        self._multiview_lasso_masks = []
         self._multiview_lasso_count = 0
         self._clear_multiview_lasso_nodes()
         self._reset_active_lasso_node()
@@ -3326,14 +3325,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _update_multiview_lasso_ui(self):
         enabled = self._get_lasso_multiview_enabled()
-        has_mask = self._accumulated_lasso_mask is not None and np.any(
-            self._accumulated_lasso_mask
-        )
+        has_mask = len(self._multiview_lasso_masks) > 0
         self.ui.pbLassoMultiViewSubmit.setVisible(enabled)
         self.ui.pbLassoMultiViewClear.setVisible(enabled)
         self.ui.pbLassoMultiViewSubmit.setEnabled(bool(has_mask))
         self.ui.pbLassoMultiViewClear.setEnabled(bool(has_mask))
-        count = self._multiview_lasso_count if has_mask else 0
+        count = len(self._multiview_lasso_masks)
         self.ui.pbLassoMultiViewSubmit.setText("Submit ({})".format(count))
 
     def _clear_multiview_lasso_nodes(self):
@@ -3358,7 +3355,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self.ui.pbInteractionLassoCancel.setVisible(False)
 
     def _reset_multiview_lasso_accumulation(self):
-        self._accumulated_lasso_mask = None
+        self._multiview_lasso_masks = []
         self._multiview_lasso_count = 0
         self._clear_multiview_lasso_nodes()
         if hasattr(self, "ui"):
@@ -5658,26 +5655,43 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Create a blank 3D mask
         mask = np.zeros(shape, dtype=np.uint8)
 
-        # Depending on which axis is constant, extract the 2D polygon and fill the corresponding slice.
-        # Note: our volume is ordered as (z, y, x)
-        if const_axis == 2:
-            x_coords = pts[:, 0]
-            y_coords = pts[:, 1]
-            rr, cc = polygon(y_coords, x_coords, shape=(shape[1], shape[2]))
-            mask[const_val, rr, cc] = 1
-        elif const_axis == 1:
-            x_coords = pts[:, 0]
-            z_coords = pts[:, 2]
-            rr, cc = polygon(z_coords, x_coords, shape=(shape[0], shape[2]))
-            mask[rr, const_val, cc] = 1
-        elif const_axis == 0:
-            y_coords = pts[:, 1]
-            z_coords = pts[:, 2]
-            rr, cc = polygon(z_coords, y_coords, shape=(shape[0], shape[1]))
-            mask[rr, cc, const_val] = 1
+        # Scan-convert the polygon on its best-fit plane *in voxel space*.
+        # The old approach collapsed every point onto a single axis-aligned
+        # voxel slice (const_axis/const_val), which is geometrically wrong when
+        # the slice view is oblique to the voxel grid (reformatted views of an
+        # oblique series): the lasso then spans several voxel slices and the
+        # flattening squashes it into a thin, misplaced sheet. Instead we fit
+        # the plane the contour actually lies on, rasterize the polygon in that
+        # plane's 2D coordinates, then map each filled cell back to voxels.
+        cv = pts.mean(axis=0)
+        _, _, Vt = np.linalg.svd(pts - cv)
+        U, V = Vt[0], Vt[1]  # in-plane orthonormal basis (voxel units)
+        uv = (pts - cv) @ np.column_stack([U, V])  # (n, 2) plane coords
+        umin, vmin = float(uv[:, 0].min()), float(uv[:, 1].min())
+        step = 0.5  # 0.5-voxel oversampling keeps the filled region watertight
+        pu = (uv[:, 0] - umin) / step
+        pv = (uv[:, 1] - vmin) / step
+        H = int(np.ceil(pv.max())) + 1
+        W = int(np.ceil(pu.max())) + 1
+        rr, cc = polygon(pv, pu, shape=(H, W))
+        uu = umin + cc * step
+        vv = vmin + rr * step
+        world = cv[None, :] + uu[:, None] * U[None, :] + vv[:, None] * V[None, :]
+        ijk = np.round(world).astype(int)
+        xi, yi, zi = ijk[:, 0], ijk[:, 1], ijk[:, 2]
+        valid = (
+            (xi >= 0) & (xi < shape[2])
+            & (yi >= 0) & (yi < shape[1])
+            & (zi >= 0) & (zi < shape[0])
+        )
+        mask[zi[valid], yi[valid], xi[valid]] = 1  # mask is (z, y, x)
+        print("[DEBUG lasso_to_mask] oblique raster: filled {} voxels".format(
+            int(mask.sum())))
 
         # Record the lasso plane so show_segmentation can clip the result to
-        # this slice +/- N. xyz axis i maps to numpy mask axis (2 - i).
+        # this slice +/- N. xyz axis i maps to numpy mask axis (2 - i). Only
+        # meaningful for axis-aligned single-view lassos; multi-view sets this
+        # to None at the call site so oblique results are never slice-clipped.
         self._last_lasso_slice = (2 - const_axis, const_val)
 
         return mask
