@@ -1211,6 +1211,29 @@
             </layout>
            </item>
            <item>
+            <widget class="QCheckBox" name="cbEnableSeriesFusion">
+             <property name="toolTip">
+              <string>Fuse the segmentation results of several registered series (e.g. axial, coronal, sagittal acquisitions) into one smooth mask using signed-distance averaging. Each series constrains the boundary in its own high-resolution plane, reducing through-plane staircase artifacts. Enable High-res output and run a lasso prompt on each series (via native-series inference), then click Fuse &amp; apply. Works best with the High-resolution output grid enabled.</string>
+             </property>
+             <property name="text">
+              <string>Fuse multi-series results (SDF average)</string>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QPushButton" name="pbFuseSeries">
+             <property name="visible">
+              <bool>false</bool>
+             </property>
+             <property name="toolTip">
+              <string>SDF-average all collected per-series results into one smooth mask and write it into the current segment (undoable).</string>
+             </property>
+             <property name="text">
+              <string>Fuse &amp; apply (0)</string>
+             </property>
+            </widget>
+           </item>
+           <item>
             <widget class="QCheckBox" name="cbAutoRegisterSupplemental">
              <property name="toolTip">
               <string>When the supplemental series uses a different DICOM frame of reference than the source volume (for example after a mid-exam localizer or repositioning), automatically run a rigid registration so prompts and masks land in the correct place.</string>

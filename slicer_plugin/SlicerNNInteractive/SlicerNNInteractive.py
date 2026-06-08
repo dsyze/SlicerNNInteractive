@@ -204,6 +204,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._inference_result_source_mask = None
         self._inference_preview_target_segment_id = None
         self._inference_preview_source_volume_id = None
+        # Multi-series fusion: latest per-series AI result on the OUTPUT grid,
+        # keyed by inference-volume id. SDF-averaged into one smooth mask on Fuse.
+        self._fusion_results = {}        # volume_id -> uint8 mask (output grid)
+        self._fusion_grid_shape = None   # output (z,y,x) shape the masks belong to
         # Applying per-plane display volumes enables a sticky view override.
         # Hidden Segment Editor widgets may reset slice backgrounds while
         # activating effects, so restore the user's selections afterward.
@@ -988,6 +992,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.pbClearAlignment.setEnabled(
             bool(self._alignment_transforms) and not registering
         )
+        # Multi-series fusion controls.
+        fusion_on = self._get_fusion_enabled()
+        n = len(self._fusion_results)
+        self.ui.pbFuseSeries.setVisible(fusion_on)
+        self.ui.pbFuseSeries.setEnabled(fusion_on and n >= 1)
+        self.ui.pbFuseSeries.setText("Fuse & apply ({})".format(n))
 
     def _on_native_series_inference_settings_changed(self, *args):
         """
@@ -1591,6 +1601,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         )
         # Stored on the canonical output grid (named _source for historical reasons).
         self._inference_result_source_mask = output_mask.astype(np.uint8)
+        self._maybe_collect_fusion_result(output_mask)
         self._inference_preview_target_segment_id = self.get_current_segment_id()
         # Track the source volume identity so we can invalidate if it changes.
         self._inference_preview_source_volume_id = self.get_volume_node().GetID()
@@ -1642,6 +1653,95 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             4000,
         )
 
+    # -- Multi-series fusion (SDF average) --
+
+    def _get_fusion_enabled(self):
+        return hasattr(self, "ui") and self.ui.cbEnableSeriesFusion.isChecked()
+
+    def _maybe_collect_fusion_result(self, output_grid_mask):
+        """Store the latest result for the active inference series, keyed by its
+        volume id, so the Fuse button can SDF-average all series together.
+        Masks must live on the current output grid; stale ones are dropped."""
+        if not self._get_fusion_enabled():
+            return
+        out_shape = self._output_grid_shape()
+        if out_shape is None:
+            return
+        m = np.asarray(output_grid_mask).astype(np.uint8)
+        if tuple(m.shape) != tuple(out_shape):
+            return  # stale grid; skip
+        if self._fusion_grid_shape != tuple(out_shape):
+            # Output grid changed (source / high-res switch); drop stale store.
+            self._fusion_results = {}
+            self._fusion_grid_shape = tuple(out_shape)
+        vid = self.get_inference_volume_node().GetID()
+        self._fusion_results[vid] = m.copy()
+        self._refresh_native_series_inference_ui()
+
+    def _fuse_series_results(self):
+        """SDF-average all collected per-series masks (output grid) into one
+        smooth uint8 mask on the output grid, or None if nothing to fuse."""
+        try:
+            from scipy import ndimage
+        except Exception:
+            return None
+        out_shape = self._output_grid_shape()
+        if out_shape is None:
+            return None
+        masks = [
+            m
+            for m in self._fusion_results.values()
+            if m is not None and tuple(m.shape) == tuple(out_shape) and m.any()
+        ]
+        if not masks:
+            return None
+        output_volume = self.get_output_volume_node()
+        spacing = output_volume.GetSpacing()  # (x, y, z) mm
+        samp = (spacing[2], spacing[1], spacing[0])  # numpy (z, y, x)
+        sdf_sum = np.zeros(out_shape, dtype=np.float32)
+        for m in masks:
+            mb = m.astype(bool)
+            # Positive inside, negative outside (matches the convention used by
+            # _interpolate_mask_to_output_grid). Averaging level sets and
+            # thresholding at zero yields a smooth "mean surface".
+            sdf = (
+                ndimage.distance_transform_edt(mb, sampling=samp)
+                - ndimage.distance_transform_edt(~mb, sampling=samp)
+            ).astype(np.float32)
+            sdf_sum += sdf
+        fused = (sdf_sum / len(masks) >= 0).astype(np.uint8)
+        print("[DEBUG fusion] {} series -> fused voxels {}".format(
+            len(masks), int(fused.sum())))
+        return fused
+
+    def on_fuse_series_clicked(self, checked=False):
+        """SDF-average all collected per-series results and write the smooth
+        combined mask into the current segment (undoable)."""
+        fused = self._fuse_series_results()
+        if fused is None:
+            slicer.util.showStatusMessage(
+                "Collect at least one series result first (run a prompt with "
+                "Fuse enabled).",
+                4000,
+            )
+            return
+        seg_id = self.get_current_segment_id()
+        pre = self.get_segment_data(self.get_output_volume_node()).astype(
+            np.uint8
+        ).copy()
+        self._record_selection_op_undo(seg_id, pre)
+        self.show_segmentation(fused)  # fused already on output grid (replace)
+        self._destroy_inference_preview()
+        self._fusion_results = {}
+        self._refresh_native_series_inference_ui()
+        self.upload_segment_to_server()
+        slicer.util.showStatusMessage("Fused series result applied.", 3000)
+
+    def _on_series_fusion_toggled(self, checked):
+        self._fusion_results = {}
+        self._fusion_grid_shape = None
+        self._refresh_native_series_inference_ui()
+
     def _handle_server_segmentation_result(self, segmentation_mask):
         """Write normal results directly, but stage supplemental results as previews."""
         if not self._is_native_series_inference_active():
@@ -1653,6 +1753,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                     inference_mask, self.get_inference_volume_node()
                 )
                 if smoothed is not None:
+                    self._maybe_collect_fusion_result(smoothed)
                     self.show_segmentation(smoothed)
                     return
                 # Smoothing failed; fall through to plain resampling below.
@@ -1669,6 +1770,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                     "reverted to the source grid."
                 )
                 resampled = inference_mask
+            self._maybe_collect_fusion_result(resampled)
             self.show_segmentation(resampled)
             return
 
@@ -1766,6 +1868,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.pbClearInferencePreview.clicked.connect(
             self.on_clear_inference_preview_clicked
         )
+        self.ui.cbEnableSeriesFusion.toggled.connect(
+            self._on_series_fusion_toggled
+        )
+        self.ui.pbFuseSeries.clicked.connect(self.on_fuse_series_clicked)
         self.ui.pbRegisterSupplemental.clicked.connect(
             self.on_register_supplemental_clicked
         )
