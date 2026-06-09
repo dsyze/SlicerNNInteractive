@@ -32,7 +32,7 @@ from PythonQt.QtGui import QMessageBox
 
 DEBUG_MODE = False
 
-PLUGIN_VERSION = "1.2.2-triplanar-perf"
+PLUGIN_VERSION = "1.2.3-triplanar-trace"
 print("[nni] SlicerNNInteractive build loaded:", PLUGIN_VERSION)
 
 # A volume counts as oblique (and gets rotated to its own acquisition plane) when
@@ -2171,6 +2171,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _handle_server_segmentation_result(self, segmentation_mask):
         """Write normal results directly, but stage supplemental results as previews."""
+        print("[DEBUG triplanar.perf] handle_server_result enter shape={}".format(
+            tuple(np.asarray(segmentation_mask).shape)), flush=True)
         if self._triplanar_mode:
             # Per-view routed result: collect it for fusion and show the combined
             # direction-weighted result instead of a single-series preview.
@@ -3235,6 +3237,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         Uploads lasso or scribble prompt to the server.
         """
+        print("[DEBUG triplanar.perf] lasso_or_scribble_prompt body (sync passed) "
+              "tp={} mask_sum={}".format(tp, int(np.sum(np.asarray(mask)))),
+              flush=True)
         inference_volume = self.get_inference_volume_node()
         if mask_volume_node is None:
             mask_volume_node = inference_volume
@@ -5789,7 +5794,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
             error_message = None
             try:
+                print("[DEBUG triplanar.perf] POST start url={}".format(
+                    args[0] if args else kwargs.get("url")), flush=True)
                 response = requests.post(*args, **kwargs)
+                print("[DEBUG triplanar.perf] POST done status={}".format(
+                    getattr(response, "status_code", None)), flush=True)
                 debug_print('response:', response)
             except requests.exceptions.MissingSchema as e:
                 response = None
@@ -5842,6 +5851,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 self.get_inference_image_data()
             )  # Expected to return (image_data, window, level)
             debug_print(f"self.get_inference_image_data took {time.time() - t0}")
+            _inf = self.get_inference_volume_node()
+            print("[DEBUG triplanar.perf] upload_image enter: series='{}' shape={}"
+                  .format(
+                      _inf.GetName() if _inf else None,
+                      None if image_data is None
+                      else tuple(np.asarray(image_data).shape)),
+                  flush=True)
 
             if image_data is None:
                 debug_print("No image data available to upload.")
@@ -5902,6 +5918,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         Sends the canonical segment sampled on the inference-working grid.
         """
         debug_print("Syncing segment with server...")
+        print("[DEBUG triplanar.perf] upload_segment enter", flush=True)
         try:
             if not self._ensure_inference_image_uploaded():
                 return None
@@ -6023,6 +6040,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         Unpacks data received from server into a full 3D numpy array (bool).
         """
+        print("[DEBUG triplanar.perf] unpack enter bytes={}".format(
+            len(binary_data) if binary_data is not None else None), flush=True)
         if decompress:
             binary_data = binary_data = gzip.decompress(binary_data)
 
