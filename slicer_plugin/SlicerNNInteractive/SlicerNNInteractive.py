@@ -1880,6 +1880,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 sdf = ndimage.gaussian_filter(sdf, sigma=sigma).astype(np.float32)
                 print("[DEBUG fusion.fuse]   id={} thick-axis blur sigma(z,y,x)="
                       "{}".format(vid, tuple(round(float(s), 2) for s in sigma)))
+            else:
+                print("[DEBUG fusion.fuse]   id={} no thick-axis blur "
+                      "(isotropic / oblique)".format(vid))
             sdf_sum += sdf
             n += 1
         if n == 0:
@@ -1942,10 +1945,18 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         mapping = self._ijk_to_ras_axis_map(volume)
         if mapping is None:
+            print("[DEBUG triplanar.classify] '{}' -> oblique (not axis-aligned)"
+                  .format(volume.GetName() if volume else None))
             return "oblique"
         axis_map, spacing = mapping
-        thin_ras = axis_map[int(np.argmin(spacing))]  # 0=R, 1=A, 2=S
-        return {0: "sagittal", 1: "coronal", 2: "axial"}.get(thin_ras, "oblique")
+        thin_ijk = int(np.argmin(spacing))
+        thin_ras = axis_map[thin_ijk]  # 0=R, 1=A, 2=S
+        orient = {0: "sagittal", 1: "coronal", 2: "axial"}.get(thin_ras, "oblique")
+        print("[DEBUG triplanar.classify] '{}' spacing(x,y,z)={} thin_ijk={} "
+              "thin_ras={} -> {}".format(
+                  volume.GetName(), tuple(round(float(s), 3) for s in spacing),
+                  thin_ijk, thin_ras, orient))
+        return orient
 
     def _candidate_series_volumes(self):
         """Scalar volumes that may be a tri-planar series (excludes the hidden
@@ -1964,12 +1975,18 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         the sticky per-plane display snapshot, and enable the high-resolution
         output grid + series fusion. Returns True on a usable (>=2 view)
         assignment; otherwise warns and leaves the user to assign manually."""
+        candidates = self._candidate_series_volumes()
+        print("[DEBUG triplanar.setup] candidate volumes: {}".format(
+            [v.GetName() for v in candidates]))
         by_orientation = {}
-        for v in self._candidate_series_volumes():
+        for v in candidates:
             orient = self._classify_series_orientation(v)
             if orient in TRIPLANAR_ORIENTATION_TO_VIEW and orient not in by_orientation:
                 by_orientation[orient] = v
+        print("[DEBUG triplanar.setup] assignment: {}".format(
+            {o: n.GetName() for o, n in by_orientation.items()}))
         if len(by_orientation) < 2:
+            print("[DEBUG triplanar.setup] FAIL: fewer than 2 distinct orientations")
             slicer.util.showStatusMessage(
                 "Tri-planar mode needs at least two axis-aligned series with "
                 "distinct orientations; assign views manually instead.", 6000
@@ -2003,16 +2020,21 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             for orient, view in TRIPLANAR_ORIENTATION_TO_VIEW.items()
             if orient in by_orientation
         )
+        print("[DEBUG triplanar.setup] applied; snapshot={}, sticky_active={}, "
+              "high-res+fusion enabled".format(
+                  snapshot, self._plane_display_volumes_active))
         slicer.util.showStatusMessage("Tri-planar views: " + assigned, 5000)
         return True
 
     def _on_triplanar_mode_toggled(self, checked):
         """Enter or leave tri-planar multi-series mode."""
+        print("[DEBUG triplanar.mode] toggled -> {}".format(bool(checked)))
         self._set_qsetting(SETTING_TRIPLANAR_ENABLED, bool(checked))
         self._triplanar_mode = bool(checked)
         self._active_inference_volume_override = None
         if checked:
-            self._setup_triplanar_views()
+            ok = self._setup_triplanar_views()
+            print("[DEBUG triplanar.mode] view setup returned {}".format(ok))
         self._refresh_native_series_inference_ui()
 
     @staticmethod
@@ -2051,7 +2073,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         a point placed in the 3D view)."""
         if ras is None:
             return None
-        best_view, best_dist = None, None
+        best_view, best_dist, dists = None, None, {}
         for view_name, _logic, slice_node in self._iter_standard_slice_logics():
             m = slice_node.GetSliceToRAS()
             origin = (m.GetElement(0, 3), m.GetElement(1, 3), m.GetElement(2, 3))
@@ -2062,11 +2084,19 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             dist = abs(
                 sum((ras[i] - origin[i]) * normal[i] for i in range(3)) / nlen
             )
+            dists[view_name] = round(dist, 2)
             if best_dist is None or dist < best_dist:
                 best_view, best_dist = view_name, dist
-        if best_view is not None and best_dist is not None and best_dist <= tolerance_mm:
-            return best_view
-        return None
+        chosen = (
+            best_view
+            if best_view is not None
+            and best_dist is not None
+            and best_dist <= tolerance_mm
+            else None
+        )
+        print("[DEBUG triplanar.view] ras={} plane_dists={} -> {} (tol={}mm)".format(
+            [round(float(c), 1) for c in ras], dists, chosen, tolerance_mm))
+        return chosen
 
     def _route_prompt_to_view(self, ras):
         """In tri-planar mode, set the per-prompt inference override to the series
@@ -2078,16 +2108,16 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             return None
         view = self._view_for_ras_point(ras)
         if view is None:
+            print("[DEBUG triplanar.route] no view plane matched; default volume")
             return None
         series = self._view_background_volume(view)
         if series is None:
+            print("[DEBUG triplanar.route] view {} has no background series".format(
+                view))
             return None
         self._active_inference_volume_override = series
-        debug_print(
-            "[triplanar] routed interaction to view {} (series '{}')".format(
-                view, series.GetName()
-            )
-        )
+        print("[DEBUG triplanar.route] routed to view {} (series '{}')".format(
+            view, series.GetName()))
         return view
 
     def _resample_result_to_output(self, working_mask):
@@ -2117,10 +2147,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """Tri-planar mode: collect the routed per-view result for fusion and
         show the direction-weighted fused combination (no per-series preview)."""
         output_mask = self._resample_result_to_output(segmentation_mask)
+        print("[DEBUG triplanar.result] routed result sum={}, fusion store size={}"
+              .format(int(np.asarray(output_mask).astype(np.uint8).sum()),
+                      len(self._fusion_results)))
         self._maybe_collect_fusion_result(output_mask)
         if not self._maybe_autofuse():
             # Only one series collected so far: show this result directly so the
             # user still gets immediate feedback before a second view is used.
+            print("[DEBUG triplanar.result] not enough series to fuse yet; "
+                  "showing single routed result")
             self.show_segmentation(np.asarray(output_mask).astype(np.uint8))
 
     def _maybe_autofuse(self):
@@ -2131,6 +2166,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             return False
         fused = self._fuse_series_results()
         if fused is None:
+            print("[DEBUG triplanar.autofuse] fuse returned None")
             return False
         seg_id = self.get_current_segment_id()
         if seg_id:
@@ -2139,6 +2175,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             ).astype(np.uint8).copy()
             self._record_selection_op_undo(seg_id, pre)
         self.show_segmentation(fused)
+        print("[DEBUG triplanar.autofuse] fused {} series and displayed".format(
+            len(self._fusion_results)))
         return True
 
     def _handle_server_segmentation_result(self, segmentation_mask):
