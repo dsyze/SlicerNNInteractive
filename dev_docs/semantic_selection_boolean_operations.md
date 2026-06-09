@@ -1,5 +1,12 @@
 # 3D 语义选区布尔操作设计计划
 
+> **状态说明（2026-06，事后补注）**:本文是该功能的**初版设计提案**,部分内容已被实现演进取代,阅读时请以代码为准:
+> - 实现已分化为**四种操作数来源**(`cbOperandSource` -> `OPERAND_SOURCE_ROI/WAND/SEGMENT/LASSO3D`):ROI(盒/球/椭球)、Magic Wand、另一个 Segment、Lasso(3D)。分别见 `selection_operand_magic_wand.md`、`lasso_3d_selection.md`。
+> - 程序化布尔编辑用私有撤销栈 `_sel_op_undo_stack`(嵌入式 Segment Editor 的历史不记录这些改动)。
+> - 同步无需新增 server API:`@ensure_synched` 已在下次 prompt 惰性同步,另有 `pbSyncToServer` 立即同步入口。
+> - 评审文档 `semantic_selection_boolean_operations_review.md` 已指出:Slicer 原生 **Logical operators / Scissors** 已覆盖 segment-to-segment 布尔与 ROI 切割的大部分能力,重点应放在 UI 引导与 server 同步,而非重写算法。
+> - 行号引用基于撰写时代码,改动后需复核。
+
 ## 背景
 
 当前插件已经可以通过 nnInteractive 生成和迭代人体结构分割选区，并支持 point、bounding box、lasso、scribble 等交互提示。用户现在最需要的是在插件的 3D 视图中，对已经生成的语义化结构选区做进一步局部编辑，例如增加一部分、减去一部分、只保留交集，或者用另一个选区替换当前选区。

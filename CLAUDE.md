@@ -67,17 +67,34 @@ The whole client is one large `SlicerNNInteractiveWidget`. Key mechanism: the `@
 
 Prompts are driven by Slicer Markups nodes registered in `self.prompt_types` (point = Fiducial, bbox = ROI, lasso = ClosedCurve), each with an `on_placed` observer that fires the corresponding prompt. The **scribble** prompt is different: it uses a hidden background `qMRMLSegmentEditorWidget` with the Paint effect, and sends the *diff* of consecutive strokes.
 
-All segmentation always applies to the currently selected segment in the embedded Segment Editor. Two hidden nodes are internal scaffolding and are deliberately excluded from `get_segmentation_node()`: `"ScribbleSegmentNode (do not touch)"` (Paint scratch space) and `"MagicWandPreviewSegmentNode (do not touch)"` (see Custom features below).
+All segmentation always applies to the currently selected segment in the embedded Segment Editor. Five hidden nodes are internal scaffolding and are deliberately excluded from `get_segmentation_node()` / `_existing_segmentation_node()` -- the exclusion set is centralized in `_internal_segmentation_node_names()`: `"ScribbleSegmentNode (do not touch)"` (Paint scratch space), `"MagicWandPreviewSegmentNode (do not touch)"`, `"Lasso3dInputSegmentNode (do not touch)"`, `"Lasso3dPreviewSegmentNode (do not touch)"`, and `"NativeSeriesInferencePreviewSegmentNode (do not touch)"` (see Custom features below).
 
 The test class is imported into the module file at the bottom and exposed as `SlicerNNInteractiveTest` so Slicer's `Reload and Test` picks it up.
 
 ### Custom features (secondary development)
 
-These were added on top of upstream nnInteractive and live **entirely in the client** (`SlicerNNInteractive.py`); the server (`server/.../main.py`) is unchanged from upstream, so none of them add or call new endpoints. Design notes and reviews for each live in `dev_docs/`, named `feature_name.md` (proposal) plus `feature_name_review.md` (review) -- e.g. `dev_docs/semantic_selection_boolean_operations.md` and its `_review.md`.
+These were added on top of upstream nnInteractive and live **entirely in the client** (`SlicerNNInteractive.py`); the server (`server/.../main.py`) is unchanged from upstream, so none of them add or call new endpoints. Design notes and reviews live in `dev_docs/`, named `feature_name.md` (proposal) plus optional `feature_name_review.md` (review) -- e.g. `dev_docs/semantic_selection_boolean_operations.md` and its `_review.md`.
 
-- **Selection Operations** -- boolean editing of the current segment (Add = OR, Subtract = AND NOT, Intersect = AND) against one of three operands chosen in `cbOperandSource`: an ROI box (`roi_node_to_mask`, supports box/sphere/ellipsoid and handles oblique volumes via OBB containment), the Magic Wand result, or another segment. Programmatic edits are tracked in a private undo stack (`_sel_op_undo_stack`) because the embedded Segment Editor's history does not capture them.
-- **Magic Wand** -- multi-point positive/negative seeds (`SelectionOpWandSeeds`) drive a client-side mask preview (hidden node `"MagicWandPreviewSegmentNode (do not touch)"`) that, once confirmed, is applied as a Selection Operations operand.
-- **Per-segment opacity** -- the `sldSegmentOpacity` slider; its default persists across sessions via `QSettings` and is applied to newly created segments.
-- **Lasso slice-range clipping** -- when enabled, a lasso result is clipped to the prompt slice +/- N slices. The lasso's constant slice plane is recorded in `_last_lasso_slice` at submit time and consumed once in `show_segmentation`; non-lasso prompts are never clipped.
+**Selection Operations** (`dev_docs/semantic_selection_boolean_operations.md`) -- boolean editing of the current segment (Add = OR, Subtract = AND NOT, Intersect = AND) against one of four operands chosen in `cbOperandSource` (indices are the module constants `OPERAND_SOURCE_ROI/WAND/SEGMENT/LASSO3D`):
+- **ROI operand** -- box/sphere/ellipsoid (`cbRoiShape` -> `ROI_SHAPE_BOX/SPHERE/ELLIPSOID`); `roi_node_to_mask` rasterizes via OBB containment so it is correct on oblique volumes.
+- **Magic Wand operand** (`dev_docs/selection_operand_magic_wand.md`) -- multi-point positive/negative seeds (`SelectionOpWandSeeds`) drive a client-side AI mask preview (hidden node `"MagicWandPreviewSegmentNode (do not touch)"`).
+- **Segment operand** -- boolean against another segment.
+- **Lasso (3D) operand** (`dev_docs/lasso_3d_selection.md`) -- a hidden Segment Editor runs the native Scissors effect; the nnInteractive lasso AI refines it into a preview.
 
-Cross-session preferences live under the `SlicerNNInteractive/` `QSettings` namespace (server URL, `segment_opacity`, `lasso_clip_enabled`, `lasso_clip_n`).
+Programmatic edits are tracked in a private undo stack (`_sel_op_undo_stack`) because the embedded Segment Editor's history does not capture them.
+
+**Slice-view behaviors** (`dev_docs/slice_view_behaviors.md`) -- slice intersections, mouse-wheel scrolling snapped to the original voxel grid (`cbSnapSlicesToGrid`), and automatic re-orientation of RAS views to an oblique series' acquisition plane (`_volume_is_oblique`, `_align_views_to_volume_planes`; `OBLIQUE_COS_THRESHOLD`).
+
+**Multi-plane display volumes** (`dev_docs/multi_plane_display_volumes.md`) -- show a different supplemental volume per slice view (Red/Yellow/Green) as a background, independent of the Segment Editor source volume. Snapshot-then-apply with a sticky reapply after editor effects reset backgrounds.
+
+**Output geometry & smoothing** (`dev_docs/output_geometry_and_smoothing.md`) -- an optional high-resolution isotropic output grid (`cbEnableHighResOutput`, hidden node `OUTPUT_GEOMETRY_NODE_NAME`, voxel-budget guarded) the canonical segment is stored on; coarse->fine SDF/Gaussian interpolation of server results (`cbSmoothInterpolate`, `on_smooth_current_segment_clicked`); and non-destructive 2D+3D display smoothing with bake-on-export (`cbDisplaySmooth`, `pbBakeDisplaySmooth`).
+
+**Native-series inference, registration & fusion** (`dev_docs/multi_series_fusion_and_registration.md`, plus `multi_plane_display_volumes.md`) -- run the AI on a supplemental registered series (`cbEnableNativeSeriesInference`) with a preview-before-merge workflow (sync modes in `cbInferenceSyncMode`); auto-register supplemental series to the source via BRAINSFit when DICOM frames of reference differ (`SERIES_ALIGNMENT_TRANSFORM_NODE_NAME`, a registration queue); and SDF-average several series into one smooth combined mask (`cbEnableSeriesFusion`, `pbFuseSeries`).
+
+**Per-segment opacity** -- the `sldSegmentOpacity` slider; its default persists across sessions and is applied to newly created segments.
+
+**Lasso slice-range clipping** -- when enabled (`cbEnableLassoClip`), a lasso result is clipped to the prompt slice +/- N slices. The lasso's constant slice plane is recorded in `_last_lasso_slice` at submit time and consumed once in `show_segmentation`; non-lasso prompts are never clipped.
+
+**Multi-view lasso** -- accumulate a lasso mask per drawn plane (`cbLassoMultiView`) and submit each as its own lasso interaction so the server session is constrained by all views.
+
+Cross-session preferences live under the `SlicerNNInteractive/` `QSettings` namespace, accessed through the `_get_qsetting` / `_set_qsetting` helpers with key constants named `SETTING_*` (server URL, snap-slices, output spacing, segment opacity, display-smooth enabled/strength, lasso clip enabled/N, lasso multi-view, high-res output, smooth-interpolate). Repeated idioms have shared helpers: `_get_qsetting`/`_set_qsetting` (QSettings), `_safe_add_observer`/`_safe_remove_observer` (VTKObservationMixin guards), `_get_or_create_hidden_segmentation` (hidden preview/scratch segmentations), `_clear_segment_labelmap`, `_internal_segmentation_node_names`. Several manually-managed observers are NOT covered by `removeObservers()` and are torn down explicitly in `cleanup()` (the scribble Paint observer via `_teardown_scribble_observer`, the lasso-3D input observer, and the registration CLI observer).

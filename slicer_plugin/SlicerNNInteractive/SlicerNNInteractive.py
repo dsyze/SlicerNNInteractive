@@ -71,6 +71,30 @@ REGISTRATION_OFFSET_WARN_MM = 30.0
 REGISTRATION_IDENTITY_TRANSLATION_MM = 1.0
 REGISTRATION_IDENTITY_ROTATION_DEG = 1.0
 
+# Operand sources for Selection Operations (cbOperandSource item order).
+OPERAND_SOURCE_ROI = 0
+OPERAND_SOURCE_WAND = 1
+OPERAND_SOURCE_SEGMENT = 2
+OPERAND_SOURCE_LASSO3D = 3
+
+# ROI operand shapes (cbRoiShape item order).
+ROI_SHAPE_BOX = 0
+ROI_SHAPE_SPHERE = 1
+ROI_SHAPE_ELLIPSOID = 2
+
+# QSettings keys (all under the SlicerNNInteractive/ namespace).
+SETTING_SERVER = "SlicerNNInteractive/server"
+SETTING_SNAP_SLICES = "SlicerNNInteractive/snap_slices_to_grid"
+SETTING_OUTPUT_SPACING = "SlicerNNInteractive/output_spacing"
+SETTING_SEGMENT_OPACITY = "SlicerNNInteractive/segment_opacity"
+SETTING_DISPLAY_SMOOTH_ENABLED = "SlicerNNInteractive/display_smooth_enabled"
+SETTING_DISPLAY_SMOOTH_STRENGTH = "SlicerNNInteractive/display_smooth_strength"
+SETTING_LASSO_CLIP_ENABLED = "SlicerNNInteractive/lasso_clip_enabled"
+SETTING_LASSO_CLIP_N = "SlicerNNInteractive/lasso_clip_n"
+SETTING_LASSO_MULTIVIEW_ENABLED = "SlicerNNInteractive/lasso_multiview_enabled"
+SETTING_HIGH_RES_ENABLED = "SlicerNNInteractive/high_res_output_enabled"
+SETTING_SMOOTH_INTERPOLATE_ENABLED = "SlicerNNInteractive/smooth_interpolate_enabled"
+
 
 def debug_print(*args):
     if DEBUG_MODE:
@@ -384,12 +408,45 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         )
         return True
 
+    @staticmethod
+    def _get_qsetting(key, default, cast=None):
+        """Read a QSettings value with an optional typed cast.
+
+        cast=bool reproduces the str->bool handling Qt needs on platforms that
+        store booleans as the strings "true"/"false". cast=int/float fall back
+        to ``default`` when the stored value is not numeric. cast=None returns
+        the raw stored value.
+        """
+        v = qt.QSettings().value(key, default)
+        if cast is bool:
+            if isinstance(v, str):
+                return v.lower() == "true"
+            return bool(v)
+        if cast is int or cast is float:
+            try:
+                return cast(v)
+            except (TypeError, ValueError):
+                return default
+        return v
+
+    @staticmethod
+    def _set_qsetting(key, value):
+        """Persist a QSettings value under the SlicerNNInteractive/ namespace."""
+        qt.QSettings().setValue(key, value)
+
+    def _safe_add_observer(self, node, event, callback):
+        """Add a VTKObservationMixin observer once (no-op if already present)."""
+        if node is not None and not self.hasObserver(node, event, callback):
+            self.addObserver(node, event, callback)
+
+    def _safe_remove_observer(self, node, event, callback):
+        """Remove a VTKObservationMixin observer if present (no-op otherwise)."""
+        if node is not None and self.hasObserver(node, event, callback):
+            self.removeObserver(node, event, callback)
+
     def _get_snap_slices_setting(self):
         """Read whether scrolling snaps to the original voxel grid. Default True."""
-        v = qt.QSettings().value("SlicerNNInteractive/snap_slices_to_grid", True)
-        if isinstance(v, str):
-            return v.lower() == "true"
-        return bool(v)
+        return self._get_qsetting(SETTING_SNAP_SLICES, True, cast=bool)
 
     def _iter_standard_slice_logics(self):
         """Yield (view_name, sliceLogic, sliceNode) for the three standard views.
@@ -555,9 +612,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _on_snap_slices_changed(self, checked):
         """Persist the snap-to-grid toggle and (un)install the observers."""
-        qt.QSettings().setValue(
-            "SlicerNNInteractive/snap_slices_to_grid", bool(checked)
-        )
+        self._set_qsetting(SETTING_SNAP_SLICES, bool(checked))
         self._refresh_slice_snap()
         if checked:
             slicer.util.showStatusMessage(
@@ -760,7 +815,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         else:
             value = float(
                 slicer.util.settingsValue(
-                    "SlicerNNInteractive/output_spacing", 0.0, converter=float
+                    SETTING_OUTPUT_SPACING, 0.0, converter=float
                 )
             )
         if value <= 0.0:
@@ -999,16 +1054,20 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.pbFuseSeries.setEnabled(fusion_on and n >= 1)
         self.ui.pbFuseSeries.setText("Fuse & apply ({})".format(n))
 
-    def _on_native_series_inference_settings_changed(self, *args):
-        """
-        Discard stale previews and force a server resync after changing the
-        inference image. Switching volumes resets the server interaction chain.
-        """
+    def _clear_inference_cache(self):
+        """Drop the inference preview and force the next prompt to re-upload."""
         self._destroy_inference_preview()
         if hasattr(self, "previous_states"):
             self.previous_states.pop("image_data", None)
             self.previous_states.pop("image_volume_id", None)
             self.previous_states.pop("segment_data", None)
+
+    def _on_native_series_inference_settings_changed(self, *args):
+        """
+        Discard stale previews and force a server resync after changing the
+        inference image. Switching volumes resets the server interaction chain.
+        """
+        self._clear_inference_cache()
         self._reset_multiview_lasso_accumulation()
         self._sync_supplemental_alignment()
         self._refresh_native_series_inference_ui()
@@ -1125,11 +1184,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _on_alignment_geometry_changed(self):
         """Force the next prompt to re-upload after the working geometry moved."""
-        self._destroy_inference_preview()
-        if hasattr(self, "previous_states"):
-            self.previous_states.pop("image_data", None)
-            self.previous_states.pop("image_volume_id", None)
-            self.previous_states.pop("segment_data", None)
+        self._clear_inference_cache()
 
     def _sync_supplemental_alignment(self):
         """Align the native-series working volume after a settings change."""
@@ -1662,20 +1717,42 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """Store the latest result for the active inference series, keyed by its
         volume id, so the Fuse button can SDF-average all series together.
         Masks must live on the current output grid; stale ones are dropped."""
-        if not self._get_fusion_enabled():
+        enabled = self._get_fusion_enabled()
+        print("[DEBUG fusion.collect] called, fusion_enabled={}".format(enabled))
+        if not enabled:
             return
         out_shape = self._output_grid_shape()
         if out_shape is None:
+            print("[DEBUG fusion.collect] SKIP: output grid shape is None")
             return
         m = np.asarray(output_grid_mask).astype(np.uint8)
+        print("[DEBUG fusion.collect] mask shape={}, out_shape={}, mask sum={}".format(
+            tuple(m.shape), tuple(out_shape), int(m.sum())))
         if tuple(m.shape) != tuple(out_shape):
+            print("[DEBUG fusion.collect] SKIP: shape mismatch (stale grid)")
             return  # stale grid; skip
         if self._fusion_grid_shape != tuple(out_shape):
             # Output grid changed (source / high-res switch); drop stale store.
+            print("[DEBUG fusion.collect] output grid changed -> clearing store")
             self._fusion_results = {}
             self._fusion_grid_shape = tuple(out_shape)
-        vid = self.get_inference_volume_node().GetID()
+        inf_node = self.get_inference_volume_node()
+        vid = inf_node.GetID()
+        vname = inf_node.GetName()
+        is_native = self._is_native_series_inference_active()
         self._fusion_results[vid] = m.copy()
+        print("[DEBUG fusion.collect] stored under id={} name='{}' "
+              "native_active={}; store now has {} series: {}".format(
+                  vid, vname, is_native, len(self._fusion_results),
+                  [slicer.mrmlScene.GetNodeByID(k).GetName()
+                   if slicer.mrmlScene.GetNodeByID(k) else k
+                   for k in self._fusion_results]))
+        if len(self._fusion_results) == 1 and not is_native:
+            print("[DEBUG fusion.collect] WARNING: only 1 series and "
+                  "native-series inference is OFF -- every result is keyed by "
+                  "the same source volume, so fusing will not change anything. "
+                  "Enable native-series inference and switch the working volume "
+                  "to a different registered series for each plane.")
         self._refresh_native_series_inference_ui()
 
     def _fuse_series_results(self):
@@ -1684,16 +1761,27 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         try:
             from scipy import ndimage
         except Exception:
+            print("[DEBUG fusion.fuse] SKIP: scipy unavailable")
             return None
         out_shape = self._output_grid_shape()
         if out_shape is None:
+            print("[DEBUG fusion.fuse] SKIP: output grid shape is None")
             return None
+        print("[DEBUG fusion.fuse] store has {} series, out_shape={}".format(
+            len(self._fusion_results), tuple(out_shape)))
+        for k, m in self._fusion_results.items():
+            nm = slicer.mrmlScene.GetNodeByID(k)
+            print("[DEBUG fusion.fuse]   series id={} name='{}' shape={} sum={}".format(
+                k, nm.GetName() if nm else "<gone>",
+                None if m is None else tuple(m.shape),
+                None if m is None else int(m.sum())))
         masks = [
             m
             for m in self._fusion_results.values()
             if m is not None and tuple(m.shape) == tuple(out_shape) and m.any()
         ]
         if not masks:
+            print("[DEBUG fusion.fuse] SKIP: no usable masks after filtering")
             return None
         output_volume = self.get_output_volume_node()
         spacing = output_volume.GetSpacing()  # (x, y, z) mm
@@ -1710,15 +1798,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             ).astype(np.float32)
             sdf_sum += sdf
         fused = (sdf_sum / len(masks) >= 0).astype(np.uint8)
-        print("[DEBUG fusion] {} series -> fused voxels {}".format(
-            len(masks), int(fused.sum())))
+        print("[DEBUG fusion.fuse] {} usable series, spacing(x,y,z)={} -> "
+              "fused voxels {}".format(len(masks), tuple(spacing), int(fused.sum())))
         return fused
 
     def on_fuse_series_clicked(self, checked=False):
         """SDF-average all collected per-series results and write the smooth
         combined mask into the current segment (undoable)."""
+        print("[DEBUG fusion.apply] Fuse clicked")
         fused = self._fuse_series_results()
         if fused is None:
+            print("[DEBUG fusion.apply] RETURN: nothing to fuse")
             slicer.util.showStatusMessage(
                 "Collect at least one series result first (run a prompt with "
                 "Fuse enabled).",
@@ -1729,12 +1819,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         pre = self.get_segment_data(self.get_output_volume_node()).astype(
             np.uint8
         ).copy()
+        print("[DEBUG fusion.apply] segment before sum={}, fused sum={}, "
+              "diff voxels={}".format(
+                  int(pre.sum()), int(fused.sum()),
+                  int(np.sum(pre.astype(bool) != fused.astype(bool)))))
         self._record_selection_op_undo(seg_id, pre)
         self.show_segmentation(fused)  # fused already on output grid (replace)
         self._destroy_inference_preview()
         self._fusion_results = {}
         self._refresh_native_series_inference_ui()
         self.upload_segment_to_server()
+        print("[DEBUG fusion.apply] applied; segment written and uploaded")
         slicer.util.showStatusMessage("Fused series result applied.", 3000)
 
     def _on_series_fusion_toggled(self, checked):
@@ -1835,7 +1930,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.uploadProgressGroup.setVisible(False)
 
         # Load the saved server URL (default to an empty string if not set)
-        savedServer = slicer.util.settingsValue("SlicerNNInteractive/server", "")
+        savedServer = self._get_qsetting(SETTING_SERVER, "")
         self.ui.Server.text = savedServer
         self.server = savedServer.rstrip("/")
 
@@ -2118,12 +2213,31 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         self.progressbar.close()
 
+    def _teardown_scribble_observer(self):
+        """Detach the manually-added scribble Paint observer if present.
+
+        It is added via AddObserver (not VTKObservationMixin), so it is not
+        covered by removeObservers(); detach it here so a scribble left
+        mid-stroke does not leak the observer on module close.
+        """
+        if not hasattr(self, "_scribble_labelmap_callback_tag"):
+            return
+        tag = self._scribble_labelmap_callback_tag.get("tag", None)
+        node = getattr(self, "scribble_segment_node", None)
+        if tag and node is not None and slicer.mrmlScene.IsNodePresent(node):
+            try:
+                node.RemoveObserver(tag)
+            except Exception:
+                pass
+        del self._scribble_labelmap_callback_tag
+
     def cleanup(self):
         """
         Clean up resources when the module is closed.
         """
         self.removeObservers()
         self._remove_slice_snap_observers()
+        self._teardown_scribble_observer()
 
         # Tear down the hidden lasso (3D) Scissors editor and region/preview nodes.
         self._destroy_lasso3d()
@@ -2701,11 +2815,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 )  # Clears the active effect
 
             # Optionally clear or reset the segmentation node
-            if hasattr(self, "_scribble_labelmap_callback_tag"):
-                tag = self._scribble_labelmap_callback_tag.get("tag", None)
-                if tag:
-                    self.scribble_segment_node.RemoveObserver(tag)
-                del self._scribble_labelmap_callback_tag
+            self._teardown_scribble_observer()
 
             return
 
@@ -2969,19 +3079,23 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         debug_print(f"show_segmentation took {time.time() - t0}")
 
-    def get_segmentation_node(self):
-        """
-        Returns the currently referenced segmentation node (from the Segment Editor).
-        If none exists, we create a fresh one. Internal scaffolding nodes
-        (scribble, magic wand preview) are excluded from this lookup.
-        """
-        internal_names = {
+    def _internal_segmentation_node_names(self):
+        """Names of hidden scaffolding segmentations excluded from user lookups."""
+        return {
             self.scribble_segment_node_name,
             self.wand_preview_segment_node_name,
             self.lasso3d_input_segment_node_name,
             self.lasso3d_preview_segment_node_name,
             self.inference_preview_segment_node_name,
         }
+
+    def get_segmentation_node(self):
+        """
+        Returns the currently referenced segmentation node (from the Segment Editor).
+        If none exists, we create a fresh one. Internal scaffolding nodes
+        (scribble, magic wand preview) are excluded from this lookup.
+        """
+        internal_names = self._internal_segmentation_node_names()
 
         # If the segmentation widget has a currently selected segmentation node, return it.
         segmentation_node = self.ui.editor_widget.segmentationNode()
@@ -3114,18 +3228,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _get_preferred_segment_opacity(self):
         """Read the persisted preferred segment opacity (0..1). Default 1.0."""
-        settings = qt.QSettings()
-        try:
-            v = float(settings.value("SlicerNNInteractive/segment_opacity", 1.0))
-        except (TypeError, ValueError):
-            v = 1.0
+        v = self._get_qsetting(SETTING_SEGMENT_OPACITY, 1.0, cast=float)
         return max(0.0, min(1.0, v))
 
     def _save_preferred_segment_opacity(self, value):
         """Persist the slider's current value as a user preference."""
-        qt.QSettings().setValue(
-            "SlicerNNInteractive/segment_opacity", float(value)
-        )
+        self._set_qsetting(SETTING_SEGMENT_OPACITY, float(value))
 
     # -- Non-destructive display smoothing (2D + 3D from the closed surface) --
 
@@ -3134,13 +3242,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         node = self.ui.editor_widget.segmentationNode()
         if node is None:
             return None
-        internal_names = {
-            self.scribble_segment_node_name,
-            self.wand_preview_segment_node_name,
-            self.lasso3d_input_segment_node_name,
-            self.lasso3d_preview_segment_node_name,
-            self.inference_preview_segment_node_name,
-        }
+        internal_names = self._internal_segmentation_node_names()
         if node.GetName() in internal_names:
             return None
         return node
@@ -3161,23 +3263,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _get_display_smooth_enabled(self):
         """Read whether non-destructive display smoothing is on. Default False."""
-        v = qt.QSettings().value(
-            "SlicerNNInteractive/display_smooth_enabled", False
-        )
-        if isinstance(v, str):
-            return v.lower() == "true"
-        return bool(v)
+        return self._get_qsetting(SETTING_DISPLAY_SMOOTH_ENABLED, False, cast=bool)
 
     def _get_display_smooth_strength(self):
         """Read the display smoothing strength in [0, 1]. Default 0.5."""
-        try:
-            v = float(
-                qt.QSettings().value(
-                    "SlicerNNInteractive/display_smooth_strength", 0.5
-                )
-            )
-        except (TypeError, ValueError):
-            v = 0.5
+        v = self._get_qsetting(SETTING_DISPLAY_SMOOTH_STRENGTH, 0.5, cast=float)
         return float(min(1.0, max(0.0, v)))
 
     def _current_display_smooth_strength(self):
@@ -3242,9 +3332,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _on_display_smooth_enabled_changed(self, checked):
         """Persist the toggle and apply or clear the display-only smoothing."""
-        qt.QSettings().setValue(
-            "SlicerNNInteractive/display_smooth_enabled", bool(checked)
-        )
+        self._set_qsetting(SETTING_DISPLAY_SMOOTH_ENABLED, bool(checked))
         if checked:
             self._apply_display_smoothing()
         else:
@@ -3253,8 +3341,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _on_display_smooth_strength_changed(self, value):
         """Persist the strength and re-apply if display smoothing is active."""
-        qt.QSettings().setValue(
-            "SlicerNNInteractive/display_smooth_strength",
+        self._set_qsetting(
+            SETTING_DISPLAY_SMOOTH_STRENGTH,
             self._current_display_smooth_strength(),
         )
         if hasattr(self, "ui") and self.ui.cbDisplaySmooth.isChecked():
@@ -3336,9 +3424,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             blocked = self.ui.cbDisplaySmooth.blockSignals(True)
             self.ui.cbDisplaySmooth.setChecked(False)
             self.ui.cbDisplaySmooth.blockSignals(blocked)
-            qt.QSettings().setValue(
-                "SlicerNNInteractive/display_smooth_enabled", False
-            )
+            self._set_qsetting(SETTING_DISPLAY_SMOOTH_ENABLED, False)
         self._clear_display_smoothing()
         self._refresh_display_smooth_ui()
         self.upload_segment_to_server()
@@ -3350,44 +3436,29 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _get_lasso_clip_enabled(self):
         """Read whether lasso slice-range clipping is enabled. Default False."""
-        v = qt.QSettings().value("SlicerNNInteractive/lasso_clip_enabled", False)
-        if isinstance(v, str):
-            return v.lower() == "true"
-        return bool(v)
+        return self._get_qsetting(SETTING_LASSO_CLIP_ENABLED, False, cast=bool)
 
     def _get_lasso_clip_n(self):
         """Read the persisted +/- N slices for lasso clipping. Default 0."""
-        try:
-            return max(
-                0, int(qt.QSettings().value("SlicerNNInteractive/lasso_clip_n", 0))
-            )
-        except (TypeError, ValueError):
-            return 0
+        return max(0, self._get_qsetting(SETTING_LASSO_CLIP_N, 0, cast=int))
 
     def _on_lasso_clip_enabled_changed(self, checked):
         """Persist the lasso-clip enable checkbox."""
-        qt.QSettings().setValue(
-            "SlicerNNInteractive/lasso_clip_enabled", bool(checked)
-        )
+        self._set_qsetting(SETTING_LASSO_CLIP_ENABLED, bool(checked))
 
     def _on_lasso_clip_n_changed(self, value):
         """Persist the lasso-clip +/- N slices spin box."""
-        qt.QSettings().setValue("SlicerNNInteractive/lasso_clip_n", int(value))
+        self._set_qsetting(SETTING_LASSO_CLIP_N, int(value))
 
     # -- Multi-view lasso accumulation --
 
     def _get_lasso_multiview_enabled(self):
-        v = qt.QSettings().value(
-            "SlicerNNInteractive/lasso_multiview_enabled", False
+        return self._get_qsetting(
+            SETTING_LASSO_MULTIVIEW_ENABLED, False, cast=bool
         )
-        if isinstance(v, str):
-            return v.lower() == "true"
-        return bool(v)
 
     def _set_lasso_multiview_enabled(self, val):
-        qt.QSettings().setValue(
-            "SlicerNNInteractive/lasso_multiview_enabled", bool(val)
-        )
+        self._set_qsetting(SETTING_LASSO_MULTIVIEW_ENABLED, bool(val))
 
     def _on_lasso_multiview_toggled(self, checked):
         self._set_lasso_multiview_enabled(checked)
@@ -3469,22 +3540,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _get_high_res_enabled_setting(self):
         """Read whether the high-resolution output grid is enabled. Default False."""
-        v = qt.QSettings().value("SlicerNNInteractive/high_res_output_enabled", False)
-        if isinstance(v, str):
-            return v.lower() == "true"
-        return bool(v)
+        return self._get_qsetting(SETTING_HIGH_RES_ENABLED, False, cast=bool)
 
     def _get_output_spacing_setting(self):
         """Read the persisted isotropic output spacing in mm (0 = auto)."""
-        try:
-            return max(
-                0.0,
-                float(
-                    qt.QSettings().value("SlicerNNInteractive/output_spacing", 0.0)
-                ),
-            )
-        except (TypeError, ValueError):
-            return 0.0
+        return max(0.0, self._get_qsetting(SETTING_OUTPUT_SPACING, 0.0, cast=float))
 
     def _remove_output_geometry_node(self):
         """Drop the hidden output-geometry volume and reset its bookkeeping."""
@@ -3502,9 +3562,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             blocked = self.ui.cbEnableHighResOutput.blockSignals(True)
             self.ui.cbEnableHighResOutput.setChecked(False)
             self.ui.cbEnableHighResOutput.blockSignals(blocked)
-        qt.QSettings().setValue(
-            "SlicerNNInteractive/high_res_output_enabled", False
-        )
+        self._set_qsetting(SETTING_HIGH_RES_ENABLED, False)
         slicer.util.showStatusMessage(reason, 6000)
         print("[nni] high-resolution output disabled: %s" % reason)
 
@@ -3550,18 +3608,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _get_smooth_interpolate_setting(self):
         """Read whether smooth (interpolated) results are enabled. Default False."""
-        v = qt.QSettings().value(
-            "SlicerNNInteractive/smooth_interpolate_enabled", False
+        return self._get_qsetting(
+            SETTING_SMOOTH_INTERPOLATE_ENABLED, False, cast=bool
         )
-        if isinstance(v, str):
-            return v.lower() == "true"
-        return bool(v)
 
     def _on_high_res_output_changed(self, checked):
         """Persist the high-res output toggle and migrate the current segment."""
-        qt.QSettings().setValue(
-            "SlicerNNInteractive/high_res_output_enabled", bool(checked)
-        )
+        self._set_qsetting(SETTING_HIGH_RES_ENABLED, bool(checked))
         # Smoothing interpolates onto the fine grid, so it cannot run without
         # the high-resolution output. Turn it off in lockstep.
         if (
@@ -3572,9 +3625,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             blocked = self.ui.cbSmoothInterpolate.blockSignals(True)
             self.ui.cbSmoothInterpolate.setChecked(False)
             self.ui.cbSmoothInterpolate.blockSignals(blocked)
-            qt.QSettings().setValue(
-                "SlicerNNInteractive/smooth_interpolate_enabled", False
-            )
+            self._set_qsetting(SETTING_SMOOTH_INTERPOLATE_ENABLED, False)
             slicer.util.showStatusMessage(
                 "Smoothing disabled (needs high-resolution output).", 4000
             )
@@ -3589,9 +3640,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         blocked = self.ui.cbEnableHighResOutput.blockSignals(True)
         self.ui.cbEnableHighResOutput.setChecked(True)
         self.ui.cbEnableHighResOutput.blockSignals(blocked)
-        qt.QSettings().setValue(
-            "SlicerNNInteractive/high_res_output_enabled", True
-        )
+        self._set_qsetting(SETTING_HIGH_RES_ENABLED, True)
         self._rebuild_output_geometry_and_migrate()
         self._refresh_native_series_inference_ui()
         slicer.util.showStatusMessage(
@@ -3600,9 +3649,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _on_smooth_interpolate_changed(self, checked):
         """Persist the smoothing toggle; auto-enable the fine output grid it needs."""
-        qt.QSettings().setValue(
-            "SlicerNNInteractive/smooth_interpolate_enabled", bool(checked)
-        )
+        self._set_qsetting(SETTING_SMOOTH_INTERPOLATE_ENABLED, bool(checked))
         if checked:
             self._enable_high_res_for_smoothing()
 
@@ -3642,7 +3689,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _on_output_spacing_changed(self, value):
         """Persist the output spacing and, if enabled, rebuild the output grid."""
-        qt.QSettings().setValue("SlicerNNInteractive/output_spacing", float(value))
+        self._set_qsetting(SETTING_OUTPUT_SPACING, float(value))
         if self._high_res_output_enabled():
             self._rebuild_output_geometry_and_migrate()
 
@@ -3801,7 +3848,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         # Operand source order: 0=ROI box, 1=Magic wand, 2=Segment, 3=Lasso (3D).
         source = self.ui.cbOperandSource.currentIndex
-        if source == 0:
+        if source == OPERAND_SOURCE_ROI:
             if not self._is_selection_roi_valid():
                 QMessageBox.warning(
                     slicer.util.mainWindow(),
@@ -3810,7 +3857,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 )
                 return
             operand_mask = self.roi_node_to_mask(self._sel_op_roi_node)
-        elif source == 1:
+        elif source == OPERAND_SOURCE_WAND:
             if not self._is_selection_wand_seed_valid():
                 QMessageBox.warning(
                     slicer.util.mainWindow(),
@@ -3827,7 +3874,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                     "or seeds out of volume).",
                 )
                 return
-        elif source == 3:
+        elif source == OPERAND_SOURCE_LASSO3D:
             if not self._is_selection_lasso3d_valid():
                 QMessageBox.warning(
                     slicer.util.mainWindow(),
@@ -3947,16 +3994,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         Observes segmentation and segment-editor changes so the operand selector
         stays up to date. Registration is idempotent.
         """
-        if not self.hasObserver(
+        self._safe_add_observer(
             self.segment_editor_node,
             vtk.vtkCommand.ModifiedEvent,
             self.on_segment_editor_node_modified,
-        ):
-            self.addObserver(
-                self.segment_editor_node,
-                vtk.vtkCommand.ModifiedEvent,
-                self.on_segment_editor_node_modified,
-            )
+        )
 
         self._observe_active_segmentation()
 
@@ -3981,10 +4023,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         )
         if previous is not None:
             for event in events:
-                if self.hasObserver(previous, event, self.on_segmentation_modified):
-                    self.removeObserver(
-                        previous, event, self.on_segmentation_modified
-                    )
+                self._safe_remove_observer(
+                    previous, event, self.on_segmentation_modified
+                )
 
         for event in events:
             self.addObserver(segmentation, event, self.on_segmentation_modified)
@@ -4005,41 +4046,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._reapply_display_smoothing_if_active()
 
     # -- ROI operand --
-
-    @staticmethod
-    def _aabb_to_voxel_box(bounds_ras, ras_to_ijk_fn, shape):
-        """
-        Given a world AABB (xmin, xmax, ymin, ymax, zmin, zmax) in RAS, a function
-        mapping an RAS point to (i, j, k) integer voxel coords, and the target
-        volume shape (z, y, x), return a bool mask with the corresponding
-        voxel-space box filled. Coordinates are clamped to the volume; if the
-        resulting box is empty the mask is all-False.
-        """
-        xmin, xmax, ymin, ymax, zmin, zmax = bounds_ras
-        corners_ras = [
-            (xmin, ymin, zmin), (xmax, ymin, zmin),
-            (xmin, ymax, zmin), (xmax, ymax, zmin),
-            (xmin, ymin, zmax), (xmax, ymin, zmax),
-            (xmin, ymax, zmax), (xmax, ymax, zmax),
-        ]
-        ijk = np.array([ras_to_ijk_fn(list(c)) for c in corners_ras])
-
-        # ijk columns are (i, j, k) == (x, y, z); shape is (z, y, x).
-        i_min, i_max = int(ijk[:, 0].min()), int(ijk[:, 0].max())
-        j_min, j_max = int(ijk[:, 1].min()), int(ijk[:, 1].max())
-        k_min, k_max = int(ijk[:, 2].min()), int(ijk[:, 2].max())
-
-        i_min = max(0, i_min)
-        i_max = min(shape[2] - 1, i_max)
-        j_min = max(0, j_min)
-        j_max = min(shape[1] - 1, j_max)
-        k_min = max(0, k_min)
-        k_max = min(shape[0] - 1, k_max)
-
-        mask = np.zeros(shape, dtype=bool)
-        if i_max >= i_min and j_max >= j_min and k_max >= k_min:
-            mask[k_min:k_max + 1, j_min:j_max + 1, i_min:i_max + 1] = True
-        return mask
 
     def roi_node_to_mask(self, roi_node):
         """
@@ -4167,11 +4173,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         z = M[2, 0] * ii + M[2, 1] * jj + M[2, 2] * kk + M[2, 3]
 
         shape_idx = self.ui.cbRoiShape.currentIndex  # 0=Box, 1=Sphere, 2=Ellipsoid
-        if shape_idx == 1:
+        if shape_idx == ROI_SHAPE_SPHERE:
             # Sphere: inscribed in the (possibly non-cube) ROI box.
             r = min(rx, ry, rz)
             inside = (x * x + y * y + z * z) <= (r * r)
-        elif shape_idx == 2:
+        elif shape_idx == ROI_SHAPE_ELLIPSOID:
             # Ellipsoid aligned with the ROI axes.
             inside = (
                 (x / rx) ** 2 + (y / ry) ** 2 + (z / rz) ** 2
@@ -4252,12 +4258,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         node.SetDisplayVisibility(True)
 
         # Ensure shape preview tracks this ROI's pose and size.
-        if not self.hasObserver(
+        self._safe_add_observer(
             node, vtk.vtkCommand.ModifiedEvent, self._on_selection_roi_modified
-        ):
-            self.addObserver(
-                node, vtk.vtkCommand.ModifiedEvent, self._on_selection_roi_modified
-            )
+        )
         self._get_or_create_selection_roi_preview()
         self._update_selection_roi_preview()
         return node
@@ -4266,12 +4269,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """Remove the operation ROI node (and its preview) from the scene."""
         node = self._sel_op_roi_node
         if node is not None:
-            if self.hasObserver(
+            self._safe_remove_observer(
                 node, vtk.vtkCommand.ModifiedEvent, self._on_selection_roi_modified
-            ):
-                self.removeObserver(
-                    node, vtk.vtkCommand.ModifiedEvent, self._on_selection_roi_modified
-                )
+            )
             if slicer.mrmlScene.IsNodePresent(node):
                 slicer.mrmlScene.RemoveNode(node)
         self._sel_op_roi_node = None
@@ -4347,7 +4347,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             return
 
         shape_idx = self.ui.cbRoiShape.currentIndex  # 0=Box, 1=Sphere, 2=Ellipsoid
-        if shape_idx == 0:
+        if shape_idx == ROI_SHAPE_BOX:
             self._set_preview_visible(False)
             return
 
@@ -4358,7 +4358,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self._set_preview_visible(False)
             return
 
-        if shape_idx == 1:
+        if shape_idx == ROI_SHAPE_SPHERE:
             r = min(rx, ry, rz)
             sx = sy = sz = r
         else:
@@ -4419,13 +4419,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _on_roi_shape_changed(self, index):
         """Status-bar hint clarifying what each ROI shape means, plus preview refresh."""
-        if index == 1:
+        if index == ROI_SHAPE_SPHERE:
             slicer.util.showStatusMessage(
                 "Sphere mode uses the inscribed sphere "
                 "(radius = min of the ROI's three half-extents).",
                 5000,
             )
-        elif index == 2:
+        elif index == ROI_SHAPE_ELLIPSOID:
             slicer.util.showStatusMessage(
                 "Ellipsoid mode uses the ellipsoid aligned with the ROI axes.",
                 5000,
@@ -4436,11 +4436,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """Enable Apply only when the current operand source has a usable operand."""
         # Source order: 0=ROI box, 1=Magic wand, 2=Segment, 3=Lasso (3D).
         source = self.ui.cbOperandSource.currentIndex
-        if source == 0:
+        if source == OPERAND_SOURCE_ROI:
             enabled = self._is_selection_roi_valid()
-        elif source == 1:
+        elif source == OPERAND_SOURCE_WAND:
             enabled = self._is_selection_wand_seed_valid()
-        elif source == 3:
+        elif source == OPERAND_SOURCE_LASSO3D:
             enabled = self._is_selection_lasso3d_valid()
         else:
             enabled = self.ui.cbSelectionOperand.count > 0
@@ -4452,19 +4452,19 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         ROI / Magic wand / Lasso preview never lingers across switches.
         Source order: 0=ROI box, 1=Magic wand, 2=Segment, 3=Lasso (3D).
         """
-        self.ui.operandRoiContainer.setVisible(index == 0)
-        self.ui.operandMagicWandContainer.setVisible(index == 1)
-        self.ui.operandSegmentContainer.setVisible(index == 2)
-        self.ui.operandLasso3dContainer.setVisible(index == 3)
+        self.ui.operandRoiContainer.setVisible(index == OPERAND_SOURCE_ROI)
+        self.ui.operandMagicWandContainer.setVisible(index == OPERAND_SOURCE_WAND)
+        self.ui.operandSegmentContainer.setVisible(index == OPERAND_SOURCE_SEGMENT)
+        self.ui.operandLasso3dContainer.setVisible(index == OPERAND_SOURCE_LASSO3D)
         # Leaving ROI -> destroy the ROI box (and its preview).
-        if index != 0:
+        if index != OPERAND_SOURCE_ROI:
             self._destroy_selection_roi()
         # Leaving Magic wand -> destroy seeds and the mask preview.
-        if index != 1:
+        if index != OPERAND_SOURCE_WAND:
             self._destroy_wand_seed()
             self._clear_wand_preview_segment()
         # Leaving Lasso (3D) -> disarm Scissors and clear region + preview.
-        if index != 3:
+        if index != OPERAND_SOURCE_LASSO3D:
             self.ui.pbDrawLasso3d.setChecked(False)
             self._deactivate_lasso3d_scissors()
             self._clear_lasso3d_input_segment()
@@ -4506,16 +4506,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             display_node = node.GetDisplayNode()
             if display_node is not None:
                 self._configure_wand_seed_display(display_node)
-            if not self.hasObserver(
+            self._safe_add_observer(
                 node,
                 slicer.vtkMRMLMarkupsNode.PointPositionDefinedEvent,
                 self._on_wand_seed_placed,
-            ):
-                self.addObserver(
-                    node,
-                    slicer.vtkMRMLMarkupsNode.PointPositionDefinedEvent,
-                    self._on_wand_seed_placed,
-                )
+            )
             self._sel_op_wand_seed_node = node
 
         node.SetDisplayVisibility(True)
@@ -4530,16 +4525,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # 1) Detach observer on the tracked node before removal so the placement
         #    callback never fires on a half-dead node.
         tracked = self._sel_op_wand_seed_node
-        if tracked is not None and self.hasObserver(
+        self._safe_remove_observer(
             tracked,
             slicer.vtkMRMLMarkupsNode.PointPositionDefinedEvent,
             self._on_wand_seed_placed,
-        ):
-            self.removeObserver(
-                tracked,
-                slicer.vtkMRMLMarkupsNode.PointPositionDefinedEvent,
-                self._on_wand_seed_placed,
-            )
+        )
 
         # 2) Sweep every historical wand seed name out of the scene. Use a
         #    while-loop in case multiple nodes share the same name.
@@ -4739,47 +4729,19 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         Create (or recover) a hidden segmentation node with a single 'preview'
         segment used to visualize the magic wand region before Apply.
         """
-        name = self.wand_preview_segment_node_name
-        node = self._sel_op_wand_preview_segment_node
-        if node is None or not slicer.mrmlScene.IsNodePresent(node):
-            existing = slicer.mrmlScene.GetFirstNodeByName(name)
-            if existing is not None and existing.IsA("vtkMRMLSegmentationNode"):
-                node = existing
-            else:
-                node = slicer.mrmlScene.AddNewNodeByClass(
-                    "vtkMRMLSegmentationNode"
-                )
-                node.SetName(name)
-            node.HideFromEditorsOn()
-            volume_node = self.get_volume_node()
-            if volume_node is not None:
-                node.SetReferenceImageGeometryParameterFromVolumeNode(volume_node)
-            node.CreateDefaultDisplayNodes()
-            self._sel_op_wand_preview_segment_node = node
+        return self._get_or_create_hidden_segmentation(
+            "_sel_op_wand_preview_segment_node",
+            self.wand_preview_segment_node_name,
+            "_wand_preview_segment_id",
+            "MagicWandPreview",
+            [0.95, 0.2, 0.85],
+        )
 
-        segmentation = node.GetSegmentation()
-        seg_id = self._wand_preview_segment_id
-        if not seg_id or not segmentation.GetSegment(seg_id):
-            seg_id = segmentation.AddEmptySegment(
-                "MagicWandPreview", "MagicWandPreview", [0.95, 0.2, 0.85]
-            )
-            self._wand_preview_segment_id = seg_id
+    def _clear_segment_labelmap(self, node, seg_id):
+        """Zero-fill a segment's labelmap on the source grid and hide it.
 
-        display_node = node.GetDisplayNode()
-        if display_node is not None:
-            display_node.SetSegmentOpacity2DFill(seg_id, 0.35)
-            display_node.SetSegmentOpacity2DOutline(seg_id, 0.9)
-            display_node.SetSegmentVisibility(seg_id, True)
-
-        return node, seg_id
-
-    def _clear_wand_preview_segment(self):
+        The node itself is kept around so the next show is cheap.
         """
-        Empty the preview segment's labelmap and hide it. The node itself is
-        kept around so the next show is cheap.
-        """
-        node = self._sel_op_wand_preview_segment_node
-        seg_id = self._wand_preview_segment_id
         if node is None or not slicer.mrmlScene.IsNodePresent(node) or not seg_id:
             return
         volume_node = self.get_volume_node()
@@ -4797,13 +4759,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if display_node is not None:
             display_node.SetSegmentVisibility(seg_id, False)
 
-    def _destroy_wand_preview(self):
-        """Remove the preview segmentation node entirely (used at cleanup)."""
-        node = self._sel_op_wand_preview_segment_node
-        if node is not None and slicer.mrmlScene.IsNodePresent(node):
-            slicer.mrmlScene.RemoveNode(node)
-        self._sel_op_wand_preview_segment_node = None
-        self._wand_preview_segment_id = None
+    def _clear_wand_preview_segment(self):
+        """
+        Empty the preview segment's labelmap and hide it. The node itself is
+        kept around so the next show is cheap.
+        """
+        self._clear_segment_labelmap(
+            self._sel_op_wand_preview_segment_node, self._wand_preview_segment_id
+        )
 
     def _update_magic_wand_preview(self):
         """
@@ -4811,8 +4774,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         write it into the preview segment. Safe to call when the wand is not
         the active operand source -- it will just clear the preview.
         """
-        # Magic wand source index is 1 in the current ordering.
-        if self.ui.cbOperandSource.currentIndex != 1:
+        if self.ui.cbOperandSource.currentIndex != OPERAND_SOURCE_WAND:
             self._clear_wand_preview_segment()
             return
         if not self._is_selection_wand_seed_valid():
@@ -4854,11 +4816,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     # -- Lasso (3D): native Scissors draws a region, nnInteractive lasso AI --
     #    refines it into a preview, mirroring the Magic wand seed/preview flow.
 
-    def _get_or_create_lasso3d_segmentation(self, attr, name, seg_id_attr,
-                                            seg_name, color):
+    def _get_or_create_hidden_segmentation(
+        self, attr, name, seg_id_attr, seg_name, color
+    ):
         """
-        Shared helper to create (or recover) a hidden single-segment node used
-        either as the Scissors input region or as the AI preview.
+        Shared helper to create (or recover) a hidden single-segment node on the
+        source grid (Scissors input/preview, magic wand preview, etc.). The node
+        is hidden from editors and shown as a translucent fill/outline overlay.
         """
         node = getattr(self, attr)
         if node is None or not slicer.mrmlScene.IsNodePresent(node):
@@ -4893,7 +4857,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _get_or_create_lasso3d_input_segmentation(self):
         """Hidden node holding the raw 3D region the user draws with Scissors."""
-        return self._get_or_create_lasso3d_segmentation(
+        return self._get_or_create_hidden_segmentation(
             "_sel_op_lasso3d_input_segment_node",
             self.lasso3d_input_segment_node_name,
             "_lasso3d_input_segment_id",
@@ -4903,7 +4867,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _get_or_create_lasso3d_preview_segmentation(self):
         """Hidden node holding the nnInteractive lasso AI result (the preview)."""
-        return self._get_or_create_lasso3d_segmentation(
+        return self._get_or_create_hidden_segmentation(
             "_sel_op_lasso3d_preview_segment_node",
             self.lasso3d_preview_segment_node_name,
             "_lasso3d_preview_segment_id",
@@ -5053,26 +5017,16 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._refresh_apply_enabled()
 
     def _clear_lasso3d_segment(self, node, seg_id):
-        """Empty a lasso labelmap and hide its segment; keep the node."""
-        if node is None or not slicer.mrmlScene.IsNodePresent(node) or not seg_id:
-            return
-        volume_node = self.get_volume_node()
-        image = self.get_image_data()
-        if volume_node is None or image is None:
-            return
-        empty = np.zeros(image.shape, dtype=np.uint8)
+        """Empty a lasso labelmap and hide its segment; keep the node.
+
+        Guarded so the programmatic clear does not re-trigger the input
+        observer (_on_lasso3d_input_modified).
+        """
         self._lasso3d_in_update = True
         try:
-            slicer.util.updateSegmentBinaryLabelmapFromArray(
-                empty, node, seg_id, volume_node
-            )
-        except Exception:
-            pass
+            self._clear_segment_labelmap(node, seg_id)
         finally:
             self._lasso3d_in_update = False
-        display_node = node.GetDisplayNode()
-        if display_node is not None:
-            display_node.SetSegmentVisibility(seg_id, False)
 
     def _clear_lasso3d_input_segment(self):
         """Empty the drawn input region and hide it; keep the node."""
@@ -5195,8 +5149,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         preview segment. Safe to call when lasso is not the active operand
         source -- it will just clear the preview. Mirrors the magic wand.
         """
-        # Lasso (3D) source index is 3 in the current ordering.
-        if self.ui.cbOperandSource.currentIndex != 3:
+        if self.ui.cbOperandSource.currentIndex != OPERAND_SOURCE_LASSO3D:
             self._clear_lasso3d_preview_segment()
             return
         if not self._is_selection_lasso3d_valid():
@@ -5323,8 +5276,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         Reads user-entered server URL from UI, saves to QSettings, updates self.server.
         """
         self.server = self.ui.Server.text.rstrip("/")
-        settings = qt.QSettings()
-        settings.setValue("SlicerNNInteractive/server", self.server)
+        self._set_qsetting(SETTING_SERVER, self.server)
         debug_print(f"Server URL updated and saved: {self.server}")
 
     def test_server_connection(self):
