@@ -20,17 +20,18 @@
   恢复勾选状态、**不**自动重排视图,避免在加载序列前动布局)。
 - 入口:`_on_triplanar_mode_toggled` -> 开启时 `_setup_triplanar_views()`。
 
-## 一、自动方向分配(序列 -> 视图)
+## 一、序列 -> 视图(手动分配)
 
-- `_classify_series_orientation(volume)`:用最薄轴的 RAS 方向判定 `axial|sagittal|coronal`
-  (薄轴≈S->axial、≈R->sagittal、≈A->coronal),倾斜返回 `oblique`。底层用
-  `_ijk_to_ras_axis_map`(方向余弦 + `OBLIQUE_COS_THRESHOLD`,要求干净的 RAS 轴置换)。
-- `_setup_triplanar_views()`:扫描候选标量体积(排除 `(do not touch)` 与输出几何节点),
-  分类后按 `TRIPLANAR_ORIENTATION_TO_VIEW`(axial=Red、sagittal=Yellow、coronal=Green)
-  写入多平面快照 `_plane_display_snapshot` 并经 `_apply_plane_display_volumes` 应用;同时
-  反映到 `cbRed/Yellow/GreenDisplayVolume` 下拉。还会启用高分辨率输出
-  (`_enable_high_res_for_smoothing`)与序列融合(`cbEnableSeriesFusion`)。<2 个可分配
-  序列时提示手动分配。
+- **用户手动选序列**:在"多平面显示"面板把 3 个序列分别指给 红=横断 / 黄=矢状 / 绿=冠状
+  (Slicer 标准约定)并 Apply。**不做自动方向检测**——真实数据常含定位图等多余序列、且多为
+  oblique(成角采集),自动挑选不可靠(实测教训:8 个体积里 7 个 oblique、定位图被拆成 3 个)。
+- `_setup_triplanar_views()`:只"锁定 + 启用前置",不分类不扫描:
+  - 调 `on_apply_plane_display_volumes_clicked()` 把用户当前红/黄/绿下拉选择应用为视图背景;
+  - 启用高分辨率各向同性输出(`_enable_high_res_for_smoothing`)与序列融合(`cbEnableSeriesFusion`);
+  - 用 `_view_background_volume` 校验三视图背景:**不同序列<2 个**则提示用户先去多平面面板指定
+    (`[DEBUG triplanar.setup]` 打印三视图背景序列名)。
+- 不依赖"横/冠/矢"标签:路由只看 `view -> _view_background_volume(view)`;oblique 序列的视图朝向
+  由现有 `_align_views_to_volume_planes` 各自旋正。
 
 ## 二、按视图路由(交互 -> 该视图序列)
 
@@ -53,12 +54,14 @@
 - `_handle_server_segmentation_result` 顶部分支:三视图模式下走 `_handle_triplanar_result`
   -> `_resample_result_to_output`(结果重采样到输出网格)-> `_maybe_collect_fusion_result`
   (按路由序列 id 累积)-> `_maybe_autofuse`(>=2 序列时融合显示;不足时直接显示单序列)。
-- `_fuse_series_results`(已升级):对每个序列的 SDF,**仅沿其本身"厚轴/采集方向"做各向异性
-  高斯平滑**(`_series_anisotropic_sigma`:仅在该轴比输出网格更粗时给正 sigma,薄轴≈0),
-  抹掉该方向的台阶锯齿,薄轴细节保留;再平均、阈值 0。这样某方向上锯齿的序列被该方向平滑、
-  让在该方向清晰的序列主导,实现"各方向取最清晰"。
-  - 注:直接用原生 spacing 当 edt `sampling` 的极性是反的(厚轴反而主导),故采用
-    "按厚轴平滑"而非"按 spacing 采样"。
+- `_fuse_series_results`(已升级):对每个序列的 SDF,**仅沿其"层叠/采集方向"做各向异性高斯
+  平滑**(`_series_anisotropic_sigma`),抹掉该方向台阶锯齿、保留面内锐度;再平均、阈值 0。
+  这样某方向上锯齿的序列被该方向平滑、让在该方向清晰的序列主导,实现"各方向取最清晰"。
+  - **oblique 容忍(选项 A)**:层叠轴 = `argmax(GetSpacing())`;取其 RAS 方向投影到**最近的输出
+    网格轴**(|dot| 最大),沿该轴设 sigma=`clip(0.5*(层厚/该轴输出间距-1),0,3)`,其余 0。成角序列
+    也能去锯齿(近似到主轴)。`[DEBUG triplanar.obliq]` 打印层方向、所选输出轴、夹角(度),据此判断
+    近似是否足够;不够可升级 C(旋转-模糊-转回,仅动此处)。
+  - 注:直接用原生 spacing 当 edt `sampling` 的极性是反的(厚轴反而主导),故采用"按层方向平滑"。
 - `_maybe_autofuse` 每次融合记一次 undo(与手动 `pbFuseSeries` 一致,栈上限 10)。
 
 ## 四、注意点 / 限制
@@ -69,16 +72,15 @@
   适合融合;但无法跨视图在同一 server 会话里迭代细化)。
 - **scribble 分辨率**:scribble 编辑器仍绑源体积,笔画在源网格分辨率绘制,再重采样到路由
   序列(AI 会精修);未按视图序列分辨率绘制。
-- **倾斜序列**:`_classify_series_orientation`/`_series_anisotropic_sigma` 对非轴对齐返回
-  oblique/None,分配与方向加权退回保守行为(手动分配 / 各向同性)。
+- **倾斜序列**:序列选定靠手动(不自动分类);方向加权融合对 oblique 用"近似到最近输出轴"
+  (选项 A),强成角下可按需升级到 C。
 - 启动时不自动重排视图(需用户开启模式触发 `_setup_triplanar_views`)。
 - 保留该区域 `[DEBUG fusion]` 等调试输出(排查期),未经确认勿删。
 
 ## 关键符号
 
-`cbTriPlanarMode`、`SETTING_TRIPLANAR_ENABLED`、`TRIPLANAR_ORIENTATION_TO_VIEW`、
-`_triplanar_mode`、`_active_inference_volume_override`、`_on_triplanar_mode_toggled`、
-`_classify_series_orientation`、`_ijk_to_ras_axis_map`、`_setup_triplanar_views`、
+`cbTriPlanarMode`、`SETTING_TRIPLANAR_ENABLED`、`_triplanar_mode`、
+`_active_inference_volume_override`、`_on_triplanar_mode_toggled`、`_setup_triplanar_views`、
 `_view_for_ras_point`、`_route_prompt_to_view`、`_last_control_point_ras`、
 `_mask_centroid_ras`、`_resample_result_to_output`、`_handle_triplanar_result`、
 `_maybe_autofuse`、`_series_anisotropic_sigma`、`_fuse_series_results`。

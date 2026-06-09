@@ -96,14 +96,6 @@ SETTING_HIGH_RES_ENABLED = "SlicerNNInteractive/high_res_output_enabled"
 SETTING_SMOOTH_INTERPOLATE_ENABLED = "SlicerNNInteractive/smooth_interpolate_enabled"
 SETTING_TRIPLANAR_ENABLED = "SlicerNNInteractive/triplanar_mode_enabled"
 
-# Standard slice view that best resolves each acquisition orientation
-# (Slicer convention: Red=Axial, Yellow=Sagittal, Green=Coronal).
-TRIPLANAR_ORIENTATION_TO_VIEW = {
-    "axial": "Red",
-    "sagittal": "Yellow",
-    "coronal": "Green",
-}
-
 
 def debug_print(*args):
     if DEBUG_MODE:
@@ -1776,62 +1768,64 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                   "to a different registered series for each plane.")
         self._refresh_native_series_inference_ui()
 
-    @staticmethod
-    def _ijk_to_ras_axis_map(volume):
-        """For a near-axis-aligned volume, return (axis_map, spacing) where
-        axis_map[k] is the RAS axis index (0=R, 1=A, 2=S) that IJK axis k maps
-        to, and spacing is GetSpacing() (sI, sJ, sK). Returns None when the
-        volume is oblique or the IJK->RAS mapping is not a clean permutation."""
-        get_dirs = getattr(volume, "GetIJKToRASDirectionMatrix", None)
-        if get_dirs is None:
-            return None
-        m = vtk.vtkMatrix4x4()
-        get_dirs(m)
-        axis_map = []
-        for k in range(3):  # IJK axis k is column k of the direction matrix
-            col = [abs(m.GetElement(r, k)) for r in range(3)]
-            ras = int(np.argmax(col))
-            if col[ras] < OBLIQUE_COS_THRESHOLD:
-                return None  # oblique; cannot cleanly map this axis to RAS
-            axis_map.append(ras)
-        if sorted(axis_map) != [0, 1, 2]:
-            return None  # not a clean permutation of the RAS axes
-        return axis_map, tuple(volume.GetSpacing())
-
     def _series_anisotropic_sigma(self, series_volume):
-        """Per-output-axis Gaussian sigma (in voxels, numpy z,y,x order) that
-        blurs a series ONLY along axes where it is coarser than the output grid
-        -- i.e. its thick, stair-stepped acquisition axis -- while leaving its
-        sharp in-plane axes untouched. Used by direction-weighted fusion so that
-        each series stops imposing its through-plane jaggies and the series that
-        is sharp in a given plane governs the fused surface there. Returns None
-        when either grid is oblique (caller then skips smoothing)."""
+        """Per-output-axis Gaussian sigma (numpy z,y,x voxels) that blurs
+        `series_volume` ONLY along the output-grid axis closest to its thick
+        (slice-stacking) acquisition direction, leaving its sharp in-plane axes
+        untouched. Oblique-tolerant: the slice direction is approximated to the
+        nearest output axis (no axis-alignment requirement). Returns the
+        (sz, sy, sx) sigma tuple, or None when geometry is unavailable. Prints the
+        obliquity angle so the approximation quality can be judged."""
         output_volume = self.get_output_volume_node()
         if output_volume is None or series_volume is None:
             return None
-        series = self._ijk_to_ras_axis_map(series_volume)
-        out = self._ijk_to_ras_axis_map(output_volume)
-        if series is None or out is None:
+        get_s = getattr(series_volume, "GetIJKToRASDirectionMatrix", None)
+        get_o = getattr(output_volume, "GetIJKToRASDirectionMatrix", None)
+        if get_s is None or get_o is None:
             return None
-        series_axis_map, series_spacing = series
-        out_axis_map, out_spacing = out
-        ras_series = [0.0, 0.0, 0.0]
-        ras_out = [0.0, 0.0, 0.0]
-        for k in range(3):
-            ras_series[series_axis_map[k]] = series_spacing[k]
-            ras_out[out_axis_map[k]] = out_spacing[k]
-        sigma_ras = []
-        for a in range(3):
-            ratio = ras_series[a] / ras_out[a] if ras_out[a] > 0 else 1.0
-            # No smoothing where the series is as fine as (or finer than) the
-            # output grid; grow with coarseness, capped to stay local.
-            sigma_ras.append(float(np.clip(0.5 * (ratio - 1.0), 0.0, 3.0)))
-        # Map RAS-axis sigma to output numpy axes (z=K=ijk2, y=J=ijk1, x=I=ijk0).
-        return (
-            sigma_ras[out_axis_map[2]],
-            sigma_ras[out_axis_map[1]],
-            sigma_ras[out_axis_map[0]],
+        sm = vtk.vtkMatrix4x4()
+        get_s(sm)
+        om = vtk.vtkMatrix4x4()
+        get_o(om)
+        s_spacing = tuple(series_volume.GetSpacing())  # (sI, sJ, sK)
+        o_spacing = tuple(output_volume.GetSpacing())
+        # Series slice axis = thickest IJK axis; take its RAS unit direction.
+        slice_ijk = int(np.argmax(s_spacing))
+        slice_dir = np.array(
+            [sm.GetElement(r, slice_ijk) for r in range(3)], dtype=float
         )
+        norm = float(np.linalg.norm(slice_dir))
+        if norm == 0:
+            return None
+        slice_dir /= norm
+        # Output numpy axes -> IJK columns: z=K(col2), y=J(col1), x=I(col0).
+        out_col_for_np_axis = (2, 1, 0)
+        best_np_axis, best_dot = 0, -1.0
+        for np_axis, col in enumerate(out_col_for_np_axis):
+            d = np.array([om.GetElement(r, col) for r in range(3)], dtype=float)
+            dn = float(np.linalg.norm(d))
+            if dn == 0:
+                continue
+            dot = abs(float(np.dot(slice_dir, d / dn)))
+            if dot > best_dot:
+                best_dot, best_np_axis = dot, np_axis
+        out_axis_spacing = o_spacing[out_col_for_np_axis[best_np_axis]]
+        ratio = (
+            s_spacing[slice_ijk] / out_axis_spacing if out_axis_spacing > 0 else 1.0
+        )
+        # No smoothing where the series is as fine as (or finer than) the output
+        # grid along that axis; grow with coarseness, capped to stay local.
+        sigma_val = float(np.clip(0.5 * (ratio - 1.0), 0.0, 3.0))
+        sigma = [0.0, 0.0, 0.0]  # numpy z, y, x
+        sigma[best_np_axis] = sigma_val
+        angle_deg = float(np.degrees(np.arccos(max(0.0, min(1.0, best_dot)))))
+        print("[DEBUG triplanar.obliq] '{}' slice_ijk={} slice_dir_ras={} -> "
+              "out_np_axis={} angle={}deg ratio={} sigma(z,y,x)={}".format(
+                  series_volume.GetName(), slice_ijk,
+                  [round(float(c), 3) for c in slice_dir], best_np_axis,
+                  round(angle_deg, 1), round(ratio, 2),
+                  tuple(round(s, 2) for s in sigma)))
+        return tuple(sigma)
 
     def _fuse_series_results(self):
         """Direction-weighted SDF fusion of the collected per-series masks
@@ -1936,76 +1930,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """Read the persisted tri-planar mode preference. Default False."""
         return self._get_qsetting(SETTING_TRIPLANAR_ENABLED, False, cast=bool)
 
-    def _classify_series_orientation(self, volume):
-        """Classify a volume as 'axial'|'sagittal'|'coronal' from its thinnest
-        (best-resolved) axis' RAS direction, or 'oblique' if not axis-aligned.
-
-        Thin along S -> sharp in the axial plane; thin along R -> sagittal; thin
-        along A -> coronal. Reuses _ijk_to_ras_axis_map for the IJK->RAS mapping.
-        """
-        mapping = self._ijk_to_ras_axis_map(volume)
-        if mapping is None:
-            print("[DEBUG triplanar.classify] '{}' -> oblique (not axis-aligned)"
-                  .format(volume.GetName() if volume else None))
-            return "oblique"
-        axis_map, spacing = mapping
-        thin_ijk = int(np.argmin(spacing))
-        thin_ras = axis_map[thin_ijk]  # 0=R, 1=A, 2=S
-        orient = {0: "sagittal", 1: "coronal", 2: "axial"}.get(thin_ras, "oblique")
-        print("[DEBUG triplanar.classify] '{}' spacing(x,y,z)={} thin_ijk={} "
-              "thin_ras={} -> {}".format(
-                  volume.GetName(), tuple(round(float(s), 3) for s in spacing),
-                  thin_ijk, thin_ras, orient))
-        return orient
-
-    def _candidate_series_volumes(self):
-        """Scalar volumes that may be a tri-planar series (excludes the hidden
-        output-geometry node and internal scratch volumes)."""
-        candidates = []
-        for v in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode"):
-            name = v.GetName() or ""
-            if "(do not touch)" in name or name == OUTPUT_GEOMETRY_NODE_NAME:
-                continue
-            candidates.append(v)
-        return candidates
-
     def _setup_triplanar_views(self):
-        """Auto-assign axial/sagittal/coronal series to the Red/Yellow/Green
-        views by detecting each series' orientation, lock the assignment in as
-        the sticky per-plane display snapshot, and enable the high-resolution
-        output grid + series fusion. Returns True on a usable (>=2 view)
-        assignment; otherwise warns and leaves the user to assign manually."""
-        candidates = self._candidate_series_volumes()
-        print("[DEBUG triplanar.setup] candidate volumes: {}".format(
-            [v.GetName() for v in candidates]))
-        by_orientation = {}
-        for v in candidates:
-            orient = self._classify_series_orientation(v)
-            if orient in TRIPLANAR_ORIENTATION_TO_VIEW and orient not in by_orientation:
-                by_orientation[orient] = v
-        print("[DEBUG triplanar.setup] assignment: {}".format(
-            {o: n.GetName() for o, n in by_orientation.items()}))
-        if len(by_orientation) < 2:
-            print("[DEBUG triplanar.setup] FAIL: fewer than 2 distinct orientations")
-            slicer.util.showStatusMessage(
-                "Tri-planar mode needs at least two axis-aligned series with "
-                "distinct orientations; assign views manually instead.", 6000
-            )
-            return False
-        snapshot = {}
-        for orient, view in TRIPLANAR_ORIENTATION_TO_VIEW.items():
-            vol = by_orientation.get(orient)
-            snapshot[view] = vol.GetID() if vol is not None else None
-            selector_name = PLANE_DISPLAY_SELECTOR_NAMES.get(view)
-            if vol is not None and selector_name and hasattr(self, "ui"):
-                try:
-                    getattr(self.ui, selector_name).setCurrentNode(vol)
-                except Exception:  # noqa: BLE001 - UI selector is best-effort
-                    pass
-        self._plane_display_snapshot = snapshot
-        self._plane_display_volumes_active = bool(
-            self._apply_plane_display_volumes(show_status=False)
-        )
+        """Apply the user's manual Red/Yellow/Green series assignment as the
+        sticky per-plane display, then enable the high-resolution output grid and
+        series fusion. Series selection is the user's job (Multi-plane display
+        panel: Red=axial, Yellow=sagittal, Green=coronal by convention); this only
+        locks in what they chose and turns on the prerequisites. Returns True when
+        at least two views show distinct series."""
+        # Lock in / re-apply whatever the user selected in the multi-plane panel.
+        self.on_apply_plane_display_volumes_clicked()
         # A fine isotropic output grid sharpens the fused result; fusion must be
         # on so each routed per-view result is collected per series.
         self._enable_high_res_for_smoothing()
@@ -2015,15 +1948,23 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self.ui.cbEnableSeriesFusion.blockSignals(blocked)
         self._fusion_results = {}
         self._fusion_grid_shape = None
-        assigned = ", ".join(
-            "{}={}".format(view, by_orientation[orient].GetName())
-            for orient, view in TRIPLANAR_ORIENTATION_TO_VIEW.items()
-            if orient in by_orientation
+        bg = {v: self._view_background_volume(v) for v in PLANE_DISPLAY_SELECTOR_NAMES}
+        view_series = {
+            v: (n.GetName() if n is not None else None) for v, n in bg.items()
+        }
+        print("[DEBUG triplanar.setup] view backgrounds: {}".format(view_series))
+        distinct_ids = {n.GetID() for n in bg.values() if n is not None}
+        if len(distinct_ids) < 2:
+            print("[DEBUG triplanar.setup] WARN: fewer than 2 distinct series in views")
+            slicer.util.showStatusMessage(
+                "Tri-planar mode: assign your series to the Red/Yellow/Green views "
+                "in the Multi-plane display panel (and Apply) first.", 6000
+            )
+            return False
+        slicer.util.showStatusMessage(
+            "Tri-planar mode on: " + ", ".join(
+                "{}={}".format(v, n) for v, n in view_series.items()), 5000
         )
-        print("[DEBUG triplanar.setup] applied; snapshot={}, sticky_active={}, "
-              "high-res+fusion enabled".format(
-                  snapshot, self._plane_display_volumes_active))
-        slicer.util.showStatusMessage("Tri-planar views: " + assigned, 5000)
         return True
 
     def _on_triplanar_mode_toggled(self, checked):
