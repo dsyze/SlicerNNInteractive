@@ -1114,6 +1114,16 @@
           </property>
           <layout class="QVBoxLayout" name="verticalLayout_nativeSeriesInference">
            <item>
+            <widget class="QCheckBox" name="cbTriPlanarMode">
+             <property name="toolTip">
+              <string>Tri-planar multi-series mode: route each interaction to the series shown in the view you click, auto-assign axial/sagittal/coronal series to the Red/Yellow/Green views, and direction-weighted-fuse the three directions after every interaction to reduce through-plane staircase artifacts. Requires three co-registered series.</string>
+             </property>
+             <property name="text">
+              <string>Tri-planar multi-series mode</string>
+             </property>
+            </widget>
+           </item>
+           <item>
             <widget class="QCheckBox" name="cbEnableNativeSeriesInference">
              <property name="toolTip">
               <string>Run nnInteractive on a registered supplemental series. Results are previewed first and synchronized back to the Segment Editor source volume only when confirmed.</string>

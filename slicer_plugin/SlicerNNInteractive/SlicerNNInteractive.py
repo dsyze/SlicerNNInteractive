@@ -94,6 +94,15 @@ SETTING_LASSO_CLIP_N = "SlicerNNInteractive/lasso_clip_n"
 SETTING_LASSO_MULTIVIEW_ENABLED = "SlicerNNInteractive/lasso_multiview_enabled"
 SETTING_HIGH_RES_ENABLED = "SlicerNNInteractive/high_res_output_enabled"
 SETTING_SMOOTH_INTERPOLATE_ENABLED = "SlicerNNInteractive/smooth_interpolate_enabled"
+SETTING_TRIPLANAR_ENABLED = "SlicerNNInteractive/triplanar_mode_enabled"
+
+# Standard slice view that best resolves each acquisition orientation
+# (Slicer convention: Red=Axial, Yellow=Sagittal, Green=Coronal).
+TRIPLANAR_ORIENTATION_TO_VIEW = {
+    "axial": "Red",
+    "sagittal": "Yellow",
+    "coronal": "Green",
+}
 
 
 def debug_print(*args):
@@ -232,6 +241,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # keyed by inference-volume id. SDF-averaged into one smooth mask on Fuse.
         self._fusion_results = {}        # volume_id -> uint8 mask (output grid)
         self._fusion_grid_shape = None   # output (z,y,x) shape the masks belong to
+        # Tri-planar multi-series mode: each interaction is routed to the series
+        # shown in the view it was made in, and the three directions are
+        # direction-weighted-fused after every interaction. While a prompt is
+        # routed, _active_inference_volume_override forces get_inference_volume_node
+        # to return that view's series.
+        self._triplanar_mode = False
+        self._active_inference_volume_override = None
         # Applying per-plane display volumes enables a sticky view override.
         # Hidden Segment Editor widgets may reset slice backgrounds while
         # activating effects, so restore the user's selections afterward.
@@ -775,8 +791,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         The embedded Segment Editor source volume remains the canonical output
         grid. A supplemental working volume is used only while native-series
-        inference is explicitly enabled.
+        inference is explicitly enabled. In tri-planar mode a per-prompt override
+        (set while routing an interaction to the clicked view's series) takes
+        precedence so the prompt runs against that series.
         """
+        override = getattr(self, "_active_inference_volume_override", None)
+        if override is not None and slicer.mrmlScene.IsNodePresent(override):
+            return override
         source_volume = self.get_volume_node()
         if source_volume is None:
             return None
@@ -1755,9 +1776,70 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                   "to a different registered series for each plane.")
         self._refresh_native_series_inference_ui()
 
+    @staticmethod
+    def _ijk_to_ras_axis_map(volume):
+        """For a near-axis-aligned volume, return (axis_map, spacing) where
+        axis_map[k] is the RAS axis index (0=R, 1=A, 2=S) that IJK axis k maps
+        to, and spacing is GetSpacing() (sI, sJ, sK). Returns None when the
+        volume is oblique or the IJK->RAS mapping is not a clean permutation."""
+        get_dirs = getattr(volume, "GetIJKToRASDirectionMatrix", None)
+        if get_dirs is None:
+            return None
+        m = vtk.vtkMatrix4x4()
+        get_dirs(m)
+        axis_map = []
+        for k in range(3):  # IJK axis k is column k of the direction matrix
+            col = [abs(m.GetElement(r, k)) for r in range(3)]
+            ras = int(np.argmax(col))
+            if col[ras] < OBLIQUE_COS_THRESHOLD:
+                return None  # oblique; cannot cleanly map this axis to RAS
+            axis_map.append(ras)
+        if sorted(axis_map) != [0, 1, 2]:
+            return None  # not a clean permutation of the RAS axes
+        return axis_map, tuple(volume.GetSpacing())
+
+    def _series_anisotropic_sigma(self, series_volume):
+        """Per-output-axis Gaussian sigma (in voxels, numpy z,y,x order) that
+        blurs a series ONLY along axes where it is coarser than the output grid
+        -- i.e. its thick, stair-stepped acquisition axis -- while leaving its
+        sharp in-plane axes untouched. Used by direction-weighted fusion so that
+        each series stops imposing its through-plane jaggies and the series that
+        is sharp in a given plane governs the fused surface there. Returns None
+        when either grid is oblique (caller then skips smoothing)."""
+        output_volume = self.get_output_volume_node()
+        if output_volume is None or series_volume is None:
+            return None
+        series = self._ijk_to_ras_axis_map(series_volume)
+        out = self._ijk_to_ras_axis_map(output_volume)
+        if series is None or out is None:
+            return None
+        series_axis_map, series_spacing = series
+        out_axis_map, out_spacing = out
+        ras_series = [0.0, 0.0, 0.0]
+        ras_out = [0.0, 0.0, 0.0]
+        for k in range(3):
+            ras_series[series_axis_map[k]] = series_spacing[k]
+            ras_out[out_axis_map[k]] = out_spacing[k]
+        sigma_ras = []
+        for a in range(3):
+            ratio = ras_series[a] / ras_out[a] if ras_out[a] > 0 else 1.0
+            # No smoothing where the series is as fine as (or finer than) the
+            # output grid; grow with coarseness, capped to stay local.
+            sigma_ras.append(float(np.clip(0.5 * (ratio - 1.0), 0.0, 3.0)))
+        # Map RAS-axis sigma to output numpy axes (z=K=ijk2, y=J=ijk1, x=I=ijk0).
+        return (
+            sigma_ras[out_axis_map[2]],
+            sigma_ras[out_axis_map[1]],
+            sigma_ras[out_axis_map[0]],
+        )
+
     def _fuse_series_results(self):
-        """SDF-average all collected per-series masks (output grid) into one
-        smooth uint8 mask on the output grid, or None if nothing to fuse."""
+        """Direction-weighted SDF fusion of the collected per-series masks
+        (output grid) into one smooth uint8 mask on the output grid, or None if
+        nothing to fuse. Each series' signed distance field is blurred only along
+        its own thick (stair-stepped) acquisition axis before averaging, so the
+        series that is sharpest in a given plane dominates the fused boundary
+        there and through-plane jaggies are suppressed."""
         try:
             from scipy import ndimage
         except Exception:
@@ -1775,31 +1857,39 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 k, nm.GetName() if nm else "<gone>",
                 None if m is None else tuple(m.shape),
                 None if m is None else int(m.sum())))
-        masks = [
-            m
-            for m in self._fusion_results.values()
-            if m is not None and tuple(m.shape) == tuple(out_shape) and m.any()
-        ]
-        if not masks:
-            print("[DEBUG fusion.fuse] SKIP: no usable masks after filtering")
-            return None
         output_volume = self.get_output_volume_node()
         spacing = output_volume.GetSpacing()  # (x, y, z) mm
         samp = (spacing[2], spacing[1], spacing[0])  # numpy (z, y, x)
         sdf_sum = np.zeros(out_shape, dtype=np.float32)
-        for m in masks:
+        n = 0
+        for vid, m in self._fusion_results.items():
+            if m is None or tuple(m.shape) != tuple(out_shape) or not m.any():
+                continue
             mb = m.astype(bool)
             # Positive inside, negative outside (matches the convention used by
-            # _interpolate_mask_to_output_grid). Averaging level sets and
-            # thresholding at zero yields a smooth "mean surface".
+            # _interpolate_mask_to_output_grid).
             sdf = (
                 ndimage.distance_transform_edt(mb, sampling=samp)
                 - ndimage.distance_transform_edt(~mb, sampling=samp)
             ).astype(np.float32)
+            # Direction weighting: blur this series' level set only along its own
+            # thick (coarse) axis so its through-plane stair-steps drop out, while
+            # its sharp in-plane edges survive and govern the fused surface there.
+            sigma = self._series_anisotropic_sigma(slicer.mrmlScene.GetNodeByID(vid))
+            if sigma is not None and any(s > 0 for s in sigma):
+                sdf = ndimage.gaussian_filter(sdf, sigma=sigma).astype(np.float32)
+                print("[DEBUG fusion.fuse]   id={} thick-axis blur sigma(z,y,x)="
+                      "{}".format(vid, tuple(round(float(s), 2) for s in sigma)))
             sdf_sum += sdf
-        fused = (sdf_sum / len(masks) >= 0).astype(np.uint8)
-        print("[DEBUG fusion.fuse] {} usable series, spacing(x,y,z)={} -> "
-              "fused voxels {}".format(len(masks), tuple(spacing), int(fused.sum())))
+            n += 1
+        if n == 0:
+            print("[DEBUG fusion.fuse] SKIP: no usable masks after filtering")
+            return None
+        # Averaging level sets and thresholding at zero yields a smooth mean
+        # surface; with the per-series blur it is direction-weighted.
+        fused = (sdf_sum / n >= 0).astype(np.uint8)
+        print("[DEBUG fusion.fuse] {} usable series (direction-weighted) -> "
+              "fused voxels {}".format(n, int(fused.sum())))
         return fused
 
     def on_fuse_series_clicked(self, checked=False):
@@ -1837,8 +1927,227 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._fusion_grid_shape = None
         self._refresh_native_series_inference_ui()
 
+    # -- Tri-planar multi-series mode ----------------------------------------
+
+    def _get_triplanar_enabled(self):
+        """Read the persisted tri-planar mode preference. Default False."""
+        return self._get_qsetting(SETTING_TRIPLANAR_ENABLED, False, cast=bool)
+
+    def _classify_series_orientation(self, volume):
+        """Classify a volume as 'axial'|'sagittal'|'coronal' from its thinnest
+        (best-resolved) axis' RAS direction, or 'oblique' if not axis-aligned.
+
+        Thin along S -> sharp in the axial plane; thin along R -> sagittal; thin
+        along A -> coronal. Reuses _ijk_to_ras_axis_map for the IJK->RAS mapping.
+        """
+        mapping = self._ijk_to_ras_axis_map(volume)
+        if mapping is None:
+            return "oblique"
+        axis_map, spacing = mapping
+        thin_ras = axis_map[int(np.argmin(spacing))]  # 0=R, 1=A, 2=S
+        return {0: "sagittal", 1: "coronal", 2: "axial"}.get(thin_ras, "oblique")
+
+    def _candidate_series_volumes(self):
+        """Scalar volumes that may be a tri-planar series (excludes the hidden
+        output-geometry node and internal scratch volumes)."""
+        candidates = []
+        for v in slicer.util.getNodesByClass("vtkMRMLScalarVolumeNode"):
+            name = v.GetName() or ""
+            if "(do not touch)" in name or name == OUTPUT_GEOMETRY_NODE_NAME:
+                continue
+            candidates.append(v)
+        return candidates
+
+    def _setup_triplanar_views(self):
+        """Auto-assign axial/sagittal/coronal series to the Red/Yellow/Green
+        views by detecting each series' orientation, lock the assignment in as
+        the sticky per-plane display snapshot, and enable the high-resolution
+        output grid + series fusion. Returns True on a usable (>=2 view)
+        assignment; otherwise warns and leaves the user to assign manually."""
+        by_orientation = {}
+        for v in self._candidate_series_volumes():
+            orient = self._classify_series_orientation(v)
+            if orient in TRIPLANAR_ORIENTATION_TO_VIEW and orient not in by_orientation:
+                by_orientation[orient] = v
+        if len(by_orientation) < 2:
+            slicer.util.showStatusMessage(
+                "Tri-planar mode needs at least two axis-aligned series with "
+                "distinct orientations; assign views manually instead.", 6000
+            )
+            return False
+        snapshot = {}
+        for orient, view in TRIPLANAR_ORIENTATION_TO_VIEW.items():
+            vol = by_orientation.get(orient)
+            snapshot[view] = vol.GetID() if vol is not None else None
+            selector_name = PLANE_DISPLAY_SELECTOR_NAMES.get(view)
+            if vol is not None and selector_name and hasattr(self, "ui"):
+                try:
+                    getattr(self.ui, selector_name).setCurrentNode(vol)
+                except Exception:  # noqa: BLE001 - UI selector is best-effort
+                    pass
+        self._plane_display_snapshot = snapshot
+        self._plane_display_volumes_active = bool(
+            self._apply_plane_display_volumes(show_status=False)
+        )
+        # A fine isotropic output grid sharpens the fused result; fusion must be
+        # on so each routed per-view result is collected per series.
+        self._enable_high_res_for_smoothing()
+        if hasattr(self, "ui"):
+            blocked = self.ui.cbEnableSeriesFusion.blockSignals(True)
+            self.ui.cbEnableSeriesFusion.setChecked(True)
+            self.ui.cbEnableSeriesFusion.blockSignals(blocked)
+        self._fusion_results = {}
+        self._fusion_grid_shape = None
+        assigned = ", ".join(
+            "{}={}".format(view, by_orientation[orient].GetName())
+            for orient, view in TRIPLANAR_ORIENTATION_TO_VIEW.items()
+            if orient in by_orientation
+        )
+        slicer.util.showStatusMessage("Tri-planar views: " + assigned, 5000)
+        return True
+
+    def _on_triplanar_mode_toggled(self, checked):
+        """Enter or leave tri-planar multi-series mode."""
+        self._set_qsetting(SETTING_TRIPLANAR_ENABLED, bool(checked))
+        self._triplanar_mode = bool(checked)
+        self._active_inference_volume_override = None
+        if checked:
+            self._setup_triplanar_views()
+        self._refresh_native_series_inference_ui()
+
+    @staticmethod
+    def _last_control_point_ras(caller):
+        """World RAS of the markup's most recently placed control point, or None."""
+        try:
+            n = caller.GetNumberOfControlPoints()
+            if n <= 0:
+                return None
+            ras = [0.0, 0.0, 0.0]
+            caller.GetNthControlPointPositionWorld(n - 1, ras)
+            return list(ras)
+        except Exception:  # noqa: BLE001 - defensive around VTK accessors
+            return None
+
+    def _mask_centroid_ras(self, mask, volume_node):
+        """RAS centroid of the nonzero voxels of `mask` on volume_node's grid
+        (assumes volume_node has no parent transform, which holds for the Segment
+        Editor source volume the scribble is painted on). Returns None if empty."""
+        if volume_node is None:
+            return None
+        idx = np.argwhere(np.asarray(mask) > 0)
+        if idx.size == 0:
+            return None
+        cz, cy, cx = idx.mean(axis=0)  # numpy (z, y, x) == IJK (k, j, i)
+        m = vtk.vtkMatrix4x4()
+        volume_node.GetIJKToRASMatrix(m)
+        ras = m.MultiplyPoint([float(cx), float(cy), float(cz), 1.0])
+        return [ras[0], ras[1], ras[2]]
+
+    def _view_for_ras_point(self, ras, tolerance_mm=2.0):
+        """Standard view (Red/Yellow/Green) whose slice plane the RAS point lies
+        on, or None. A markup placed in a 2D slice view lies on that view's
+        plane, so this recovers which view an interaction happened in for
+        tri-planar routing. Returns None when no plane is within tolerance (e.g.
+        a point placed in the 3D view)."""
+        if ras is None:
+            return None
+        best_view, best_dist = None, None
+        for view_name, _logic, slice_node in self._iter_standard_slice_logics():
+            m = slice_node.GetSliceToRAS()
+            origin = (m.GetElement(0, 3), m.GetElement(1, 3), m.GetElement(2, 3))
+            normal = (m.GetElement(0, 2), m.GetElement(1, 2), m.GetElement(2, 2))
+            nlen = (normal[0] ** 2 + normal[1] ** 2 + normal[2] ** 2) ** 0.5
+            if nlen == 0:
+                continue
+            dist = abs(
+                sum((ras[i] - origin[i]) * normal[i] for i in range(3)) / nlen
+            )
+            if best_dist is None or dist < best_dist:
+                best_view, best_dist = view_name, dist
+        if best_view is not None and best_dist is not None and best_dist <= tolerance_mm:
+            return best_view
+        return None
+
+    def _route_prompt_to_view(self, ras):
+        """In tri-planar mode, set the per-prompt inference override to the series
+        shown in the view containing `ras`. Resets any previous override first.
+        Returns the routed view name or None. The caller MUST clear the override
+        (self._active_inference_volume_override = None) when the prompt finishes."""
+        self._active_inference_volume_override = None
+        if not self._triplanar_mode or ras is None:
+            return None
+        view = self._view_for_ras_point(ras)
+        if view is None:
+            return None
+        series = self._view_background_volume(view)
+        if series is None:
+            return None
+        self._active_inference_volume_override = series
+        debug_print(
+            "[triplanar] routed interaction to view {} (series '{}')".format(
+                view, series.GetName()
+            )
+        )
+        return view
+
+    def _resample_result_to_output(self, working_mask):
+        """Bring an nnInteractive result from the inference grid onto the
+        canonical output grid (smoothed if active), falling back to the source
+        grid if the high-res resample fails. Returns an output-grid mask."""
+        working_volume = self.get_inference_volume_node()
+        if self._smoothing_active():
+            out = self._interpolate_mask_to_output_grid(working_mask, working_volume)
+            if out is not None:
+                return out
+        out = self._resample_mask_between_volumes(
+            working_mask, working_volume, self.get_output_volume_node()
+        )
+        if out is None:
+            self._disable_high_res_output(
+                "High-resolution output resample failed; reverted to source grid."
+            )
+            out = self._resample_mask_between_volumes(
+                working_mask, working_volume, self.get_output_volume_node()
+            )
+        if out is None:
+            out = np.asarray(working_mask)
+        return out
+
+    def _handle_triplanar_result(self, segmentation_mask):
+        """Tri-planar mode: collect the routed per-view result for fusion and
+        show the direction-weighted fused combination (no per-series preview)."""
+        output_mask = self._resample_result_to_output(segmentation_mask)
+        self._maybe_collect_fusion_result(output_mask)
+        if not self._maybe_autofuse():
+            # Only one series collected so far: show this result directly so the
+            # user still gets immediate feedback before a second view is used.
+            self.show_segmentation(np.asarray(output_mask).astype(np.uint8))
+
+    def _maybe_autofuse(self):
+        """In tri-planar mode, fuse all collected series and display the result.
+        Records one undo snapshot per fuse (consistent with the manual Fuse) and
+        returns True when a fused result was shown."""
+        if not self._triplanar_mode or len(self._fusion_results) < 2:
+            return False
+        fused = self._fuse_series_results()
+        if fused is None:
+            return False
+        seg_id = self.get_current_segment_id()
+        if seg_id:
+            pre = self.get_segment_data(
+                self.get_output_volume_node()
+            ).astype(np.uint8).copy()
+            self._record_selection_op_undo(seg_id, pre)
+        self.show_segmentation(fused)
+        return True
+
     def _handle_server_segmentation_result(self, segmentation_mask):
         """Write normal results directly, but stage supplemental results as previews."""
+        if self._triplanar_mode:
+            # Per-view routed result: collect it for fusion and show the combined
+            # direction-weighted result instead of a single-series preview.
+            self._handle_triplanar_result(segmentation_mask)
+            return
         if not self._is_native_series_inference_active():
             # The result is on the inference grid (== source here). Resample onto
             # the canonical output grid before writing (no-op if they are equal).
@@ -1967,6 +2276,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self._on_series_fusion_toggled
         )
         self.ui.pbFuseSeries.clicked.connect(self.on_fuse_series_clicked)
+        # Tri-planar multi-series mode. Restore the persisted preference into the
+        # checkbox with signals blocked (so we do not rearrange views at startup,
+        # before series are loaded); the view setup runs when the user toggles.
+        self.ui.cbTriPlanarMode.toggled.connect(self._on_triplanar_mode_toggled)
+        blocked = self.ui.cbTriPlanarMode.blockSignals(True)
+        self.ui.cbTriPlanarMode.setChecked(self._get_triplanar_enabled())
+        self.ui.cbTriPlanarMode.blockSignals(blocked)
+        self._triplanar_mode = self._get_triplanar_enabled()
         self.ui.pbRegisterSupplemental.clicked.connect(
             self.on_register_supplemental_clicked
         )
@@ -2568,13 +2885,19 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             )
             return
 
-        xyz = self.xyz_from_caller(
-            caller, volume_node=self.get_inference_volume_node()
-        )
+        # Tri-planar routing: run this prompt against the series shown in the
+        # view the point was placed in (no-op outside tri-planar mode).
+        self._route_prompt_to_view(self._last_control_point_ras(caller))
+        try:
+            xyz = self.xyz_from_caller(
+                caller, volume_node=self.get_inference_volume_node()
+            )
 
-        volume_node = self.get_volume_node()
-        if volume_node:
-            self.point_prompt(xyz=xyz, positive_click=self.is_positive)
+            volume_node = self.get_volume_node()
+            if volume_node:
+                self.point_prompt(xyz=xyz, positive_click=self.is_positive)
+        finally:
+            self._active_inference_volume_override = None
 
     @ensure_synched
     def point_prompt(self, xyz=None, positive_click=False):
@@ -2614,45 +2937,52 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             )
             return
 
-        xyz = self.xyz_from_caller(
-            caller, volume_node=self.get_inference_volume_node()
-        )
+        # Tri-planar routing: run this box against the series shown in the view
+        # the corner was placed in (no-op outside tri-planar mode). Routed before
+        # voxel coordinates are computed so both corners land in that series' grid.
+        self._route_prompt_to_view(self._last_control_point_ras(caller))
+        try:
+            xyz = self.xyz_from_caller(
+                caller, volume_node=self.get_inference_volume_node()
+            )
 
-        if self.prev_caller is not None and caller.GetID() == self.prev_caller.GetID():
-            roi_node = slicer.mrmlScene.GetNodeByID(caller.GetID())
-            current_size = list(roi_node.GetSize())
-            drawn_in_axis = np.argwhere(np.array(xyz) == self.prev_bbox_xyz).squeeze()
-            current_size[drawn_in_axis] = 0
-            roi_node.SetSize(current_size)
+            if self.prev_caller is not None and caller.GetID() == self.prev_caller.GetID():
+                roi_node = slicer.mrmlScene.GetNodeByID(caller.GetID())
+                current_size = list(roi_node.GetSize())
+                drawn_in_axis = np.argwhere(np.array(xyz) == self.prev_bbox_xyz).squeeze()
+                current_size[drawn_in_axis] = 0
+                roi_node.SetSize(current_size)
 
-            volume_node = self.get_volume_node()
-            if volume_node:
-                outer_point_two = self.prev_bbox_xyz
+                volume_node = self.get_volume_node()
+                if volume_node:
+                    outer_point_two = self.prev_bbox_xyz
 
-                outer_point_one = [
-                    xyz[0] * 2 - outer_point_two[0],
-                    xyz[1] * 2 - outer_point_two[1],
-                    xyz[2] * 2 - outer_point_two[2],
-                ]
+                    outer_point_one = [
+                        xyz[0] * 2 - outer_point_two[0],
+                        xyz[1] * 2 - outer_point_two[1],
+                        xyz[2] * 2 - outer_point_two[2],
+                    ]
 
-                self.bbox_prompt(
-                    outer_point_one=outer_point_one,
-                    outer_point_two=outer_point_two,
-                    positive_click=self.is_positive,
-                )
+                    self.bbox_prompt(
+                        outer_point_one=outer_point_one,
+                        outer_point_two=outer_point_two,
+                        positive_click=self.is_positive,
+                    )
 
-                def _next():
-                    self.setup_prompts()
-                    # Start placing a new box
-                    self.ui.pbInteractionBBox.click()
+                    def _next():
+                        self.setup_prompts()
+                        # Start placing a new box
+                        self.ui.pbInteractionBBox.click()
 
-                qt.QTimer.singleShot(0, _next)
+                    qt.QTimer.singleShot(0, _next)
 
-            self.prev_caller = None
-        else:
-            self.prev_bbox_xyz = xyz
+                self.prev_caller = None
+            else:
+                self.prev_bbox_xyz = xyz
 
-        self.prev_caller = caller
+            self.prev_caller = caller
+        finally:
+            self._active_inference_volume_override = None
 
     @ensure_synched
     def bbox_prompt(self, outer_point_one, outer_point_two, positive_click=False):
@@ -2700,7 +3030,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         print("[DEBUG submit_lasso] called, multiview={}".format(
             self._get_lasso_multiview_enabled()))
         caller = self.prompt_types["lasso"]["node"]
-        inference_volume = self.get_inference_volume_node()
 
         # Grab raw RAS curve points for world-space planarity check (robust for
         # oblique volumes where the RAS->IJK transform scatters voxel indices).
@@ -2708,6 +3037,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         _vtk_pts = caller.GetCurvePointsWorld()
         _ras_pts = _vtk_to_numpy(_vtk_pts.GetData()) if _vtk_pts is not None else np.zeros((0, 3))
         print("[DEBUG submit_lasso] _ras_pts count:", len(_ras_pts))
+
+        # Tri-planar routing: a lasso is drawn on one view's plane, so route it to
+        # that view's series BEFORE computing voxel coords / rasterizing. In
+        # tri-planar mode multi-view accumulation is bypassed (each view shows a
+        # different series), so the lasso submits immediately and routed.
+        if self._triplanar_mode and len(_ras_pts):
+            self._route_prompt_to_view(list(_ras_pts[0]))
+        multiview_effective = (
+            self._get_lasso_multiview_enabled() and not self._triplanar_mode
+        )
+        inference_volume = self.get_inference_volume_node()
 
         xyzs = self.xyz_from_caller(
             caller,
@@ -2719,6 +3059,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if len(xyzs) < 3:
             slicer.util.showStatusMessage("Lasso needs at least 3 points.", 4000)
             print("[DEBUG submit_lasso] RETURN: fewer than 3 points")
+            self._active_inference_volume_override = None
             return
 
         # The lasso prompt only supports points on a single slice plane.
@@ -2738,15 +3079,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             )
             caller.RemoveAllControlPoints()
             self.ui.pbInteractionLassoCancel.setVisible(False)
+            self._active_inference_volume_override = None
             return
 
         volume_node = self.get_volume_node()
         if not volume_node:
             slicer.util.showStatusMessage("No source volume selected.", 4000)
             print("[DEBUG submit_lasso] RETURN: no volume node")
+            self._active_inference_volume_override = None
             return
 
-        if self._get_lasso_multiview_enabled():
+        if multiview_effective:
             # Multi-view mode: keep this plane's mask, don't submit yet. Each
             # plane is sent as its own lasso interaction on Submit.
             self._multiview_lasso_masks.append(mask.copy())
@@ -2786,6 +3129,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 tp="lasso",
                 mask_volume_node=inference_volume,
             )
+            self._active_inference_volume_override = None
 
             def _next():
                 self.setup_prompts()
@@ -2950,12 +3294,23 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         diff_mask = mask - prev_scribble_mask
         self._prev_scribble_mask = mask
 
-        self.lasso_or_scribble_prompt(
-            mask=diff_mask,
-            positive_click=self.is_positive,
-            tp="scribble",
-            mask_volume_node=self.get_volume_node(),
-        )
+        # Tri-planar routing: send the scribble to the series shown in the view
+        # it was drawn in, detected from the painted plane's RAS centroid. The
+        # diff mask is on the source grid; lasso_or_scribble_prompt resamples it
+        # onto the routed series before upload.
+        if self._triplanar_mode:
+            self._route_prompt_to_view(
+                self._mask_centroid_ras(diff_mask, self.get_volume_node())
+            )
+        try:
+            self.lasso_or_scribble_prompt(
+                mask=diff_mask,
+                positive_click=self.is_positive,
+                tp="scribble",
+                mask_volume_node=self.get_volume_node(),
+            )
+        finally:
+            self._active_inference_volume_override = None
 
         self.ui.pbInteractionScribble.click()  # turn it off
         self.ui.pbInteractionScribble.click()  # turn it on
