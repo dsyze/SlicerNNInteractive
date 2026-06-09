@@ -32,7 +32,7 @@ from PythonQt.QtGui import QMessageBox
 
 DEBUG_MODE = False
 
-PLUGIN_VERSION = "1.2.1-triplanar-fusion"
+PLUGIN_VERSION = "1.2.2-triplanar-perf"
 print("[nni] SlicerNNInteractive build loaded:", PLUGIN_VERSION)
 
 # A volume counts as oblique (and gets rotated to its own acquisition plane) when
@@ -53,6 +53,10 @@ OUTPUT_GEOMETRY_NODE_NAME = "NNInteractiveOutputGeometry (do not touch)"
 # Voxel-count guardrails for the isotropic output grid (kept opt-in + bounded).
 OUTPUT_GEOMETRY_SOFT_VOXEL_BUDGET = 50_000_000
 OUTPUT_GEOMETRY_HARD_VOXEL_BUDGET = 150_000_000
+# Tri-planar fusion runs SDF + resample + render on the output grid after EVERY
+# interaction, so cap it well below the single-shot high-res budget to keep each
+# operation light (load reduction, not RAM; tunable).
+TRIPLANAR_MAX_OUTPUT_VOXELS = 32_000_000
 OUTPUT_SPACING_MIN_MM = 0.3
 OUTPUT_SPACING_MAX_MM = 10.0
 # Lasso is a single-slice 2D prompt. Curve points are rounded to int voxels, so
@@ -818,7 +822,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         return self.ui.cbEnableHighResOutput.isChecked()
 
     def _get_output_spacing(self, source_volume=None):
-        """Isotropic output spacing in mm (0/empty -> finest source spacing)."""
+        """Isotropic output spacing in mm (0/empty -> finest source spacing),
+        coarsened so the resulting isotropic grid stays within the voxel budget
+        (tighter in tri-planar mode, where SDF fusion + resample + render run on
+        the output grid after every interaction). Returns the effective (capped)
+        spacing so the geometry-cache comparison in _ensure_output_geometry_node
+        stays stable (otherwise the grid would rebuild on every call)."""
         value = 0.0
         if hasattr(self, "ui"):
             try:
@@ -831,11 +840,32 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                     SETTING_OUTPUT_SPACING, 0.0, converter=float
                 )
             )
+        if source_volume is None:
+            source_volume = self.get_volume_node()
         if value <= 0.0:
-            if source_volume is None:
-                source_volume = self.get_volume_node()
             value = min(source_volume.GetSpacing()) if source_volume else 1.0
-        return max(OUTPUT_SPACING_MIN_MM, min(OUTPUT_SPACING_MAX_MM, value))
+        value = max(OUTPUT_SPACING_MIN_MM, min(OUTPUT_SPACING_MAX_MM, value))
+        # Coarsen to fit the voxel budget so the isotropic grid stays tractable.
+        budget = (
+            TRIPLANAR_MAX_OUTPUT_VOXELS
+            if getattr(self, "_triplanar_mode", False)
+            else OUTPUT_GEOMETRY_HARD_VOXEL_BUDGET
+        )
+        image = source_volume.GetImageData() if source_volume is not None else None
+        if image is not None:
+            spacing = source_volume.GetSpacing()
+            dims = image.GetDimensions()
+            extents = [dims[a] * spacing[a] for a in range(3)]
+
+            def voxel_count(iso):
+                return float(
+                    np.prod([max(1, int(np.ceil(e / iso))) for e in extents])
+                )
+
+            if voxel_count(value) > budget:
+                factor = (voxel_count(value) / budget) ** (1.0 / 3.0)
+                value = min(OUTPUT_SPACING_MAX_MM, value * factor)
+        return value
 
     def get_output_volume_node(self):
         """
@@ -1859,16 +1889,23 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         samp = (spacing[2], spacing[1], spacing[0])  # numpy (z, y, x)
         sdf_sum = np.zeros(out_shape, dtype=np.float32)
         n = 0
+        print("[DEBUG triplanar.perf] fuse: SDF start, out_voxels={}, series={}"
+              .format(int(np.prod(out_shape)), len(self._fusion_results)),
+              flush=True)
         for vid, m in self._fusion_results.items():
             if m is None or tuple(m.shape) != tuple(out_shape) or not m.any():
                 continue
             mb = m.astype(bool)
+            print("[DEBUG triplanar.perf] fuse: edt id={} start".format(vid),
+                  flush=True)
             # Positive inside, negative outside (matches the convention used by
             # _interpolate_mask_to_output_grid).
             sdf = (
                 ndimage.distance_transform_edt(mb, sampling=samp)
                 - ndimage.distance_transform_edt(~mb, sampling=samp)
             ).astype(np.float32)
+            print("[DEBUG triplanar.perf] fuse: edt id={} done".format(vid),
+                  flush=True)
             # Direction weighting: blur this series' level set only along its own
             # thick (coarse) axis so its through-plane stair-steps drop out, while
             # its sharp in-plane edges survive and govern the fused surface there.
@@ -2069,6 +2106,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         canonical output grid (smoothed if active), falling back to the source
         grid if the high-res resample fails. Returns an output-grid mask."""
         working_volume = self.get_inference_volume_node()
+        try:
+            _out_voxels = int(np.prod(self._output_grid_shape() or (0,)))
+        except Exception:
+            _out_voxels = -1
+        print("[DEBUG triplanar.perf] resample result: working_shape={}, "
+              "out_voxels={}".format(
+                  tuple(np.asarray(working_mask).shape), _out_voxels), flush=True)
         if self._smoothing_active():
             out = self._interpolate_mask_to_output_grid(working_mask, working_volume)
             if out is not None:
@@ -2109,20 +2153,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _maybe_autofuse(self):
         """In tri-planar mode, fuse all collected series and display the result.
-        Records one undo snapshot per fuse (consistent with the manual Fuse) and
-        returns True when a fused result was shown."""
+        Returns True when a fused result was shown. No custom undo snapshot is
+        recorded here -- it runs after every interaction and snapshotting the
+        whole (large) output grid each time is wasteful; show_segmentation's own
+        saveStateForUndo still gives editor-level undo. The manual Fuse button
+        keeps recording the custom undo."""
         if not self._triplanar_mode or len(self._fusion_results) < 2:
             return False
         fused = self._fuse_series_results()
         if fused is None:
             print("[DEBUG triplanar.autofuse] fuse returned None")
             return False
-        seg_id = self.get_current_segment_id()
-        if seg_id:
-            pre = self.get_segment_data(
-                self.get_output_volume_node()
-            ).astype(np.uint8).copy()
-            self._record_selection_op_undo(seg_id, pre)
         self.show_segmentation(fused)
         print("[DEBUG triplanar.autofuse] fused {} series and displayed".format(
             len(self._fusion_results)))
@@ -3390,6 +3431,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         was_3d_shown = segmentationNode.GetSegmentation().ContainsRepresentation(slicer.vtkSegmentationConverter.GetSegmentationClosedSurfaceRepresentationName())
 
+        print("[DEBUG triplanar.perf] show_segmentation: write labelmap "
+              "shape={}".format(tuple(np.asarray(segmentation_mask).shape)),
+              flush=True)
         with slicer.util.RenderBlocker():  # avoid flashing of 3D view
             self.ui.editor_widget.saveStateForUndo()
             slicer.util.updateSegmentBinaryLabelmapFromArray(
@@ -3398,8 +3442,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 selectedSegmentID,
                 self.get_output_volume_node(),
             )
-            if was_3d_shown:
+            # Tri-planar fuses + redraws after every interaction; rebuilding the
+            # closed surface (marching cubes) on the large output grid each time
+            # is a heavy CPU/GPU hit and a likely freeze/crash source, so skip it
+            # in tri-planar mode (the user can re-enable 3D when ready).
+            if was_3d_shown and not self._triplanar_mode:
+                print("[DEBUG triplanar.perf] CreateClosedSurfaceRepresentation "
+                      "start", flush=True)
                 segmentationNode.CreateClosedSurfaceRepresentation()
+                print("[DEBUG triplanar.perf] CreateClosedSurfaceRepresentation "
+                      "done", flush=True)
+        print("[DEBUG triplanar.perf] show_segmentation: done", flush=True)
 
         # Mark the segment as being edited (can be useful for selective saving of only modified segments)
         segment = segmentationNode.GetSegmentation().GetSegment(selectedSegmentID)
