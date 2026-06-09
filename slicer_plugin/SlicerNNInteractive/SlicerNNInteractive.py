@@ -32,7 +32,7 @@ from PythonQt.QtGui import QMessageBox
 
 DEBUG_MODE = False
 
-PLUGIN_VERSION = "1.2.0-triplanar-segfix"
+PLUGIN_VERSION = "1.2.1-triplanar-fusion"
 print("[nni] SlicerNNInteractive build loaded:", PLUGIN_VERSION)
 
 # A volume counts as oblique (and gets rotated to its own acquisition plane) when
@@ -1730,7 +1730,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """Store the latest result for the active inference series, keyed by its
         volume id, so the Fuse button can SDF-average all series together.
         Masks must live on the current output grid; stale ones are dropped."""
-        enabled = self._get_fusion_enabled()
+        # Tri-planar mode always collects per-series results for fusion, even if
+        # the cbEnableSeriesFusion checkbox got reset (it is not persisted across
+        # a module reload, unlike the tri-planar mode flag).
+        enabled = self._get_fusion_enabled() or self._triplanar_mode
         print("[DEBUG fusion.collect] called, fusion_enabled={}".format(enabled))
         if not enabled:
             return
@@ -3483,6 +3486,26 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         return self.ui.editor_widget.mrmlSegmentEditorNode().GetSelectedSegmentID()
 
+    def _segment_is_empty(self, segmentation_node, seg_id):
+        """True when the segment has no foreground voxels, determined WITHOUT
+        exporting to a reference geometry (Slicer's GenerateSharedLabelmap fails
+        and logs a VTK error on empty segments). Reads the binary-labelmap
+        representation directly. Returns False on any uncertainty so the caller
+        still attempts the guarded export rather than dropping real data."""
+        try:
+            if segmentation_node is None or not seg_id:
+                return True
+            segmentation = segmentation_node.GetSegmentation()
+            seg = segmentation.GetSegment(seg_id) if segmentation else None
+            if seg is None:
+                return True
+            labelmap = seg.GetRepresentation(self._binary_labelmap_name())
+            if labelmap is None or labelmap.GetNumberOfPoints() == 0:
+                return True
+            return labelmap.GetScalarRange()[1] <= 0
+        except Exception:  # noqa: BLE001 - uncertain -> let the export try
+            return False
+
     def get_segment_data(self, reference_volume_node=None):
         """
         Gets the selected segment on a requested scalar-volume geometry.
@@ -3503,23 +3526,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         # Avoid exporting an EMPTY segment to a different reference geometry:
         # Slicer's GenerateSharedLabelmap / ResampleOrientedImageToReferenceGeometry
-        # fails (and logs a VTK error) on an empty segment. Read the segment on its
-        # OWN geometry first (no resample, so no error); if empty, return an
-        # all-background mask on the reference grid without ever attempting the
-        # failing export. This is most visible with the high-resolution output grid
-        # (and the tri-planar mode that forces it on) on oblique series.
-        try:
-            native = slicer.util.arrayFromSegmentBinaryLabelmap(
-                segmentation_node, selected_segment_id
+        # fails (and logs a VTK error) on an empty segment. Detect emptiness from
+        # the binary-labelmap representation directly (no export, no resample) and
+        # short-circuit to an all-background mask on the reference grid. Most
+        # visible with the high-resolution output grid (and tri-planar mode that
+        # forces it on) on oblique series.
+        if self._segment_is_empty(segmentation_node, selected_segment_id):
+            return (
+                np.zeros(ref_shape, dtype=bool) if ref_shape is not None else None
             )
-            if native is None or int(np.asarray(native).sum()) == 0:
-                return (
-                    np.zeros(ref_shape, dtype=bool)
-                    if ref_shape is not None
-                    else None
-                )
-        except Exception as exc:  # noqa: BLE001 - fall through to guarded export
-            print("[DEBUG segdata] native (no-reference) read failed: {}".format(exc))
 
         # Non-empty: export onto the requested reference grid, guarded so a
         # resample failure (None / wrong shape / raise) degrades to an
