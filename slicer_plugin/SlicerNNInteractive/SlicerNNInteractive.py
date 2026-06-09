@@ -2088,9 +2088,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """Tri-planar mode: collect the routed per-view result for fusion and
         show the direction-weighted fused combination (no per-series preview)."""
         output_mask = self._resample_result_to_output(segmentation_mask)
-        print("[DEBUG triplanar.result] routed result sum={}, fusion store size={}"
-              .format(int(np.asarray(output_mask).astype(np.uint8).sum()),
-                      len(self._fusion_results)))
+        out_shape = self._output_grid_shape()
+        arr = np.asarray(output_mask)
+        print("[DEBUG triplanar.result] routed result sum={}, shape={}, "
+              "output_grid={}, match={}, fusion store size={}".format(
+                  int(arr.astype(np.uint8).sum()), tuple(arr.shape),
+                  tuple(out_shape) if out_shape is not None else None,
+                  (out_shape is not None and tuple(arr.shape) == tuple(out_shape)),
+                  len(self._fusion_results)))
         self._maybe_collect_fusion_result(output_mask)
         if not self._maybe_autofuse():
             # Only one series collected so far: show this result directly so the
@@ -3494,9 +3499,27 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         mask = slicer.util.arrayFromSegmentBinaryLabelmap(
             segmentation_node, selected_segment_id, reference_volume_node
         )
-        seg_data_bool = mask.astype(bool)
+        # An empty segment cannot be exported to a reference geometry (Slicer's
+        # GenerateSharedLabelmap / ResampleOrientedImageToReferenceGeometry fails),
+        # and a failed resample can return None or a wrong-shaped array. Treat all
+        # of these as an all-background mask on the reference grid so sync, fusion
+        # and undo keep working -- most visible with the high-resolution output
+        # grid (and the tri-planar mode that forces it on) on oblique series.
+        try:
+            ref_shape = slicer.util.arrayFromVolume(reference_volume_node).shape
+        except Exception:
+            ref_shape = None
+        if mask is None or (
+            ref_shape is not None and tuple(mask.shape) != tuple(ref_shape)
+        ):
+            print("[DEBUG segdata] empty/failed export -> zeros (mask_shape={}, "
+                  "ref_shape={})".format(
+                      None if mask is None else tuple(mask.shape), ref_shape))
+            if ref_shape is None:
+                return None
+            return np.zeros(ref_shape, dtype=bool)
 
-        return seg_data_bool
+        return mask.astype(bool)
 
     def selected_segment_changed(self):
         """
