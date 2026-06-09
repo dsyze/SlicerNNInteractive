@@ -33,7 +33,7 @@ from PythonQt.QtGui import QMessageBox
 
 DEBUG_MODE = False
 
-PLUGIN_VERSION = "1.2.4-triplanar-trace2"
+PLUGIN_VERSION = "1.2.5-triplanar-noreg"
 print("[nni] SlicerNNInteractive build loaded:", PLUGIN_VERSION)
 
 
@@ -749,6 +749,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         each registration completes.
         """
         _perf_log("[DEBUG triplanar.perf] align_display start")
+        # Tri-planar's precondition is co-registered series; and the user can
+        # confirm alignment explicitly. In either case skip auto-registration
+        # entirely -- it is unnecessary for aligned series and the async BRAINSFit
+        # CLI on large oblique series can crash Slicer. Backgrounds are still
+        # applied by _apply_plane_display_volumes; only registration is skipped.
+        if self._triplanar_mode or (
+            hasattr(self, "ui") and self.ui.cbConfirmSeriesAligned.isChecked()
+        ):
+            _perf_log("[DEBUG triplanar.perf] align_display: SKIP registration "
+                      "(triplanar/confirmed; series assumed pre-aligned)")
+            return
         source_volume = self.get_volume_node()
         if source_volume is None or not self._plane_display_snapshot:
             _perf_log("[DEBUG triplanar.perf] align_display: nothing to do")
@@ -1318,6 +1329,19 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             return
 
         if not force:
+            # If the user has confirmed the series are already aligned, never
+            # auto-register -- regardless of whether the frames of reference are
+            # readable. (Previously this was only honored when the FoR was
+            # unreadable; a readable-but-different FoR still queued BRAINSFit,
+            # which on large oblique series can crash Slicer.)
+            if hasattr(self, "ui") and self.ui.cbConfirmSeriesAligned.isChecked():
+                _perf_log("[DEBUG triplanar.perf] ensure_alignment: skip "
+                          "(user confirmed aligned) vol=%s"
+                          % supplemental.GetName())
+                self._set_registration_status(
+                    "Series confirmed aligned; auto-registration skipped.", False
+                )
+                return
             aligned = self._series_aligned(supplemental, source)
             if aligned is True:
                 self._set_registration_status(
@@ -1377,6 +1401,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _start_registration(self, moving, fixed):
         """Launch an asynchronous BRAINSFit registration (moving -> fixed)."""
+        _perf_log("[DEBUG triplanar.perf] start_registration moving=%s fixed=%s"
+                  % (moving.GetName() if moving else None,
+                     fixed.GetName() if fixed else None))
         if self._alignment_in_progress:
             return
         try:
@@ -1453,6 +1480,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _finish_registration(self, cli_node, status):
         """Attach the transform on success or clean up and warn on failure."""
+        _perf_log("[DEBUG triplanar.perf] finish_registration status=%s" % status)
         if not self._alignment_in_progress:
             return
         self._alignment_in_progress = False
@@ -2022,6 +2050,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         locks in what they chose and turns on the prerequisites. Returns True when
         at least two views show distinct series."""
         _perf_log("[DEBUG triplanar.perf] setup_triplanar start")
+        # Tri-planar requires co-registered series, so mark them aligned up front
+        # and skip auto-registration (BRAINSFit on these series can crash Slicer).
+        if hasattr(self, "ui"):
+            blocked = self.ui.cbConfirmSeriesAligned.blockSignals(True)
+            self.ui.cbConfirmSeriesAligned.setChecked(True)
+            self.ui.cbConfirmSeriesAligned.blockSignals(blocked)
         # Lock in / re-apply whatever the user selected in the multi-plane panel.
         self.on_apply_plane_display_volumes_clicked()
         _perf_log("[DEBUG triplanar.perf] setup_triplanar: after on_apply")
