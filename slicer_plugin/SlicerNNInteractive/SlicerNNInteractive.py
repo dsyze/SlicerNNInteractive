@@ -32,7 +32,7 @@ from PythonQt.QtGui import QMessageBox
 
 DEBUG_MODE = False
 
-PLUGIN_VERSION = "1.1.0"
+PLUGIN_VERSION = "1.2.0-triplanar-segfix"
 print("[nni] SlicerNNInteractive build loaded:", PLUGIN_VERSION)
 
 # A volume counts as oblique (and gets rotated to its own acquisition plane) when
@@ -3496,29 +3496,50 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if reference_volume_node is None:
             reference_volume_node = self.get_output_volume_node()
 
-        mask = slicer.util.arrayFromSegmentBinaryLabelmap(
-            segmentation_node, selected_segment_id, reference_volume_node
-        )
-        # An empty segment cannot be exported to a reference geometry (Slicer's
-        # GenerateSharedLabelmap / ResampleOrientedImageToReferenceGeometry fails),
-        # and a failed resample can return None or a wrong-shaped array. Treat all
-        # of these as an all-background mask on the reference grid so sync, fusion
-        # and undo keep working -- most visible with the high-resolution output
-        # grid (and the tri-planar mode that forces it on) on oblique series.
         try:
             ref_shape = slicer.util.arrayFromVolume(reference_volume_node).shape
         except Exception:
             ref_shape = None
+
+        # Avoid exporting an EMPTY segment to a different reference geometry:
+        # Slicer's GenerateSharedLabelmap / ResampleOrientedImageToReferenceGeometry
+        # fails (and logs a VTK error) on an empty segment. Read the segment on its
+        # OWN geometry first (no resample, so no error); if empty, return an
+        # all-background mask on the reference grid without ever attempting the
+        # failing export. This is most visible with the high-resolution output grid
+        # (and the tri-planar mode that forces it on) on oblique series.
+        try:
+            native = slicer.util.arrayFromSegmentBinaryLabelmap(
+                segmentation_node, selected_segment_id
+            )
+            if native is None or int(np.asarray(native).sum()) == 0:
+                return (
+                    np.zeros(ref_shape, dtype=bool)
+                    if ref_shape is not None
+                    else None
+                )
+        except Exception as exc:  # noqa: BLE001 - fall through to guarded export
+            print("[DEBUG segdata] native (no-reference) read failed: {}".format(exc))
+
+        # Non-empty: export onto the requested reference grid, guarded so a
+        # resample failure (None / wrong shape / raise) degrades to an
+        # all-background mask instead of crashing the prompt-sync chain.
+        try:
+            mask = slicer.util.arrayFromSegmentBinaryLabelmap(
+                segmentation_node, selected_segment_id, reference_volume_node
+            )
+        except Exception as exc:  # noqa: BLE001
+            print("[DEBUG segdata] reference export raised: {}".format(exc))
+            mask = None
         if mask is None or (
             ref_shape is not None and tuple(mask.shape) != tuple(ref_shape)
         ):
-            print("[DEBUG segdata] empty/failed export -> zeros (mask_shape={}, "
-                  "ref_shape={})".format(
+            print("[DEBUG segdata] reference export empty/failed -> zeros "
+                  "(mask_shape={}, ref_shape={})".format(
                       None if mask is None else tuple(mask.shape), ref_shape))
             if ref_shape is None:
                 return None
             return np.zeros(ref_shape, dtype=bool)
-
         return mask.astype(bool)
 
     def selected_segment_changed(self):
@@ -5830,7 +5851,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 self.previous_states["segment_data"] = self.get_segment_data()
             return result
         except Exception as e:
-            debug_print(f"Error in upload_image_to_server: {e}")
+            print("[DEBUG segdata] upload_segment_to_server error: {}".format(e))
+            return None
 
     def _ensure_inference_image_uploaded(self):
         """Upload the active inference image when the server-side image is stale."""
