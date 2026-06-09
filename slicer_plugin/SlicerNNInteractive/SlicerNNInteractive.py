@@ -1,4 +1,5 @@
 import io
+import os
 import gzip
 import math
 import requests
@@ -32,8 +33,32 @@ from PythonQt.QtGui import QMessageBox
 
 DEBUG_MODE = False
 
-PLUGIN_VERSION = "1.2.3-triplanar-trace"
+PLUGIN_VERSION = "1.2.4-triplanar-trace2"
 print("[nni] SlicerNNInteractive build loaded:", PLUGIN_VERSION)
+
+
+def _perf_log(msg, flush=True):
+    """Append a flushed trace line to a fixed file next to this module so the
+    step sequence survives a hard crash (Slicer process killed) and can be
+    inspected directly; also echoes to the console. `flush` is accepted only for
+    call-site compatibility with the print() it replaces."""
+    try:
+        line = str(msg)
+    except Exception:  # noqa: BLE001
+        line = "<unprintable trace line>"
+    try:
+        path = os.path.join(os.path.dirname(__file__), "nni_triplanar_trace.log")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("%.3f %s\n" % (time.time(), line))
+    except Exception:  # noqa: BLE001 - tracing must never break the app
+        pass
+    try:
+        print(line, flush=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_perf_log("=== nni perf trace start %s @%.3f ===" % (PLUGIN_VERSION, time.time()))
 
 # A volume counts as oblique (and gets rotated to its own acquisition plane) when
 # any IJK axis tilts more than ~2.5 degrees off the nearest RAS axis. The test
@@ -528,6 +553,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         if getattr(self, "_snapping_in_progress", False):
             return
+        _perf_log("[DEBUG triplanar.perf] align_views start")
         self._snapping_in_progress = True
         try:
             for view_name, slice_logic, slice_node in (
@@ -536,12 +562,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 volume = self._view_background_volume(view_name)
                 rotated = False
                 if volume is not None and self._volume_is_oblique(volume):
+                    _perf_log("[DEBUG triplanar.perf] align_views: RotateToVolumePlane"
+                              " view=%s vol=%s" % (view_name, volume.GetName()))
                     slice_node.RotateToVolumePlane(volume)
                     rotated = True
+                _perf_log("[DEBUG triplanar.perf] align_views: snap view=%s rotated=%s"
+                          % (view_name, rotated))
                 slice_logic.SnapSliceOffsetToIJK()
                 self._snap_last_offset[view_name] = slice_logic.GetSliceOffset()
         finally:
             self._snapping_in_progress = False
+        _perf_log("[DEBUG triplanar.perf] align_views done")
 
     def _on_slice_node_modified(
         self, view_name, slice_logic, caller=None, event=None
@@ -657,6 +688,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 display_volume = (
                     slicer.mrmlScene.GetNodeByID(volume_id) or source_volume
                 )
+            _perf_log("[DEBUG triplanar.perf] apply: set bg view=%s vol=%s" % (
+                slice_view_name,
+                display_volume.GetName() if display_volume is not None else None))
             if not self._set_slice_view_background(slice_view_name, display_volume):
                 missing_views.append(slice_view_name)
 
@@ -671,7 +705,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # A new background may be an oblique series; re-align views to it.
         # Changing the composite node does not fire the slice-node observer.
         if self._get_snap_slices_setting():
+            _perf_log("[DEBUG triplanar.perf] apply: before align_views")
             self._align_views_to_volume_planes()
+            _perf_log("[DEBUG triplanar.perf] apply: after align_views")
 
         if show_status:
             slicer.util.showStatusMessage(
@@ -712,8 +748,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         volume's parent transform live, so backgrounds re-place themselves once
         each registration completes.
         """
+        _perf_log("[DEBUG triplanar.perf] align_display start")
         source_volume = self.get_volume_node()
         if source_volume is None or not self._plane_display_snapshot:
+            _perf_log("[DEBUG triplanar.perf] align_display: nothing to do")
             return
         # Drop transforms left over from a previous (now stale) source volume so
         # they are not orphaned when a new alignment overwrites the parent.
@@ -727,12 +765,16 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             seen.add(volume_id)
             display_volume = slicer.mrmlScene.GetNodeByID(volume_id)
             if display_volume is not None:
+                _perf_log("[DEBUG triplanar.perf] align_display: ensure_alignment "
+                          "vol=%s" % display_volume.GetName())
                 self._ensure_alignment(display_volume, source_volume)
+        _perf_log("[DEBUG triplanar.perf] align_display done")
 
     def _reapply_plane_display_volumes_if_active(self):
         """Restore sticky per-plane backgrounds after Segment Editor activity."""
         self._plane_display_reapply_pending = False
         if self._plane_display_volumes_active:
+            _perf_log("[DEBUG triplanar.perf] reapply fired")
             self._apply_plane_display_volumes(show_status=False)
 
     def _schedule_plane_display_reapply(self):
@@ -1305,6 +1347,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 )
                 return
 
+        _perf_log("[DEBUG triplanar.perf] ensure_alignment: queue registration "
+                  "(BRAINSFit) vol=%s" % supplemental.GetName())
         self._enqueue_alignment(supplemental, source)
 
     def _enqueue_alignment(self, moving, fixed):
@@ -1889,14 +1933,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         samp = (spacing[2], spacing[1], spacing[0])  # numpy (z, y, x)
         sdf_sum = np.zeros(out_shape, dtype=np.float32)
         n = 0
-        print("[DEBUG triplanar.perf] fuse: SDF start, out_voxels={}, series={}"
+        _perf_log("[DEBUG triplanar.perf] fuse: SDF start, out_voxels={}, series={}"
               .format(int(np.prod(out_shape)), len(self._fusion_results)),
               flush=True)
         for vid, m in self._fusion_results.items():
             if m is None or tuple(m.shape) != tuple(out_shape) or not m.any():
                 continue
             mb = m.astype(bool)
-            print("[DEBUG triplanar.perf] fuse: edt id={} start".format(vid),
+            _perf_log("[DEBUG triplanar.perf] fuse: edt id={} start".format(vid),
                   flush=True)
             # Positive inside, negative outside (matches the convention used by
             # _interpolate_mask_to_output_grid).
@@ -1904,7 +1948,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 ndimage.distance_transform_edt(mb, sampling=samp)
                 - ndimage.distance_transform_edt(~mb, sampling=samp)
             ).astype(np.float32)
-            print("[DEBUG triplanar.perf] fuse: edt id={} done".format(vid),
+            _perf_log("[DEBUG triplanar.perf] fuse: edt id={} done".format(vid),
                   flush=True)
             # Direction weighting: blur this series' level set only along its own
             # thick (coarse) axis so its through-plane stair-steps drop out, while
@@ -1977,11 +2021,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         panel: Red=axial, Yellow=sagittal, Green=coronal by convention); this only
         locks in what they chose and turns on the prerequisites. Returns True when
         at least two views show distinct series."""
+        _perf_log("[DEBUG triplanar.perf] setup_triplanar start")
         # Lock in / re-apply whatever the user selected in the multi-plane panel.
         self.on_apply_plane_display_volumes_clicked()
+        _perf_log("[DEBUG triplanar.perf] setup_triplanar: after on_apply")
         # A fine isotropic output grid sharpens the fused result; fusion must be
         # on so each routed per-view result is collected per series.
         self._enable_high_res_for_smoothing()
+        _perf_log("[DEBUG triplanar.perf] setup_triplanar: after enable_high_res")
         if hasattr(self, "ui"):
             blocked = self.ui.cbEnableSeriesFusion.blockSignals(True)
             self.ui.cbEnableSeriesFusion.setChecked(True)
@@ -2110,7 +2157,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             _out_voxels = int(np.prod(self._output_grid_shape() or (0,)))
         except Exception:
             _out_voxels = -1
-        print("[DEBUG triplanar.perf] resample result: working_shape={}, "
+        _perf_log("[DEBUG triplanar.perf] resample result: working_shape={}, "
               "out_voxels={}".format(
                   tuple(np.asarray(working_mask).shape), _out_voxels), flush=True)
         if self._smoothing_active():
@@ -2171,7 +2218,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _handle_server_segmentation_result(self, segmentation_mask):
         """Write normal results directly, but stage supplemental results as previews."""
-        print("[DEBUG triplanar.perf] handle_server_result enter shape={}".format(
+        _perf_log("[DEBUG triplanar.perf] handle_server_result enter shape={}".format(
             tuple(np.asarray(segmentation_mask).shape)), flush=True)
         if self._triplanar_mode:
             # Per-view routed result: collect it for fusion and show the combined
@@ -3237,7 +3284,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         Uploads lasso or scribble prompt to the server.
         """
-        print("[DEBUG triplanar.perf] lasso_or_scribble_prompt body (sync passed) "
+        _perf_log("[DEBUG triplanar.perf] lasso_or_scribble_prompt body (sync passed) "
               "tp={} mask_sum={}".format(tp, int(np.sum(np.asarray(mask)))),
               flush=True)
         inference_volume = self.get_inference_volume_node()
@@ -3436,7 +3483,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         was_3d_shown = segmentationNode.GetSegmentation().ContainsRepresentation(slicer.vtkSegmentationConverter.GetSegmentationClosedSurfaceRepresentationName())
 
-        print("[DEBUG triplanar.perf] show_segmentation: write labelmap "
+        _perf_log("[DEBUG triplanar.perf] show_segmentation: write labelmap "
               "shape={}".format(tuple(np.asarray(segmentation_mask).shape)),
               flush=True)
         with slicer.util.RenderBlocker():  # avoid flashing of 3D view
@@ -3452,12 +3499,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             # is a heavy CPU/GPU hit and a likely freeze/crash source, so skip it
             # in tri-planar mode (the user can re-enable 3D when ready).
             if was_3d_shown and not self._triplanar_mode:
-                print("[DEBUG triplanar.perf] CreateClosedSurfaceRepresentation "
+                _perf_log("[DEBUG triplanar.perf] CreateClosedSurfaceRepresentation "
                       "start", flush=True)
                 segmentationNode.CreateClosedSurfaceRepresentation()
-                print("[DEBUG triplanar.perf] CreateClosedSurfaceRepresentation "
+                _perf_log("[DEBUG triplanar.perf] CreateClosedSurfaceRepresentation "
                       "done", flush=True)
-        print("[DEBUG triplanar.perf] show_segmentation: done", flush=True)
+        _perf_log("[DEBUG triplanar.perf] show_segmentation: done", flush=True)
 
         # Mark the segment as being edited (can be useful for selective saving of only modified segments)
         segment = segmentationNode.GetSegmentation().GetSegment(selectedSegmentID)
@@ -4019,6 +4066,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _rebuild_output_geometry_and_migrate(self):
         """Re-derive the current segment onto the (new) output grid after a change."""
+        _perf_log("[DEBUG triplanar.perf] rebuild_output start")
         source_volume = self.get_volume_node()
         if source_volume is None:
             return
@@ -4037,6 +4085,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Touch the output volume so the geometry node is (re)built when enabled,
         # then point the segmentation reference geometry at it.
         output_volume = self.get_output_volume_node()
+        try:
+            _dims = (
+                output_volume.GetImageData().GetDimensions()
+                if output_volume is not None
+                and output_volume.GetImageData() is not None
+                else None
+            )
+        except Exception:  # noqa: BLE001
+            _dims = None
+        _perf_log("[DEBUG triplanar.perf] rebuild_output: output grid dims=%s"
+                  % (_dims,))
         seg_node = self.get_segmentation_node()
         if seg_node is not None and output_volume is not None:
             seg_node.SetReferenceImageGeometryParameterFromVolumeNode(output_volume)
@@ -4055,7 +4114,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                         source_volume
                     )
                 migrated = src_mask
+            _perf_log("[DEBUG triplanar.perf] rebuild_output: migrate show")
             self.show_segmentation(migrated)
+        _perf_log("[DEBUG triplanar.perf] rebuild_output done")
 
     def _get_smooth_interpolate_setting(self):
         """Read whether smooth (interpolated) results are enabled. Default False."""
@@ -4087,12 +4148,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def _enable_high_res_for_smoothing(self):
         """Turn on the fine output grid that smoothing needs (no-op if active)."""
         if self._output_geometry_active():
+            _perf_log("[DEBUG triplanar.perf] enable_high_res: already active")
             return
+        _perf_log("[DEBUG triplanar.perf] enable_high_res start")
         blocked = self.ui.cbEnableHighResOutput.blockSignals(True)
         self.ui.cbEnableHighResOutput.setChecked(True)
         self.ui.cbEnableHighResOutput.blockSignals(blocked)
         self._set_qsetting(SETTING_HIGH_RES_ENABLED, True)
         self._rebuild_output_geometry_and_migrate()
+        _perf_log("[DEBUG triplanar.perf] enable_high_res: after rebuild")
         self._refresh_native_series_inference_ui()
         slicer.util.showStatusMessage(
             "High-resolution output enabled for smoothing.", 4000
@@ -5794,10 +5858,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
             error_message = None
             try:
-                print("[DEBUG triplanar.perf] POST start url={}".format(
+                _perf_log("[DEBUG triplanar.perf] POST start url={}".format(
                     args[0] if args else kwargs.get("url")), flush=True)
+                # No timeout would block Slicer's main thread indefinitely if the
+                # server stalls (e.g. a large-volume inference). Bound it.
+                if "timeout" not in kwargs:
+                    kwargs["timeout"] = (10, 300)
                 response = requests.post(*args, **kwargs)
-                print("[DEBUG triplanar.perf] POST done status={}".format(
+                _perf_log("[DEBUG triplanar.perf] POST done status={}".format(
                     getattr(response, "status_code", None)), flush=True)
                 debug_print('response:', response)
             except requests.exceptions.MissingSchema as e:
@@ -5852,7 +5920,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             )  # Expected to return (image_data, window, level)
             debug_print(f"self.get_inference_image_data took {time.time() - t0}")
             _inf = self.get_inference_volume_node()
-            print("[DEBUG triplanar.perf] upload_image enter: series='{}' shape={}"
+            _perf_log("[DEBUG triplanar.perf] upload_image enter: series='{}' shape={}"
                   .format(
                       _inf.GetName() if _inf else None,
                       None if image_data is None
@@ -5918,7 +5986,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         Sends the canonical segment sampled on the inference-working grid.
         """
         debug_print("Syncing segment with server...")
-        print("[DEBUG triplanar.perf] upload_segment enter", flush=True)
+        _perf_log("[DEBUG triplanar.perf] upload_segment enter", flush=True)
         try:
             if not self._ensure_inference_image_uploaded():
                 return None
@@ -6040,7 +6108,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         Unpacks data received from server into a full 3D numpy array (bool).
         """
-        print("[DEBUG triplanar.perf] unpack enter bytes={}".format(
+        _perf_log("[DEBUG triplanar.perf] unpack enter bytes={}".format(
             len(binary_data) if binary_data is not None else None), flush=True)
         if decompress:
             binary_data = binary_data = gzip.decompress(binary_data)

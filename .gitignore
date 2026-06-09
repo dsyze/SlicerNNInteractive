@@ -1,3 +1,6 @@
+# Tri-planar debug trace (runtime-generated; never commit)
+nni_triplanar_trace.log
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
