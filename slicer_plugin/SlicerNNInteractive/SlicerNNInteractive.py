@@ -284,7 +284,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._output_geometry_node = None
         self._output_geometry_spacing = None
         self._output_geometry_source_id = None
-        # Selection Operations-private undo stack: list of (segment_id, mask_uint8).
+        # Selection Operations-private undo stack: list of
+        # (segment_id, packbits_mask, shape). Snapshots are bit-packed to keep
+        # memory bounded on large (high-resolution) output grids.
         self._sel_op_undo_stack = []
         self._sel_op_undo_stack_limit = 10
         # Series alignment: auto-registration of a supplemental series to the
@@ -2015,9 +2017,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             )
             return
         seg_id = self.get_current_segment_id()
-        pre = self.get_segment_data(self.get_output_volume_node()).astype(
-            np.uint8
-        ).copy()
+        pre = self.get_segment_data(self.get_output_volume_node())
+        if pre is None:
+            print("[DEBUG fusion.apply] RETURN: segment data unavailable")
+            slicer.util.showStatusMessage(
+                "Could not read the current segment; fuse was not applied.",
+                4000,
+            )
+            return
+        pre = pre.astype(np.uint8).copy()
         print("[DEBUG fusion.apply] segment before sum={}, fused sum={}, "
               "diff voxels={}".format(
                   int(pre.sum()), int(fused.sum()),
@@ -2669,6 +2677,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         # Tear down the hidden lasso (3D) Scissors editor and region/preview nodes.
         self._destroy_lasso3d()
+        # Selection Operations scaffolding: ROI (+ preview model/transform),
+        # wand seeds (+ their placement observer) and the hidden wand preview
+        # segmentation would otherwise survive a module close/Reload.
+        self._destroy_selection_roi()
+        self._destroy_wand_seed()
+        self._destroy_wand_preview_segmentation()
         self._destroy_inference_preview()
         self._remove_output_geometry_node()
         self._cancel_active_registration()
@@ -3015,6 +3029,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         Uploads point prompt to the server.
         """
+        # A stale lasso slice marker (e.g. from a lasso whose submit failed
+        # mid-way) must never clip a point result in show_segmentation.
+        self._last_lasso_slice = None
         url = f"{self.server}/add_point_interaction"
 
         seg_response = self.request_to_server(
@@ -3100,6 +3117,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         Uploads BBox prompt to the server.
         """
+        # A stale lasso slice marker must never clip a bbox result.
+        self._last_lasso_slice = None
         url = f"{self.server}/add_bbox_interaction"
 
         seg_response = self.request_to_server(
@@ -3321,6 +3340,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         _perf_log("[DEBUG triplanar.perf] lasso_or_scribble_prompt body (sync passed) "
               "tp={} mask_sum={}".format(tp, int(np.sum(np.asarray(mask)))),
               flush=True)
+        if tp != "lasso":
+            # Scribble results must never be clipped by a stale lasso marker.
+            self._last_lasso_slice = None
         inference_volume = self.get_inference_volume_node()
         if mask_volume_node is None:
             mask_volume_node = inference_volume
@@ -3329,6 +3351,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 mask, mask_volume_node, inference_volume
             )
         if np.sum(mask) == 0:
+            # Nothing will be shown, so the marker would otherwise leak into
+            # the next prompt's result.
+            self._last_lasso_slice = None
             slicer.util.showStatusMessage(
                 "Lasso/scribble produced an empty mask; nothing to send.", 4000
             )
@@ -3367,6 +3392,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 debug_print(
                     f"lasso_or_scribble_prompt upload failed with status code: {seg_response.status_code}"
                 )
+                self._last_lasso_slice = None
                 slicer.util.showStatusMessage(
                     f"Server rejected {tp} prompt (status "
                     f"{seg_response.status_code}).",
@@ -3374,6 +3400,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 )
         except Exception as e:
             debug_print(f"Error in lasso_or_scribble_prompt: {e}")
+            self._last_lasso_slice = None
             slicer.util.showStatusMessage(
                 f"Failed to send {tp} prompt: {e}", 4000
             )
@@ -3701,6 +3728,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         Checks if the current segment mask has changed from our `self.previous_states`.
         """
         segment_data = self.get_segment_data()
+        if segment_data is None:
+            # Reference geometry unavailable; report "changed" so the upload
+            # path runs and handles (or surfaces) the failure itself instead
+            # of crashing the sync chain here.
+            debug_print("segment_data is None; treating as changed")
+            return True
         old_segment_data = self.previous_states.get("segment_data", None)
         selected_segment_changed = old_segment_data is None or not np.array_equal(
             old_segment_data.astype(bool), segment_data.astype(bool)
@@ -4089,6 +4122,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _disable_high_res_output(self, reason):
         """Turn the high-res output feature off after a failure, without recursion."""
+        self._clear_selection_op_undo_stack()
         self._remove_output_geometry_node()
         if hasattr(self, "ui"):
             blocked = self.ui.cbEnableHighResOutput.blockSignals(True)
@@ -4104,6 +4138,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         source_volume = self.get_volume_node()
         if source_volume is None:
             return
+        self._clear_selection_op_undo_stack(
+            "Output grid changed; Selection Operations undo history was "
+            "cleared."
+        )
         # Capture the current segment on the invariant source grid before the
         # output grid changes.
         try:
@@ -4479,7 +4517,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Snapshot the pre-Apply target so our own Undo can restore it
         # reliably -- the embedded Segment Editor's history stack is not
         # always populated for these programmatic edits.
-        pre_state = self.get_segment_data().astype(np.uint8).copy()
+        pre_state = self.get_segment_data()
+        if pre_state is None:
+            slicer.util.showStatusMessage(
+                "Could not read the current segment; the operation was not "
+                "applied.",
+                4000,
+            )
+            return
+        pre_state = pre_state.astype(np.uint8).copy()
         self._record_selection_op_undo(target_id, pre_state)
 
         self.show_segmentation(result_mask)
@@ -5317,6 +5363,22 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self._sel_op_wand_preview_segment_node, self._wand_preview_segment_id
         )
 
+    def _destroy_wand_preview_segmentation(self):
+        """Remove the hidden wand preview segmentation node from the scene."""
+        node = self._sel_op_wand_preview_segment_node
+        if node is None:
+            node = slicer.mrmlScene.GetFirstNodeByName(
+                getattr(
+                    self,
+                    "wand_preview_segment_node_name",
+                    "MagicWandPreviewSegmentNode (do not touch)",
+                )
+            )
+        if node is not None and slicer.mrmlScene.IsNodePresent(node):
+            slicer.mrmlScene.RemoveNode(node)
+        self._sel_op_wand_preview_segment_node = None
+        self._wand_preview_segment_id = None
+
     def _update_magic_wand_preview(self):
         """
         Recompute the wand mask via nnInteractive from the current seed and
@@ -5770,10 +5832,25 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         return region is not None and int(region.sum()) > 0
 
     def _record_selection_op_undo(self, segment_id, pre_state_uint8):
-        """Push a (segment_id, mask) snapshot onto our private undo stack."""
-        self._sel_op_undo_stack.append((segment_id, pre_state_uint8))
+        """Push a (segment_id, packed mask, shape) snapshot onto our private
+        undo stack. Bit-packing keeps the stack's memory bounded on large
+        (high-resolution) output grids (8x smaller than raw uint8)."""
+        arr = np.asarray(pre_state_uint8)
+        self._sel_op_undo_stack.append(
+            (segment_id, np.packbits(arr.astype(bool)), arr.shape)
+        )
         while len(self._sel_op_undo_stack) > self._sel_op_undo_stack_limit:
             self._sel_op_undo_stack.pop(0)
+
+    def _clear_selection_op_undo_stack(self, reason=None):
+        """Drop all Selection Operations undo snapshots. Called when the
+        output grid changes: old snapshots no longer match the segment
+        geometry and restoring one would write a wrong-shaped labelmap."""
+        if not self._sel_op_undo_stack:
+            return
+        self._sel_op_undo_stack = []
+        if reason:
+            slicer.util.showStatusMessage(reason, 4000)
 
     def on_undo_selection_op_clicked(self, checked=False):
         """
@@ -5787,7 +5864,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             )
             return
 
-        segment_id, pre_state = self._sel_op_undo_stack.pop()
+        segment_id, packed, shape = self._sel_op_undo_stack.pop()
         seg_node = self.get_segmentation_node()
         segmentation = seg_node.GetSegmentation() if seg_node is not None else None
         if segmentation is None or not segmentation.GetSegment(segment_id):
@@ -5797,6 +5874,21 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 "The target segment of the previous Apply no longer exists.",
             )
             return
+
+        expected_shape = self._output_grid_shape()
+        if expected_shape is not None and tuple(shape) != tuple(expected_shape):
+            QMessageBox.warning(
+                slicer.util.mainWindow(),
+                "Selection Operations",
+                "The output grid has changed since this Apply; the snapshot "
+                "no longer matches the segment geometry and was discarded.",
+            )
+            return
+        pre_state = (
+            np.unpackbits(packed)[: int(np.prod(shape))]
+            .reshape(shape)
+            .astype(np.uint8)
+        )
 
         self.segment_editor_node.SetSelectedSegmentID(segment_id)
         # show_segmentation re-applies the binary labelmap AND rebuilds the

@@ -341,6 +341,14 @@ Caveats:
   onto the new grid; other segments are not auto-migrated.
 - Lasso slice-range clipping is skipped while this feature is active (the
   recorded slice index is in source voxels and does not map to the output grid).
+  It is likewise never applied to multi-view lasso submissions: each
+  accumulated plane lies on a different slice axis, so a single-plane clip
+  would be meaningless there (this is intentional, not a bug).
+- Toggling the feature, changing the spacing, or any other output-grid rebuild
+  clears the Selection Operations undo history (a status message is shown):
+  old snapshots are on the previous grid and restoring one would write a
+  wrong-shaped labelmap. Undo additionally validates the snapshot shape
+  against the current grid and discards mismatches with a warning.
 - Resampling uses Slicer's segmentation conversion (nearest-neighbor-like), so
   coarse -> fine adds stair-stepping and the fine -> coarse upload loses detail.
 - A fine isotropic grid over a large field of view is memory-heavy; the build
