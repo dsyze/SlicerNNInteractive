@@ -77,6 +77,49 @@
 - 启动时不自动重排视图(需用户开启模式触发 `_setup_triplanar_views`)。
 - 保留该区域 `[DEBUG fusion]` 等调试输出(排查期),未经确认勿删。
 
+## 五、修复:FOV 感知融合(2026-06-10,肱骨"切面切开、加不上"bug)
+
+**症状**:三平面模式下某块解剖(被一个平直切面切开)用任何工具都补不进 segment,补上立刻被切掉。
+
+**根因**:`_fuse_series_results` 对每个序列的存储掩膜做 SDF 平均。每次交互只更新当前路由
+序列的掩膜(`_maybe_collect_fusion_result` 整块替换),另外两个序列仍是**交互前旧掩膜**;
+在新加区域它们贡献大负 SDF,2 比 1 把改动投票否决。`_maybe_autofuse` 每次交互后全量覆盖
+segment,故手动编辑也被抹。FOV 边界外的恒 0 重采样进一步制造固定平直切割面。
+
+**第一版(A 覆盖掩膜 + B 差分传播 + n=1 合并)在真实数据上无效**。日志 `print.txt` 显示:输出网格
+来自一个较大源 volume,三个斜序列各只覆盖 ~37.5%(并集 46%,53.7% 网格无任何已画序列覆盖);
+每序列各存独立 mask、走各自 server 会话产生全新全量分割,SDF 平均投票让两份 mask 在重叠区互相
+拉扯(在 Green 上画时反而 `removed=14423` 把 Red 加的删掉),融合结果恰等于"最后画的序列"。
+
+**最终方案(v2):FOV 权威累积,替换 SDF 投票做实时累积**。`_handle_triplanar_result` 改为
+**每个序列只在自己 FOV 内对画布有权威**:`merged = (new & cov) | (baseline & ~cov)`。
+- 跨序列累积(各填各 FOV);重叠区"最后编辑者胜";无独立 mask 投票拉扯;增/减都生效
+  (nnInteractive 结果已含正/负提示的累积)。n=1 自然处理(baseline 空 → `new & cov`)。
+- `_maybe_autofuse`(自动 SDF 投票)删除;`_propagate_fusion_diff`(diff 传播)删除;
+  `_maybe_collect_fusion_result` 回归"每序列存一份原始结果",仅供**可选的手动 Fuse** 按钮。
+- 实时不再做方向加权 SDF 平滑(轻微 through-plane 阶梯);需要平滑时点手动 Fuse
+  (`_fuse_series_results` 仍是覆盖掩膜版 SDF 平均)。
+- **保留的辅助**:`_series_coverage_mask`/`_invalidate_fusion_coverage`(权威累积复用)、
+  各失效点、`clear_current_segment` 清 store、`_log_result_resample_loss` 诊断。
+- **未做(推迟 C)**:若解剖落在所有序列 FOV 外(0 覆盖),仍需把输出网格扩到各序列 bbox 并集;
+  用户已确认三序列均覆盖,本次不需。
+
+新调试前缀:`[DEBUG triplanar.merge]`、`[DEBUG fusion.cover]`。
+
+**v3(真正修好"加不上"):输出网格覆盖三序列并集**。v2 把融合投票修对了,但用户"还是加不上"。
+日志 + 确认锁定另一个独立根因:高分辨率输出网格是从 **Segment Editor 源 volume(series 29,与所画
+的 19/20/21 不同)** 建的盒子(`_build_output_geometry_node`),三个所画序列伸到该盒外(覆盖仅 38%),
+分割只能存在盒内,盒外部分在重采样到输出网格时被**整齐切掉** → 背景看得到骨头但分割"从来不出现",
+切口是 series 29 的 FOV 平面。服务器语义已确认(`set_segment → add_initial_seg_interaction`,交互在
+上传分割上累积),故跨序列累积与 v2 合并都成立,问题纯在网格盒子。
+- 修法:三平面下 `_ensure_output_geometry_node` 走新分支 `_ensure_triplanar_output_geometry_node`,
+  用 `GetRASBounds` 取三序列(`_triplanar_coverage_volumes`)的 **RAS 并集包围盒**,建 **RAS 轴对齐**
+  等距网格(`_build_triplanar_output_geometry_node`,无父变换,32M 预算粗化),覆盖一切三视图可见解剖。
+- 缓存签名 `_output_geometry_triplanar_sig=(iso, sorted series ids, bounds)`;序列重选/进出模式时
+  在 `_setup_triplanar_views`/`_on_triplanar_mode_toggled` 强制重建并清 undo 栈 + 覆盖缓存。
+- <2 序列回退源网格(旧行为)。新前缀 `[DEBUG triplanar.grid]`;`_log_result_resample_loss` 的 `lost`
+  应显著下降。保留 v2 的 FOV 权威累积合并(并集网格下各序列覆盖率更高,合并仍需要)。
+
 ## 关键符号
 
 `cbTriPlanarMode`、`SETTING_TRIPLANAR_ENABLED`、`_triplanar_mode`、

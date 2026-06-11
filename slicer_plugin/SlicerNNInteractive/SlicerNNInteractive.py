@@ -262,6 +262,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # keyed by inference-volume id. SDF-averaged into one smooth mask on Fuse.
         self._fusion_results = {}        # volume_id -> uint8 mask (output grid)
         self._fusion_grid_shape = None   # output (z,y,x) shape the masks belong to
+        # FOV coverage of each series on the OUTPUT grid (True where that series
+        # actually images the voxel), bit-packed and keyed by volume id. Used so
+        # a series only votes inside its own field of view during fusion.
+        self._fusion_coverage = {}       # volume_id -> (packed bits, (z,y,x) shape)
         # Tri-planar multi-series mode: each interaction is routed to the series
         # shown in the view it was made in, and the three directions are
         # direction-weighted-fused after every interaction. While a prompt is
@@ -284,6 +288,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._output_geometry_node = None
         self._output_geometry_spacing = None
         self._output_geometry_source_id = None
+        # Tri-planar: the output grid is built to cover the UNION of the three
+        # assigned series (not the editor source, which may be a different/
+        # smaller series and would clip anatomy). Cache signature so it only
+        # rebuilds when the series assignment / spacing actually changes.
+        self._output_geometry_triplanar_sig = None
         # Selection Operations-private undo stack: list of
         # (segment_id, packbits_mask, shape). Snapshots are bit-packed to keep
         # memory bounded on large (high-resolution) output grids.
@@ -1050,6 +1059,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _ensure_output_geometry_node(self, source_volume):
         """Build or reuse the isotropic output-geometry volume for source_volume."""
+        # Tri-planar: cover the UNION of the three assigned series, not the editor
+        # source (which may be a different/smaller series and would clip anatomy
+        # that is visible in the views but outside the source FOV).
+        if getattr(self, "_triplanar_mode", False):
+            node = self._ensure_triplanar_output_geometry_node()
+            if node is not None:
+                return node
+            # Fall through to the source-based grid if the union is unavailable
+            # (e.g. fewer than two assigned series): keeps the old behavior.
         iso = self._get_output_spacing(source_volume)
         node = self._output_geometry_node
         if (
@@ -1061,6 +1079,119 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         ):
             return node
         return self._build_output_geometry_node(source_volume, iso)
+
+    def _triplanar_coverage_volumes(self):
+        """The distinct assigned tri-planar display series (Red/Yellow/Green
+        backgrounds), in selector order, de-duplicated by node id."""
+        vols, seen = [], set()
+        for v in PLANE_DISPLAY_SELECTOR_NAMES:
+            n = self._view_background_volume(v)
+            if n is not None and n.GetID() not in seen:
+                seen.add(n.GetID())
+                vols.append(n)
+        return vols
+
+    def _triplanar_union_ras_bounds(self, vols):
+        """RAS axis-aligned union [xmin,xmax,ymin,ymax,zmin,zmax] of `vols`, or
+        None. GetRASBounds already bounds each (possibly oblique) volume in world
+        RAS, so the union box is guaranteed to contain all of their anatomy."""
+        union = None
+        for n in vols:
+            b = [0.0] * 6
+            n.GetRASBounds(b)
+            if union is None:
+                union = list(b)
+            else:
+                for i in (0, 2, 4):
+                    union[i] = min(union[i], b[i])
+                for i in (1, 3, 5):
+                    union[i] = max(union[i], b[i])
+        return union
+
+    def _ensure_triplanar_output_geometry_node(self):
+        """Build or reuse a RAS-axis-aligned isotropic grid that covers the union
+        of the assigned tri-planar series. Returns None when fewer than two
+        series are assigned (caller then falls back to the source grid)."""
+        vols = self._triplanar_coverage_volumes()
+        if len(vols) < 2:
+            return None
+        bounds = self._triplanar_union_ras_bounds(vols)
+        if bounds is None:
+            return None
+        # Base spacing: the finest of the assigned series, coarsened to the
+        # tri-planar voxel budget against the (larger) union extents.
+        base_iso = min(min(v.GetSpacing()) for v in vols)
+        base_iso = max(OUTPUT_SPACING_MIN_MM, min(OUTPUT_SPACING_MAX_MM, base_iso))
+        extents = [bounds[1] - bounds[0], bounds[3] - bounds[2],
+                   bounds[5] - bounds[4]]
+
+        def voxel_count(s):
+            return float(np.prod([max(1, int(np.ceil(e / s))) for e in extents]))
+
+        iso = base_iso
+        if voxel_count(iso) > TRIPLANAR_MAX_OUTPUT_VOXELS:
+            factor = (voxel_count(iso) / float(TRIPLANAR_MAX_OUTPUT_VOXELS)) ** (
+                1.0 / 3.0)
+            iso = min(OUTPUT_SPACING_MAX_MM, iso * factor)
+        sig = (
+            round(iso, 4),
+            tuple(sorted(v.GetID() for v in vols)),
+            tuple(round(b, 2) for b in bounds),
+        )
+        node = self._output_geometry_node
+        if (
+            node is not None
+            and slicer.mrmlScene.IsNodePresent(node)
+            and self._output_geometry_triplanar_sig == sig
+        ):
+            return node
+        return self._build_triplanar_output_geometry_node(bounds, extents, iso, sig)
+
+    def _build_triplanar_output_geometry_node(self, bounds, extents, iso, sig):
+        """Create the hidden RAS-axis-aligned isotropic geometry volume covering
+        the union box `bounds` at spacing `iso`."""
+        new_dims = [max(1, int(np.ceil(extents[a] / iso))) for a in range(3)]
+        total = new_dims[0] * new_dims[1] * new_dims[2]
+        new_matrix = vtk.vtkMatrix4x4()
+        new_matrix.Identity()
+        for a in range(3):
+            new_matrix.SetElement(a, a, iso)
+        # RAS origin at the min corner of the union box (no parent transform:
+        # GetRASBounds is already world RAS).
+        new_matrix.SetElement(0, 3, bounds[0])
+        new_matrix.SetElement(1, 3, bounds[2])
+        new_matrix.SetElement(2, 3, bounds[4])
+
+        new_image = vtk.vtkImageData()
+        new_image.SetDimensions(new_dims[0], new_dims[1], new_dims[2])
+        new_image.AllocateScalars(vtk.VTK_UNSIGNED_CHAR, 1)
+        new_image.GetPointData().GetScalars().Fill(0)
+
+        node = self._output_geometry_node
+        if node is None or not slicer.mrmlScene.IsNodePresent(node):
+            node = slicer.mrmlScene.AddNewNodeByClass(
+                "vtkMRMLScalarVolumeNode", self.output_geometry_node_name
+            )
+            node.HideFromEditorsOn()
+        node.SetAndObserveImageData(new_image)
+        node.SetIJKToRASMatrix(new_matrix)
+        node.SetAndObserveTransformNodeID(None)
+        self._output_geometry_node = node
+        self._output_geometry_spacing = iso
+        # Sentinel so the non-tri-planar cache comparison never accidentally
+        # reuses this union grid as if it were a source-aligned one.
+        self._output_geometry_source_id = "__triplanar_union__"
+        self._output_geometry_triplanar_sig = sig
+        print("[DEBUG triplanar.grid] union bounds={} extents(mm)={} iso={} "
+              "dims={} voxels={}".format(
+                  [round(b, 1) for b in bounds],
+                  [round(e, 1) for e in extents], round(iso, 3),
+                  tuple(new_dims), total))
+        if total > TRIPLANAR_MAX_OUTPUT_VOXELS:
+            slicer.util.showStatusMessage(
+                "Tri-planar output grid coarsened to %.2f mm to fit the budget."
+                % iso, 5000)
+        return node
 
     def _build_output_geometry_node(self, source_volume, iso):
         """Create a hidden isotropic, source-aligned geometry-only scalar volume."""
@@ -1283,6 +1414,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def _on_alignment_geometry_changed(self):
         """Force the next prompt to re-upload after the working geometry moved."""
         self._clear_inference_cache()
+        # A series moved relative to the output grid, so its cached FOV coverage
+        # is geometrically stale and must be rebuilt on the next fuse.
+        self._invalidate_fusion_coverage("alignment geometry changed")
 
     def _sync_supplemental_alignment(self):
         """Align the native-series working volume after a settings change."""
@@ -1856,10 +1990,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             print("[DEBUG fusion.collect] output grid changed -> clearing store")
             self._fusion_results = {}
             self._fusion_grid_shape = tuple(out_shape)
+            self._invalidate_fusion_coverage("output grid changed")
         inf_node = self.get_inference_volume_node()
         vid = inf_node.GetID()
         vname = inf_node.GetName()
         is_native = self._is_native_series_inference_active()
+        # Store the raw per-series result. The live tri-planar display no longer
+        # SDF-averages these (that voting erased fresh edits); they are kept only
+        # for the OPTIONAL manual Fuse button, so no cross-series diff sync.
         self._fusion_results[vid] = m.copy()
         print("[DEBUG fusion.collect] stored under id={} name='{}' "
               "native_active={}; store now has {} series: {}".format(
@@ -1874,6 +2012,64 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                   "Enable native-series inference and switch the working volume "
                   "to a different registered series for each plane.")
         self._refresh_native_series_inference_ui()
+
+    def _invalidate_fusion_coverage(self, reason=None):
+        """Drop cached per-series FOV coverage masks. Called whenever the output
+        grid or a series' geometry (registration transform) changes, since the
+        cached coverage is rasterized onto a now-stale grid."""
+        if not self._fusion_coverage:
+            return
+        self._fusion_coverage = {}
+        print("[DEBUG fusion.cover] coverage cache invalidated{}".format(
+            "" if not reason else " ({})".format(reason)))
+
+    def _series_coverage_mask(self, series_volume_id):
+        """Bool mask on the current output grid: True where this series' FOV
+        covers the voxel. Built once per (series id, output grid shape) by
+        resampling an all-ones array of the series' shape onto the output grid
+        via _resample_mask_between_volumes, then bit-packed in the cache (an
+        unpacked uint8 trio would be hundreds of MB on large grids). Returns
+        None when the node is gone or the resample fails; callers MUST treat
+        None as FULL coverage so behavior degrades to the pre-fix semantics."""
+        out_shape = self._output_grid_shape()
+        if out_shape is None:
+            return None
+        cached = self._fusion_coverage.get(series_volume_id)
+        if cached is not None and tuple(cached[1]) == tuple(out_shape):
+            packed, shape = cached
+            return (
+                np.unpackbits(packed)[: int(np.prod(shape))]
+                .reshape(shape)
+                .astype(bool)
+            )
+        series_volume = slicer.mrmlScene.GetNodeByID(series_volume_id)
+        output_volume = self.get_output_volume_node()
+        if series_volume is None or output_volume is None:
+            return None
+        try:
+            series_shape = slicer.util.arrayFromVolume(series_volume).shape
+        except Exception:  # noqa: BLE001 - defensive around VTK accessors
+            return None
+        ones = np.ones(series_shape, dtype=np.uint8)
+        cov = self._resample_mask_between_volumes(
+            ones, series_volume, output_volume
+        )
+        if cov is None or tuple(cov.shape) != tuple(out_shape):
+            print("[DEBUG fusion.cover] id={} name='{}' coverage build FAILED "
+                  "-> treated as full coverage".format(
+                      series_volume_id, series_volume.GetName()))
+            return None
+        cov_bool = cov.astype(bool)
+        self._fusion_coverage[series_volume_id] = (
+            np.packbits(cov_bool), tuple(out_shape)
+        )
+        total = int(np.prod(out_shape))
+        nvox = int(cov_bool.sum())
+        print("[DEBUG fusion.cover] id={} name='{}' coverage voxels={} / grid={} "
+              "(frac={})".format(
+                  series_volume_id, series_volume.GetName(), nvox, total,
+                  round(nvox / float(total), 3) if total else 0.0))
+        return cov_bool
 
     def _series_anisotropic_sigma(self, series_volume):
         """Per-output-axis Gaussian sigma (numpy z,y,x voxels) that blurs
@@ -1961,12 +2157,28 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         output_volume = self.get_output_volume_node()
         spacing = output_volume.GetSpacing()  # (x, y, z) mm
         samp = (spacing[2], spacing[1], spacing[0])  # numpy (z, y, x)
+        # Pre-interaction segment, used as the fallback wherever NO series covers
+        # a voxel (so manual edits outside every FOV survive autofuse). Shape-
+        # guarded against a stale previous_states from before a grid rebuild.
+        baseline = self.previous_states.get("segment_data")
+        if baseline is None or tuple(np.asarray(baseline).shape) != tuple(out_shape):
+            baseline = self.get_segment_data(output_volume)
+        if baseline is not None and tuple(np.asarray(baseline).shape) != tuple(out_shape):
+            baseline = None
         sdf_sum = np.zeros(out_shape, dtype=np.float32)
+        # Per-voxel vote count: how many series' FOV cover each voxel. A series
+        # contributes its SDF only inside its own coverage, so a region imaged by
+        # one series only is not voted away by the others' (out-of-FOV) zeros.
+        cnt = np.zeros(out_shape, dtype=np.uint8)
         n = 0
         _perf_log("[DEBUG triplanar.perf] fuse: SDF start, out_voxels={}, series={}"
               .format(int(np.prod(out_shape)), len(self._fusion_results)),
               flush=True)
-        for vid, m in self._fusion_results.items():
+        for vid, m in list(self._fusion_results.items()):
+            if slicer.mrmlScene.GetNodeByID(vid) is None:
+                print("[DEBUG fusion.fuse] drop id={} (node deleted)".format(vid))
+                del self._fusion_results[vid]
+                continue
             if m is None or tuple(m.shape) != tuple(out_shape) or not m.any():
                 continue
             mb = m.astype(bool)
@@ -1991,16 +2203,39 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             else:
                 print("[DEBUG fusion.fuse]   id={} no thick-axis blur "
                       "(isotropic / oblique)".format(vid))
+            # Restrict this series' vote to its own FOV: blur first (so the hard
+            # out-of-FOV zeros do not smear into valid in-plane boundaries), then
+            # mask. None coverage == full coverage (pre-fix fallback).
+            cov = self._series_coverage_mask(vid)
+            if cov is not None:
+                sdf *= cov
+                cnt += cov.astype(np.uint8)
+            else:
+                cnt += 1
             sdf_sum += sdf
             n += 1
         if n == 0:
             print("[DEBUG fusion.fuse] SKIP: no usable masks after filtering")
             return None
-        # Averaging level sets and thresholding at zero yields a smooth mean
-        # surface; with the per-series blur it is direction-weighted.
-        fused = (sdf_sum / n >= 0).astype(np.uint8)
-        print("[DEBUG fusion.fuse] {} usable series (direction-weighted) -> "
-              "fused voxels {}".format(n, int(fused.sum())))
+        # Threshold the per-voxel mean level set at zero. Only the SIGN matters,
+        # so dividing by the per-voxel count is unnecessary; the `& covered`
+        # guard is mandatory because sdf_sum == 0 where nothing voted and a bare
+        # `>= 0` would mark the whole uncovered region as inside.
+        covered = cnt > 0
+        fused = (sdf_sum >= 0) & covered
+        kept = 0
+        if baseline is not None:
+            base_bool = np.asarray(baseline).astype(bool)
+            uncovered_keep = base_bool & ~covered
+            kept = int(uncovered_keep.sum())
+            fused |= uncovered_keep
+        fused = fused.astype(np.uint8)
+        hist = np.bincount(cnt.ravel(), minlength=n + 1)
+        print("[DEBUG fusion.fuse] {} usable series (direction-weighted); "
+              "coverage histogram (votes->voxels)={}; uncovered kept from "
+              "segment={}; fused voxels={}".format(
+                  n, {i: int(c) for i, c in enumerate(hist) if c},
+                  kept, int(fused.sum())))
         return fused
 
     def on_fuse_series_clicked(self, checked=False):
@@ -2042,6 +2277,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def _on_series_fusion_toggled(self, checked):
         self._fusion_results = {}
         self._fusion_grid_shape = None
+        self._invalidate_fusion_coverage("series fusion toggled")
         self._refresh_native_series_inference_ui()
 
     # -- Tri-planar multi-series mode ----------------------------------------
@@ -2077,6 +2313,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self.ui.cbEnableSeriesFusion.blockSignals(blocked)
         self._fusion_results = {}
         self._fusion_grid_shape = None
+        self._invalidate_fusion_coverage("tri-planar setup")
+        # The output grid is rebuilt to cover the union of the assigned series;
+        # force a rebuild and drop now-stale geometry-bound state (undo snapshots
+        # would no longer match the new grid shape).
+        self._output_geometry_triplanar_sig = None
+        self._clear_selection_op_undo_stack(
+            "Output grid rebuilt for tri-planar; undo history cleared.")
         bg = {v: self._view_background_volume(v) for v in PLANE_DISPLAY_SELECTOR_NAMES}
         view_series = {
             v: (n.GetName() if n is not None else None) for v, n in bg.items()
@@ -2105,6 +2348,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if checked:
             ok = self._setup_triplanar_views()
             print("[DEBUG triplanar.mode] view setup returned {}".format(ok))
+        else:
+            # Leaving tri-planar: the output grid reverts to the source-based one,
+            # so the union-grid geometry-bound state is stale.
+            self._output_geometry_triplanar_sig = None
+            self._invalidate_fusion_coverage("left tri-planar mode")
+            self._fusion_results = {}
+            self._fusion_grid_shape = None
+            self._clear_selection_op_undo_stack(
+                "Output grid reverted to source; undo history cleared.")
         self._refresh_native_series_inference_ui()
 
     @staticmethod
@@ -2205,6 +2457,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if self._smoothing_active():
             out = self._interpolate_mask_to_output_grid(working_mask, working_volume)
             if out is not None:
+                self._log_result_resample_loss(working_mask, out)
                 return out
         out = self._resample_mask_between_volumes(
             working_mask, working_volume, self.get_output_volume_node()
@@ -2218,45 +2471,72 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             )
         if out is None:
             out = np.asarray(working_mask)
+        self._log_result_resample_loss(working_mask, out)
         return out
 
+    def _log_result_resample_loss(self, working_mask, output_mask):
+        """Diagnostic: voxels lost when the routed result is moved onto the output
+        grid. A large `lost` on real data means the anatomy falls OUTSIDE the
+        source-derived output grid, i.e. the output grid must be extended to the
+        union of series bounding boxes (deferred follow-up); a small `lost` is the
+        expected resampling rounding."""
+        w = int(np.asarray(working_mask).astype(bool).sum())
+        o = int(np.asarray(output_mask).astype(bool).sum())
+        print("[DEBUG fusion.cover] result resample: working sum={}, output "
+              "sum={}, lost={}".format(w, o, max(0, w - o)))
+
     def _handle_triplanar_result(self, segmentation_mask):
-        """Tri-planar mode: collect the routed per-view result for fusion and
-        show the direction-weighted fused combination (no per-series preview)."""
+        """Tri-planar: accumulate the routed series result into the canonical
+        segment with FOV authority -- the series governs ONLY inside its own
+        field of view; everything outside is preserved. This replaces the old
+        SDF-average autofuse, which let the other series' (stale, independently-
+        sessioned) masks out-vote and erase a region the user just added, giving
+        the 'flat plane cuts the bone and nothing can be added' symptom.
+
+        Supports both add and subtract: nnInteractive already returns the full
+        cumulative segmentation for that series' session (positive + negative
+        prompts baked in), so REPLACING inside the FOV applies whatever the user
+        did. Overlap zones resolve to last-editor-wins, which is predictable and
+        far better than averaging that silently erodes. Direction-weighted SDF
+        smoothing is now opt-in via the manual Fuse button."""
         output_mask = self._resample_result_to_output(segmentation_mask)
         out_shape = self._output_grid_shape()
-        arr = np.asarray(output_mask)
+        new = np.asarray(output_mask).astype(bool)
+        routed_vid = self.get_inference_volume_node().GetID()
+        cov = self._series_coverage_mask(routed_vid)
+        baseline = self.previous_states.get("segment_data")
+        if baseline is None or tuple(np.asarray(baseline).shape) != tuple(out_shape):
+            baseline = self.get_segment_data(self.get_output_volume_node())
+        if baseline is not None and tuple(np.asarray(baseline).shape) != tuple(out_shape):
+            baseline = None
+        base = None if baseline is None else np.asarray(baseline).astype(bool)
         print("[DEBUG triplanar.result] routed result sum={}, shape={}, "
-              "output_grid={}, match={}, fusion store size={}".format(
-                  int(arr.astype(np.uint8).sum()), tuple(arr.shape),
+              "output_grid={}, match={}, cov={}".format(
+                  int(new.sum()), tuple(new.shape),
                   tuple(out_shape) if out_shape is not None else None,
-                  (out_shape is not None and tuple(arr.shape) == tuple(out_shape)),
-                  len(self._fusion_results)))
+                  (out_shape is not None and tuple(new.shape) == tuple(out_shape)),
+                  "yes" if cov is not None else "none"))
+        if cov is not None and base is not None:
+            merged = (new & cov) | (base & ~cov)
+            print("[DEBUG triplanar.merge] FOV-authoritative id={} new_in_fov={} "
+                  "kept_outside={} merged={}".format(
+                      routed_vid, int((new & cov).sum()),
+                      int((base & ~cov).sum()), int(merged.sum())))
+        elif base is not None:
+            # No coverage info (resample failed): union preserves adds (but then
+            # cannot subtract) -- the safe degraded default since coverage
+            # normally builds fine.
+            merged = new | base
+            print("[DEBUG triplanar.merge] no coverage -> union fallback "
+                  "merged={}".format(int(merged.sum())))
+        else:
+            merged = new
+            print("[DEBUG triplanar.merge] no baseline -> show new merged={}"
+                  .format(int(merged.sum())))
+        # Keep per-series raw results so the OPTIONAL manual Fuse (SDF smoothing)
+        # still works; this no longer drives the live display.
         self._maybe_collect_fusion_result(output_mask)
-        if not self._maybe_autofuse():
-            # Only one series collected so far: show this result directly so the
-            # user still gets immediate feedback before a second view is used.
-            print("[DEBUG triplanar.result] not enough series to fuse yet; "
-                  "showing single routed result")
-            self.show_segmentation(np.asarray(output_mask).astype(np.uint8))
-
-    def _maybe_autofuse(self):
-        """In tri-planar mode, fuse all collected series and display the result.
-        Returns True when a fused result was shown. No custom undo snapshot is
-        recorded here -- it runs after every interaction and snapshotting the
-        whole (large) output grid each time is wasteful; show_segmentation's own
-        saveStateForUndo still gives editor-level undo. The manual Fuse button
-        keeps recording the custom undo."""
-        if not self._triplanar_mode or len(self._fusion_results) < 2:
-            return False
-        fused = self._fuse_series_results()
-        if fused is None:
-            print("[DEBUG triplanar.autofuse] fuse returned None")
-            return False
-        self.show_segmentation(fused)
-        print("[DEBUG triplanar.autofuse] fused {} series and displayed".format(
-            len(self._fusion_results)))
-        return True
+        self.show_segmentation(merged.astype(np.uint8))
 
     def _handle_server_segmentation_result(self, segmentation_mask):
         """Write normal results directly, but stage supplemental results as previews."""
@@ -3521,6 +3801,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if selected_segment_id:
             debug_print(f"Clearing segment: {selected_segment_id}")
             self._destroy_inference_preview()
+            # Drop collected per-series results too: otherwise the next autofuse
+            # rebuilds the just-cleared segmentation from the stale stored masks.
+            if self._fusion_results:
+                print("[DEBUG fusion.collect] cleared store on clear-segment")
+                self._fusion_results = {}
             self.show_segmentation(
                 np.zeros(self._output_grid_shape(), dtype=np.uint8)
             )
@@ -4119,6 +4404,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._output_geometry_node = None
         self._output_geometry_spacing = None
         self._output_geometry_source_id = None
+        self._output_geometry_triplanar_sig = None
 
     def _disable_high_res_output(self, reason):
         """Turn the high-res output feature off after a failure, without recursion."""
