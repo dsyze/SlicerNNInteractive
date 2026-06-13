@@ -90,6 +90,14 @@ OUTPUT_SPACING_MAX_MM = 10.0
 # many voxels; reject (truly oblique / multi-slice) when it exceeds it.
 LASSO_SLICE_AXIS_MAX_SPREAD = 2
 
+# One-click three-series fusion: number of positive point seeds derived from the
+# lasso interior (deepest distance-transform point + interior samples) that are
+# sent to each orthogonal (non-source) series instead of the degenerate lasso.
+FUSE3_NUM_SEEDS = 5
+# Extra margin (mm) added around the lasso bounding box to form the total ROI in
+# which the three-series fusion arithmetic is performed.
+FUSE3_ROI_MARGIN_MM = 5.0
+
 # Hidden linear transform that aligns a supplemental series to the source volume
 # when their DICOM frames of reference differ (auto-registration).
 SERIES_ALIGNMENT_TRANSFORM_NODE_NAME = "NNInteractiveSeriesAlignment (do not touch)"
@@ -266,6 +274,16 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # actually images the voxel), bit-packed and keyed by volume id. Used so
         # a series only votes inside its own field of view during fusion.
         self._fusion_coverage = {}       # volume_id -> (packed bits, (z,y,x) shape)
+        # One-click three-series fusion (onFuseFromThreeSeriesWithROI). While the
+        # capture flag is set, server results are stashed on the output grid keyed
+        # by inference-volume id (per series) instead of being displayed, so the
+        # orchestration can collect each series' result and fuse them at the end.
+        self._fusion_capture_active = False
+        self._fusion_capture_store = {}  # volume_id -> uint8 mask (output grid)
+        # World-space (RAS) curve points of the most recently submitted lasso, so
+        # the three-series fusion button can reuse it after the live lasso node was
+        # consumed/cleared by the normal auto-submit flow.
+        self._last_lasso_world_points = None
         # Tri-planar multi-series mode: each interaction is routed to the series
         # shown in the view it was made in, and the three directions are
         # direction-weighted-fused after every interaction. While a prompt is
@@ -2280,6 +2298,404 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._invalidate_fusion_coverage("series fusion toggled")
         self._refresh_native_series_inference_ui()
 
+    # -- One-click three-series fusion (lasso -> 3 series -> ROI fusion) ------
+
+    def _get_active_lasso(self):
+        """Return the current lasso polygon as an (N, 3) array of RAS world
+        points, or None. Prefer the live lasso node; fall back to the cached
+        points of the last submitted lasso (the live node is consumed/cleared by
+        the normal auto-submit flow)."""
+        node = self.prompt_types.get("lasso", {}).get("node")
+        if node is not None:
+            try:
+                vtk_pts = node.GetCurvePointsWorld()
+                if vtk_pts is not None:
+                    pts = vtk_to_numpy(vtk_pts.GetData())
+                    if pts is not None and len(pts) >= 3:
+                        return np.array(pts)
+            except Exception:  # noqa: BLE001 - defensive around VTK accessors
+                pass
+        cached = self._last_lasso_world_points
+        if cached is not None and len(cached) >= 3:
+            return np.array(cached)
+        return None
+
+    def _lasso_interior_seeds(self, lasso_ras, ref_grid_node,
+                              n_seeds=FUSE3_NUM_SEEDS):
+        """Derive positive 3D point seeds (RAS) from the lasso interior. The
+        lasso is filled on ref_grid_node; the distance transform of the filled
+        region yields the deepest interior point (first seed, safe even for
+        concave / ring shapes) plus a few interior samples (depth above half the
+        maximum, picked at an even stride for spread) so one seed cannot
+        under-segment. Returns a list of [R, A, S] points (always >= 1)."""
+        centroid = list(np.asarray(lasso_ras, dtype=float).mean(axis=0))
+        try:
+            from scipy import ndimage
+        except Exception:
+            return [centroid]
+        try:
+            xyzs = [
+                self.ras_to_xyz(list(p), volume_node=ref_grid_node)
+                for p in lasso_ras
+            ]
+            filled = self.lasso_points_to_mask(
+                xyzs, ras_points=np.asarray(lasso_ras), volume_node=ref_grid_node
+            )
+        except Exception as e:  # noqa: BLE001
+            print("[DEBUG fuse3] seed rasterization failed: {}".format(e))
+            return [centroid]
+        filled = np.asarray(filled).astype(bool)
+        if not filled.any():
+            return [centroid]
+        dt = ndimage.distance_transform_edt(filled)
+        kji = np.unravel_index(int(np.argmax(dt)), dt.shape)  # (k, j, i)
+        seeds_kji = [tuple(int(c) for c in kji)]
+        thr = 0.5 * float(dt.max())
+        cand = np.argwhere(dt > thr)
+        extra = max(0, int(n_seeds) - 1)
+        if extra > 0 and len(cand) > 0:
+            step = max(1, len(cand) // (extra + 1))
+            for s in range(1, extra + 1):
+                idx = min(len(cand) - 1, s * step)
+                seeds_kji.append(tuple(int(c) for c in cand[idx]))
+        ijk_to_ras = vtk.vtkMatrix4x4()
+        ref_grid_node.GetIJKToRASMatrix(ijk_to_ras)
+        tnode = ref_grid_node.GetParentTransformNode()
+        local_to_world = None
+        if tnode is not None:
+            local_to_world = vtk.vtkGeneralTransform()
+            slicer.vtkMRMLTransformNode.GetTransformBetweenNodes(
+                tnode, None, local_to_world
+            )
+        seeds_ras, seen = [], set()
+        for (k, j, i) in seeds_kji:
+            if (k, j, i) in seen:
+                continue
+            seen.add((k, j, i))
+            ras = ijk_to_ras.MultiplyPoint([float(i), float(j), float(k), 1.0])
+            p = [ras[0], ras[1], ras[2]]
+            if local_to_world is not None:
+                p = list(local_to_world.TransformPoint(p))
+            seeds_ras.append([p[0], p[1], p[2]])
+        print("[DEBUG fuse3] derived {} interior seed(s) from lasso".format(
+            len(seeds_ras)))
+        return seeds_ras if seeds_ras else [centroid]
+
+    def _send_point_seeds_for_series(self, series, seeds_ras):
+        """Send each in-bounds positive point seed to `series` via point_prompt.
+        A seed mapping outside the series' voxel grid (its field of view) is
+        skipped, so a series that does not image the lasso region simply gets no
+        prompt. Returns True if at least one seed was sent."""
+        try:
+            shape = slicer.util.arrayFromVolume(series).shape  # (z, y, x)
+        except Exception:  # noqa: BLE001
+            return False
+        depth, height, width = int(shape[0]), int(shape[1]), int(shape[2])
+        sent = 0
+        for ras in seeds_ras:
+            xyz = self.ras_to_xyz(list(ras), volume_node=series)  # [i, j, k]
+            if not (0 <= xyz[0] < width and 0 <= xyz[1] < height
+                    and 0 <= xyz[2] < depth):
+                continue
+            self.point_prompt(xyz=xyz, positive_click=True)
+            sent += 1
+        print("[DEBUG fuse3] series '{}' received {} of {} seed(s)".format(
+            series.GetName(), sent, len(seeds_ras)))
+        return sent > 0
+
+    def _get_lasso_roi_world(self, lassoPoints, margin_mm=FUSE3_ROI_MARGIN_MM):
+        """RAS axis-aligned bounding box of the lasso, expanded by margin_mm.
+        Returns (min_xyz, max_xyz) as length-3 lists."""
+        pts = np.asarray(lassoPoints, dtype=float)
+        mn = (pts.min(axis=0) - float(margin_mm)).tolist()
+        mx = (pts.max(axis=0) + float(margin_mm)).tolist()
+        return mn, mx
+
+    def _ras_box_to_output_index_box(self, mn, mx):
+        """Convert an RAS bounding box to a clamped numpy index sub-box
+        (z0, z1, y0, y1, x0, x1) on the current output grid. Returns the full
+        grid on any failure or a degenerate box, or None when no output grid."""
+        out_shape = self._output_grid_shape()
+        output_volume = self.get_output_volume_node()
+        if out_shape is None or output_volume is None:
+            return None
+        D, H, W = int(out_shape[0]), int(out_shape[1]), int(out_shape[2])
+        full = (0, D, 0, H, 0, W)
+        try:
+            ras_to_ijk = vtk.vtkMatrix4x4()
+            output_volume.GetRASToIJKMatrix(ras_to_ijk)
+            tnode = output_volume.GetParentTransformNode()
+            world_to_local = None
+            if tnode is not None:
+                world_to_local = vtk.vtkGeneralTransform()
+                slicer.vtkMRMLTransformNode.GetTransformBetweenNodes(
+                    None, tnode, world_to_local
+                )
+            iis, jjs, kks = [], [], []
+            for rx in (mn[0], mx[0]):
+                for ry in (mn[1], mx[1]):
+                    for rz in (mn[2], mx[2]):
+                        p = [rx, ry, rz]
+                        if world_to_local is not None:
+                            p = list(world_to_local.TransformPoint(p))
+                        ijk = ras_to_ijk.MultiplyPoint([p[0], p[1], p[2], 1.0])
+                        iis.append(ijk[0])
+                        jjs.append(ijk[1])
+                        kks.append(ijk[2])
+            x0 = max(0, int(np.floor(min(iis))))
+            x1 = min(W, int(np.ceil(max(iis))) + 1)
+            y0 = max(0, int(np.floor(min(jjs))))
+            y1 = min(H, int(np.ceil(max(jjs))) + 1)
+            z0 = max(0, int(np.floor(min(kks))))
+            z1 = min(D, int(np.ceil(max(kks))) + 1)
+            if x1 <= x0 or y1 <= y0 or z1 <= z0:
+                return full
+            return (z0, z1, y0, y1, x0, x1)
+        except Exception as e:  # noqa: BLE001
+            print("[DEBUG fuse3] ROI index box failed: {}".format(e))
+            return full
+
+    def _get_series_valid_region(self, seriesNode, refGridNode):
+        """FOV validity mask of seriesNode on the current output grid (True where
+        the series images the voxel). Delegates to the cached coverage builder;
+        refGridNode is expected to be the current output grid. Returns a bool
+        array on the output grid, or None when coverage is unavailable (callers
+        then treat the series as fully covering)."""
+        if seriesNode is None:
+            return None
+        return self._series_coverage_mask(seriesNode.GetID())
+
+    def _fuse_masks_in_roi(self, valid, roi_box, output_volume):
+        """FOV-weighted, direction-weighted SDF fusion of per-series output-grid
+        masks, computed only inside roi_box for speed. `valid` is a list of
+        (series_node, output_grid_uint8_mask). Each series' signed distance field
+        is blurred only along its own thick acquisition axis, then masked to its
+        own field of view, so a region imaged by one series only is not voted away
+        by the others' out-of-FOV zeros. Returns a full output-grid uint8 mask
+        (fused inside the ROI, existing segment preserved outside), or None."""
+        try:
+            from scipy import ndimage
+        except Exception:
+            return None
+        out_shape = self._output_grid_shape()
+        if out_shape is None or roi_box is None:
+            return None
+        z0, z1, y0, y1, x0, x1 = roi_box
+        spacing = output_volume.GetSpacing()  # (x, y, z) mm
+        samp = (spacing[2], spacing[1], spacing[0])  # numpy (z, y, x)
+        sub_shape = (z1 - z0, y1 - y0, x1 - x0)
+        sdf_sum = np.zeros(sub_shape, dtype=np.float32)
+        cnt = np.zeros(sub_shape, dtype=np.uint8)
+        n = 0
+        for series, m in valid:
+            if m is None or tuple(np.asarray(m).shape) != tuple(out_shape):
+                continue
+            mb = np.asarray(m)[z0:z1, y0:y1, x0:x1].astype(bool)
+            if not mb.any():
+                continue
+            sdf = (
+                ndimage.distance_transform_edt(mb, sampling=samp)
+                - ndimage.distance_transform_edt(~mb, sampling=samp)
+            ).astype(np.float32)
+            sigma = self._series_anisotropic_sigma(series)
+            if sigma is not None and any(s > 0 for s in sigma):
+                sdf = ndimage.gaussian_filter(sdf, sigma=sigma).astype(np.float32)
+            cov = self._get_series_valid_region(series, output_volume)
+            if cov is not None:
+                covc = np.asarray(cov)[z0:z1, y0:y1, x0:x1]
+                sdf *= covc
+                cnt += covc.astype(np.uint8)
+            else:
+                cnt += 1
+            sdf_sum += sdf
+            n += 1
+        if n == 0:
+            return None
+        fused_sub = ((sdf_sum >= 0) & (cnt > 0)).astype(np.uint8)
+        baseline = self.get_segment_data(output_volume)
+        if (baseline is None
+                or tuple(np.asarray(baseline).shape) != tuple(out_shape)):
+            final = np.zeros(out_shape, dtype=np.uint8)
+        else:
+            final = np.asarray(baseline).astype(np.uint8).copy()
+        final[z0:z1, y0:y1, x0:x1] = fused_sub
+        print("[DEBUG fuse3] fused {} series in ROI {} -> voxels={}".format(
+            n, roi_box, int(final.sum())))
+        return final
+
+    def _export_to_vr(self, segmentId, smoothing=0.5):
+        """Build a smoothed closed-surface (3D model) representation for the
+        current segmentation and make it visible in 3D. `smoothing` sets the
+        marching-cubes smoothing factor (0..1)."""
+        seg_node, sel_id = self.get_selected_segmentation_node_and_segment_id()
+        if seg_node is None:
+            return
+        if not segmentId:
+            segmentId = sel_id
+        seg = seg_node.GetSegmentation()
+        try:
+            seg.SetConversionParameter("Smoothing factor", str(smoothing))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            seg.RemoveRepresentation(self._closed_surface_name())
+        except Exception:  # noqa: BLE001
+            pass
+        seg_node.CreateClosedSurfaceRepresentation()
+        dn = seg_node.GetDisplayNode()
+        if dn is not None:
+            dn.SetVisibility3D(True)
+            if segmentId:
+                try:
+                    dn.SetSegmentVisibility3D(segmentId, True)
+                except Exception:  # noqa: BLE001
+                    pass
+        print("[DEBUG fuse3] exported closed-surface VR model "
+              "(smoothing={})".format(smoothing))
+
+    def onFuseFromThreeSeriesWithROI(self, checked=False):
+        """One-click: drive three co-registered series from a single lasso, fuse
+        their results by field-of-view-weighted SDF averaging inside the lasso
+        ROI, write the combined mask into the current segment, sync, and build a
+        3D model. The source series (the lasso's own plane) uses the real lasso;
+        the two orthogonal series use positive point seeds derived from the lasso
+        interior (a lasso is degenerate off its own plane)."""
+        print("[DEBUG fuse3] onFuseFromThreeSeriesWithROI clicked")
+        # 1) Require a series assigned to each of Red/Yellow/Green.
+        missing = [
+            v for v, sel in PLANE_DISPLAY_SELECTOR_NAMES.items()
+            if getattr(self.ui, sel).currentNode() is None
+        ]
+        if missing:
+            QMessageBox.warning(
+                slicer.util.mainWindow(),
+                "Three-series fusion",
+                "Assign a series to each of the Red/Yellow/Green views in the "
+                "Multi-plane display panel first.",
+            )
+            return
+        # 2) Require a lasso (live or last-submitted).
+        lasso = self._get_active_lasso()
+        if lasso is None:
+            QMessageBox.warning(
+                slicer.util.mainWindow(),
+                "Three-series fusion",
+                "Draw a region with the lasso (shortcut L) first.",
+            )
+            return
+        # 3) Ensure tri-planar prerequisites (union output grid covering all 3
+        #    series + high-resolution output + fusion). Enabling the mode builds
+        #    the grid, so we never clip anatomy outside the editor source FOV.
+        if not self._triplanar_mode:
+            self.ui.cbTriPlanarMode.setChecked(True)
+        output_volume = self.get_output_volume_node()
+        if output_volume is None or self._output_grid_shape() is None:
+            QMessageBox.warning(
+                slicer.util.mainWindow(),
+                "Three-series fusion",
+                "Could not prepare the high-resolution output grid. Make sure "
+                "the three series are loaded and assigned.",
+            )
+            return
+        # 4) Total ROI = lasso bounding box + margin, as an output-grid sub-box.
+        mn, mx = self._get_lasso_roi_world(lasso, FUSE3_ROI_MARGIN_MM)
+        roi_box = self._ras_box_to_output_index_box(mn, mx)
+        if roi_box is None:
+            QMessageBox.warning(
+                slicer.util.mainWindow(),
+                "Three-series fusion",
+                "Could not map the lasso ROI onto the output grid.",
+            )
+            return
+        # 5) Source series (the lasso plane's view) and derived point seeds.
+        centroid = list(np.asarray(lasso).mean(axis=0))
+        src_view = self._view_for_ras_point(centroid)
+        src_series = (
+            self._view_background_volume(src_view)
+            if src_view is not None else None
+        )
+        seeds = self._lasso_interior_seeds(lasso, output_volume)
+        print("[DEBUG fuse3] source view={}, src_series={}, seeds={}".format(
+            src_view, src_series.GetName() if src_series else None, len(seeds)))
+        # 6) Hybrid inference in capture mode: source -> lasso, others -> seeds.
+        self._fusion_capture_active = True
+        self._fusion_capture_store = {}
+        valid = []
+        seen = set()
+        try:
+            for v in ("Red", "Yellow", "Green"):
+                series = self._view_background_volume(v)
+                if series is None or series.GetID() in seen:
+                    continue
+                seen.add(series.GetID())
+                self._active_inference_volume_override = series
+                try:
+                    is_source = (
+                        src_series is not None
+                        and series.GetID() == src_series.GetID()
+                    )
+                    if is_source:
+                        xyzs = [
+                            self.ras_to_xyz(list(p), volume_node=series)
+                            for p in lasso
+                        ]
+                        mask = self.lasso_points_to_mask(
+                            xyzs, ras_points=np.asarray(lasso),
+                            volume_node=series,
+                        )
+                        self.lasso_or_scribble_prompt(
+                            mask=mask, positive_click=True, tp="lasso",
+                            mask_volume_node=series,
+                        )
+                    else:
+                        if not self._send_point_seeds_for_series(series, seeds):
+                            print("[DEBUG fuse3] '{}' got no in-FOV seeds; "
+                                  "skipping".format(series.GetName()))
+                            continue
+                    res = self._fusion_capture_store.get(series.GetID())
+                    if res is not None and res.any():
+                        valid.append((series, res))
+                except Exception as e:  # noqa: BLE001
+                    print("[DEBUG fuse3] skip series '{}': {}".format(
+                        series.GetName(), e))
+        finally:
+            self._fusion_capture_active = False
+            self._active_inference_volume_override = None
+        # 7) Need at least two contributing series to fuse.
+        if len(valid) < 2:
+            QMessageBox.warning(
+                slicer.util.mainWindow(),
+                "Three-series fusion",
+                "Fewer than 2 series produced a result; fusion aborted.",
+            )
+            return
+        # 8) Fuse inside the ROI, apply (undoable), sync, build the 3D model.
+        final = self._fuse_masks_in_roi(valid, roi_box, output_volume)
+        if final is None:
+            QMessageBox.warning(
+                slicer.util.mainWindow(),
+                "Three-series fusion",
+                "Fusion produced no result.",
+            )
+            return
+        seg_id = self.get_current_segment_id()
+        pre = self.get_segment_data(output_volume)
+        if pre is not None:
+            self._record_selection_op_undo(
+                seg_id, np.asarray(pre).astype(np.uint8).copy()
+            )
+        # The fused mask is a full 3D result; never let a stale lasso slice
+        # marker clip it to a single slice in show_segmentation.
+        self._last_lasso_slice = None
+        self.show_segmentation(final)
+        self._fusion_results = {}
+        self.upload_segment_to_server()
+        self._export_to_vr(seg_id, smoothing=0.5)
+        slicer.util.showStatusMessage(
+            "Fused {} series and exported a 3D model.".format(len(valid)), 4000
+        )
+        print("[DEBUG fuse3] done; fused {} series".format(len(valid)))
+
     # -- Tri-planar multi-series mode ----------------------------------------
 
     def _get_triplanar_enabled(self):
@@ -2542,6 +2958,20 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """Write normal results directly, but stage supplemental results as previews."""
         _perf_log("[DEBUG triplanar.perf] handle_server_result enter shape={}".format(
             tuple(np.asarray(segmentation_mask).shape)), flush=True)
+        if getattr(self, "_fusion_capture_active", False):
+            # One-click three-series fusion: stash this series' result on the
+            # output grid (keyed by the active inference volume) instead of
+            # displaying it. For point-seed series the handler fires once per
+            # seed; the last (cumulative) result wins, which is what we want.
+            out_mask = self._resample_result_to_output(segmentation_mask)
+            inf_node = self.get_inference_volume_node()
+            if inf_node is not None:
+                self._fusion_capture_store[inf_node.GetID()] = (
+                    np.asarray(out_mask).astype(np.uint8)
+                )
+                print("[DEBUG fuse3] captured result for '{}' sum={}".format(
+                    inf_node.GetName(), int(np.asarray(out_mask).sum())))
+            return
         if self._triplanar_mode:
             # Per-view routed result: collect it for fusion and show the combined
             # direction-weighted result instead of a single-series preview.
@@ -2675,6 +3105,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self._on_series_fusion_toggled
         )
         self.ui.pbFuseSeries.clicked.connect(self.on_fuse_series_clicked)
+        self.ui.pbFuseThreeSeriesRoi.clicked.connect(
+            self.onFuseFromThreeSeriesWithROI
+        )
         # Tri-planar multi-series mode. Restore the persisted preference into the
         # checkbox with signals blocked (so we do not rearrange views at startup,
         # before series are loaded); the view setup runs when the user toggles.
@@ -3447,6 +3880,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         _vtk_pts = caller.GetCurvePointsWorld()
         _ras_pts = _vtk_to_numpy(_vtk_pts.GetData()) if _vtk_pts is not None else np.zeros((0, 3))
         print("[DEBUG submit_lasso] _ras_pts count:", len(_ras_pts))
+
+        # Cache the world-space curve points so the one-click three-series fusion
+        # button can reuse this lasso after the live node is consumed/cleared.
+        if len(_ras_pts) >= 3:
+            self._last_lasso_world_points = np.array(_ras_pts)
 
         # Tri-planar routing: a lasso is drawn on one view's plane, so route it to
         # that view's series BEFORE computing voxel coords / rasterizing. In
