@@ -236,6 +236,17 @@ ROI 测试可以先构造固定 ROI bounds，再检查输出 mask。
 6. 增加临时 operation mask 工作流。
 7. 再考虑旋转 ROI、closed surface、free-form 3D selection 等高级能力。
 
+## ROI box 交互优化（手柄 + 高亮）
+
+`_configure_selection_roi_display`(ROI 的 `vtkMRMLMarkupsDisplayNode`)在 `SetHandlesInteractive(True)`
+基础上配置 Blender/Godot 式 gizmo:
+- 保留**三色轴平移箭头**(`SetTranslationHandleVisibility(True)`,拖某轴=沿该轴约束精准平移)+ **面缩放手柄**
+  (`SetScaleHandleVisibility(True)`,改大小);**去掉旋转环**(`SetRotationHandleVisibility(False)`,box 轴对齐、
+  旋转易误操作);`SetInteractionHandleScale(3.0)` 放大手柄。各 setter 用 try/except 包裹兼容旧版 Slicer。
+- 高亮:`SetFillOpacity(0.45)`(由 0.1 提升)——box 填充覆盖"框内全部",2D 切片/3D 都明显着色、随手柄实时跟随;
+  markup 的 fill/outline 共用 `SetColor`(橙),靠提高填充不透明度达到"明显颜色变化"。
+- 只配置 ROI 自己的 display node,不影响 bbox prompt、`roi_node_to_mask` 栅格化与 Apply 合并。
+
 ## 结论
 
 最合理的第一步不是扩展 nnInteractive server，而是在 Slicer 插件客户端增加本地布尔编辑层。这样可以快速满足“对智能生成的人体结构选区增加或减少一部分”的核心需求，同时保持后续智能交互能力。MVP 应从 segment-to-segment 布尔操作和 ROI box subtract 开始，之后再扩展到更复杂的 3D 自由形状选区。

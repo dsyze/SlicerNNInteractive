@@ -48,6 +48,22 @@ mask,作为布尔操作(Add/Subtract/Intersect)的 operand。它本质是"用 AI
    -> `show_segmentation` -> 记 undo(`_record_selection_op_undo`)-> 上传 server。
 3. Apply 后清理预览(`_clear_wand_preview_segment`)。
 
+## 七、三序列 AI 融合（tri-planar）+ 3D 表面点选
+
+在 tri-planar 模式(已分配 >=2 个不同序列)下,魔棒的计算从单序列扩展为**三序列融合**:
+- `_compute_magic_wand_mask` 重构为:单卷核 `_wand_raw_source_mask()`(= 原主体:备份段->重置->逐种子
+  POST->取累积 mask->重采样到**源网格** `get_volume_node()`->恢复段;**不做 grow/shrink**)+ 外层调度。
+- tri-planar 路径:对 `_triplanar_coverage_volumes()` 的每个序列,临时 `_active_inference_volume_override=series`
+  跑一次单卷核(种子坐标/上传/重采样都自动随该序列),把各序列源网格结果 `np.logical_or` 并集(任一序列
+  见到即纳入,序列外为 0),再 `_postprocess_wand_mask` 一次。`finally` 里清回 override 并
+  `_ensure_inference_image_uploaded()` + `upload_segment_to_server()` 把服务器恢复到真实推理卷+段(因 sweep
+  切换过上传图像)。非 tri-planar/<2 序列时退回单序列(回归不破)。
+- 操作数始终在**源网格**(因 `apply_boolean_operation` 用 `_to_output_grid` 自行桥接到输出网格;预览也写源网格)。
+- Preview 与 Apply 都经 `_compute_magic_wand_mask`,故三序列融合对两者自动生效,无需改这两处。
+- 调试前缀 `[DEBUG wand.triplanar]`(每序列 sum + 并集 sum)。
+- 3D 表面点选:种子是 Fiducial,可在 3D 视图放置并吸附到可见表面;定位面 model 设
+  `SetSelectable(False)`,使 3D 点击落到分割表面而非定位面(需 `cbShow3DTriPlanar` 显示 3D 表面)。
+
 ## 六、注意点
 
 - `_compute_magic_wand_mask` 会临时改写 server 的交互链(备份->重置->发种子->恢复),

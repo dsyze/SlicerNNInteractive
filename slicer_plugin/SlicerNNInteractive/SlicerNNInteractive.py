@@ -3075,6 +3075,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             model_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode")
             model_node.SetName(TRIPLANAR_FRAME_NODE_NAMES[view_name])
             model_node.HideFromEditorsOn()
+            # Not pickable, so placing a markup (e.g. a magic wand seed) in the
+            # 3D view snaps to the segmentation surface, not these planes.
+            model_node.SetSelectable(False)
             model_node.CreateDefaultDisplayNodes()
             display_node = model_node.GetDisplayNode()
             if display_node is not None:
@@ -6150,7 +6153,25 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def _configure_selection_roi_display(self, display_node):
         """Style the operation ROI distinctly from the bbox prompt."""
         display_node.SetHandlesInteractive(True)
-        display_node.SetFillOpacity(0.1)
+        # Blender/Godot-style gizmo: keep the three colored axis translation
+        # arrows (drag an axis to move precisely along it) and the face scale
+        # handles (resize), but drop the rotation rings -- the box is meant to
+        # stay axis-aligned and rotation handles are easy to grab by mistake.
+        # Each guarded so an older Slicer lacking a setter still works (it keeps
+        # that handle at its default).
+        for setter, value in (
+            ("SetTranslationHandleVisibility", True),
+            ("SetScaleHandleVisibility", True),
+            ("SetRotationHandleVisibility", False),
+            ("SetInteractionHandleScale", 3.0),
+        ):
+            try:
+                getattr(display_node, setter)(value)
+            except (AttributeError, TypeError):
+                pass
+        # Higher fill opacity so the region enclosed by the box is clearly
+        # tinted in both 2D slices and 3D (was barely visible at 0.1).
+        display_node.SetFillOpacity(0.45)
         display_node.SetOutlineOpacity(0.8)
         # Orange, to stand apart from the blue bbox prompt.
         color = (1.0, 0.55, 0.1)
@@ -6555,20 +6576,16 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             mask = ndimage.binary_erosion(mask, iterations=-n_iter)
         return mask.astype(bool)
 
-    def _compute_magic_wand_mask(self, seed_node=None):
-        """
-        Ask the nnInteractive server for an AI segmentation built from one or
-        more positive (and optional negative) seed points. The call cycle:
-          1. back up the current target segment,
-          2. POST an empty mask to /upload_segment (resets server interactions),
-          3. POST /add_point_interaction once per seed (positive first, then
-             negative); the last response holds the cumulative mask,
-          4. POST the original target back to /upload_segment (restores state),
-          5. apply local post-processing (Keep largest, Grow/Shrink).
-        The `seed_node` argument is ignored -- seeds come from the two internal
-        nodes -- and kept only for backward call sites.
-        Returns a bool numpy mask aligned to the volume, or None on failure.
-        """
+    def _wand_raw_source_mask(self):
+        """One nnInteractive wand pass on the CURRENT inference volume (honors
+        _active_inference_volume_override), resampled to the source grid. No
+        Grow/Shrink (the caller applies it once). Backs up + restores the server
+        segment around the seed sweep. Returns a bool mask or None.
+
+        The call cycle: back up the target segment -> POST empty mask to reset
+        server interactions -> POST /add_point_interaction per seed (the last
+        response holds the cumulative mask) -> restore the target segment.
+        voxel_coord uses (z, y, x) order (== ras_to_xyz()[::-1])."""
         volume = self.get_inference_volume_node()
         arr = self.get_inference_image_data()
         if volume is None or arr is None or not self.server:
@@ -6585,7 +6602,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         ).astype(np.uint8).copy()
         shape = arr.shape
 
-        # 1) Reset server interactions by uploading an empty mask.
         empty = np.zeros(shape, dtype=np.uint8)
         reset_resp = self.request_to_server(
             f"{self.server}/upload_segment",
@@ -6597,8 +6613,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         seg_mask = None
         try:
-            # 2) Send each seed in order; the LAST response holds the cumulative
-            #    mask. voxel_coord uses (z, y, x) order (== ras_to_xyz()[::-1]).
             last_response = None
             for (kk, jj, ii), is_pos in seeds:
                 last_response = self.request_to_server(
@@ -6614,13 +6628,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 seg_mask = self.unpack_binary_segmentation(
                     last_response.content, decompress=False
                 ).astype(bool)
-                seg_mask = self._postprocess_wand_mask(seg_mask)
                 seg_mask = self._resample_mask_between_volumes(
                     seg_mask, volume, self.get_volume_node()
                 ).astype(bool)
         finally:
-            # 3) Restore the user's target segment on the server so subsequent
-            #    nnInteractive prompts continue from where they left off.
+            # Restore the user's target segment on the server so subsequent
+            # nnInteractive prompts continue from where they left off.
             restore_resp = self.request_to_server(
                 f"{self.server}/upload_segment",
                 files=self.mask_to_np_upload_file(pre_target),
@@ -6634,6 +6647,50 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 )
 
         return seg_mask
+
+    def _compute_magic_wand_mask(self, seed_node=None):
+        """Compute the magic wand operand mask on the SOURCE grid.
+
+        In tri-planar mode the AI point prompt is run once per assigned series
+        (R/Y/G) and the per-series results are unioned, so all three series
+        contribute to the grown region; otherwise it runs once on the current
+        inference volume (original single-series behavior). Grow/Shrink is
+        applied once at the end. `seed_node` is ignored (kept for back-compat).
+        Returns a bool numpy mask on the source grid, or None on failure."""
+        series_list = (
+            self._triplanar_coverage_volumes() if self._triplanar_mode else []
+        )
+        if len(series_list) < 2:
+            mask = self._wand_raw_source_mask()
+            return None if mask is None else self._postprocess_wand_mask(mask)
+
+        saved_override = self._active_inference_volume_override
+        masks = []
+        try:
+            for series in series_list:
+                self._active_inference_volume_override = series
+                mask = self._wand_raw_source_mask()
+                print("[DEBUG wand.triplanar] series='{}' sum={}".format(
+                    series.GetName(),
+                    None if mask is None else int(mask.sum())))
+                if mask is not None:
+                    masks.append(mask)
+        finally:
+            # The per-series sweep left the server on the last series' image;
+            # restore the real inference image + segment so later prompts work.
+            self._active_inference_volume_override = saved_override
+            self._ensure_inference_image_uploaded()
+            self.upload_segment_to_server()
+
+        if not masks:
+            return None
+        fused = masks[0]
+        for mask in masks[1:]:
+            fused = np.logical_or(fused, mask)
+        fused = self._postprocess_wand_mask(fused.astype(bool))
+        print("[DEBUG wand.triplanar] fused sum={}".format(
+            None if fused is None else int(fused.sum())))
+        return fused
 
     def _enter_place_mode_for_wand(self, node, status_msg):
         selection_node = slicer.app.applicationLogic().GetSelectionNode()
@@ -6651,7 +6708,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         node = self._get_or_create_wand_seed()
         self._enter_place_mode_for_wand(
             node,
-            "Click in any view to add a magic wand seed.",
+            "Click on the 3D model surface or in any 2D view to add a magic "
+            "wand seed.",
         )
         self._refresh_apply_enabled()
 
