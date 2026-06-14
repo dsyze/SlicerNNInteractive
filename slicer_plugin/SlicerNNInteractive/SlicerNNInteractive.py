@@ -89,6 +89,9 @@ TRIPLANAR_FRAME_FALLBACK_COLORS = {
     "Yellow": (0.952, 0.871, 0.255),
     "Green": (0.426, 0.748, 0.270),
 }
+# Opacity of the filled locator plane (the colored border is drawn on top via
+# the same model's line cells). Low enough to see the segmentation through it.
+TRIPLANAR_FRAME_OPACITY = 0.25
 
 # Hidden, geometry-only scalar volume that defines the canonical segmentation
 # output grid when the high-resolution output feature is enabled.
@@ -150,6 +153,11 @@ SETTING_LASSO_MULTIVIEW_ENABLED = "SlicerNNInteractive/lasso_multiview_enabled"
 SETTING_HIGH_RES_ENABLED = "SlicerNNInteractive/high_res_output_enabled"
 SETTING_SMOOTH_INTERPOLATE_ENABLED = "SlicerNNInteractive/smooth_interpolate_enabled"
 SETTING_TRIPLANAR_ENABLED = "SlicerNNInteractive/triplanar_mode_enabled"
+# Per-view visibility of the 3D locator planes (one key per view, suffixed with
+# the lower-cased view name); default visible.
+SETTING_TRIPLANAR_FRAME_VISIBLE_PREFIX = (
+    "SlicerNNInteractive/triplanar_frame_visible_"
+)
 
 
 def debug_print(*args):
@@ -309,11 +317,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # to return that view's series.
         self._triplanar_mode = False
         self._active_inference_volume_override = None
-        # 3D locator frames for tri-planar mode: {view_name: vtkMRMLModelNode}
+        # 3D locator planes for tri-planar mode: {view_name: vtkMRMLModelNode}
         # and the slice-node ModifiedEvent observers that keep them in sync,
         # stored as (slice_node, tag) like the snap observers.
         self._triplanar_frame_nodes = {}
         self._triplanar_frame_observers = []
+        # Overlay R/Y/G toggle buttons (top-left of the 3D view) for showing or
+        # hiding each locator plane individually, plus their container.
+        self._triplanar_frame_buttons = {}
+        self._triplanar_frame_button_bar = None
         # Applying per-plane display volumes enables a sticky view override.
         # Hidden Segment Editor widgets may reset slice backgrounds while
         # activating effects, so restore the user's selections afterward.
@@ -767,6 +779,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 "Segmentation source volume is unchanged.",
                 4000,
             )
+        # In tri-planar mode the locator planes may not exist yet (e.g. the mode
+        # was restored as CHECKED at startup, so the toggle->setup path that
+        # builds them never ran). Now that series are applied, build them.
+        self._ensure_triplanar_slice_frames("apply")
         return True
 
     def on_apply_plane_display_volumes_clicked(self, checked=False):
@@ -2727,16 +2743,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     # -- Tri-planar 3D slice locator frames ----------------------------------
 
-    def _make_slice_frame_polydata(self, slice_node, volume, view_name=None,
-                                   debug=False):
-        """Build a closed 4-corner rectangle (line-only vtkPolyData) lying on
-        the current slice plane of `slice_node`, sized to the RAS bounding box
-        of `volume` (its own series). The rectangle slides along the slice
+    def _make_slice_frame_polydata(self, slice_node, volume):
+        """Build a filled translucent quad + closed border (vtkPolyData) lying
+        on the current slice plane of `slice_node`, sized to the RAS bounding
+        box of `volume` (its own series). The plane slides along the slice
         normal as the user scrolls and rotates with oblique re-orientation
         because orientation/offset are read live from SliceToRAS. Falls back to
         the view's field of view when `volume` is missing or degenerate.
         Returns None when the plane axes or extents are degenerate."""
-        tag = "[DEBUG triplanar.frames.geom %s]" % (view_name or "?")
         m = slice_node.GetSliceToRAS()
         u = [m.GetElement(i, 0) for i in range(3)]
         v = [m.GetElement(i, 1) for i in range(3)]
@@ -2753,9 +2767,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         v = _normalize(v)
         n = _normalize(n)
         if u is None or v is None or n is None:
-            if debug:
-                print("%s ABORT: degenerate slice axes u=%s v=%s n=%s" % (
-                    tag, u, v, n))
             return None
 
         hu = hv = 0.0
@@ -2766,11 +2777,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             volume.GetRASBounds(bounds)
             ext = [bounds[1] - bounds[0], bounds[3] - bounds[2],
                    bounds[5] - bounds[4]]
-            if debug:
-                print("%s volume=%s bounds=%s ext=%s" % (
-                    tag, volume.GetName(),
-                    [round(b, 1) for b in bounds],
-                    [round(e, 1) for e in ext]))
             if min(ext) > 1e-6:
                 have_bounds = True
                 # Half span of an axis-aligned box projected onto a unit
@@ -2787,46 +2793,40 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 d = [box_c[i] - origin[i] for i in range(3)]
                 dist = d[0] * n[0] + d[1] * n[1] + d[2] * n[2]
                 center = [box_c[i] - dist * n[i] for i in range(3)]
-        elif debug:
-            print("%s no background volume; using FOV fallback" % tag)
         if not have_bounds:
             # Fall back to the (zoom-dependent) FOV about the view center.
             fov = slice_node.GetFieldOfView()
             hu = 0.5 * float(fov[0])
             hv = 0.5 * float(fov[1])
             center = list(origin)
-            if debug:
-                print("%s FOV fallback fov=%s" % (tag, list(fov)))
         if hu < 1e-6 or hv < 1e-6:
-            if debug:
-                print("%s ABORT: degenerate half-extents hu=%s hv=%s" % (
-                    tag, hu, hv))
             return None
 
         points = vtk.vtkPoints()
-        corners = []
         for su, sv in ((1.0, 1.0), (1.0, -1.0), (-1.0, -1.0), (-1.0, 1.0)):
-            c = (
+            points.InsertNextPoint(
                 center[0] + su * hu * u[0] + sv * hv * v[0],
                 center[1] + su * hu * u[1] + sv * hv * v[1],
                 center[2] + su * hu * u[2] + sv * hv * v[2],
             )
-            corners.append(c)
-            points.InsertNextPoint(*c)
+        # Closed border line (drawn crisply regardless of surface representation).
         line = vtk.vtkPolyLine()
         line.GetPointIds().SetNumberOfIds(5)
         for idx, pid in enumerate((0, 1, 2, 3, 0)):
             line.GetPointIds().SetId(idx, pid)
-        cells = vtk.vtkCellArray()
-        cells.InsertNextCell(line)
+        lines = vtk.vtkCellArray()
+        lines.InsertNextCell(line)
+        # Filled quad (the locator "plane"); rendered as a translucent surface.
+        polygon = vtk.vtkPolygon()
+        polygon.GetPointIds().SetNumberOfIds(4)
+        for idx in range(4):
+            polygon.GetPointIds().SetId(idx, idx)
+        polys = vtk.vtkCellArray()
+        polys.InsertNextCell(polygon)
         poly = vtk.vtkPolyData()
         poly.SetPoints(points)
-        poly.SetLines(cells)
-        if debug:
-            print("%s OK center=%s hu=%.1f hv=%.1f corner0=%s corner2=%s" % (
-                tag, [round(c, 1) for c in center], hu, hv,
-                [round(c, 1) for c in corners[0]],
-                [round(c, 1) for c in corners[2]]))
+        poly.SetLines(lines)
+        poly.SetPolys(polys)
         return poly
 
     def _get_frame_color(self, view_name, slice_node):
@@ -2841,22 +2841,43 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             pass
         return TRIPLANAR_FRAME_FALLBACK_COLORS.get(view_name, (1.0, 1.0, 1.0))
 
+    def _get_frame_visible(self, view_name):
+        """Persisted per-view visibility of the locator plane (default True)."""
+        return self._get_qsetting(
+            SETTING_TRIPLANAR_FRAME_VISIBLE_PREFIX + view_name.lower(),
+            True, cast=bool)
+
+    def _set_frame_visible(self, view_name, visible):
+        """Persist a view's locator-plane visibility preference."""
+        self._set_qsetting(
+            SETTING_TRIPLANAR_FRAME_VISIBLE_PREFIX + view_name.lower(),
+            bool(visible))
+
+    def _ensure_triplanar_slice_frames(self, reason=""):
+        """Build the locator planes if we are in tri-planar mode, they are not
+        built yet, and at least two distinct series are assigned to the views.
+
+        Covers the lazy-restore gap: when tri-planar is restored as CHECKED at
+        startup the toggle->setup path that builds the planes never runs, so the
+        planes are created here instead the moment series get applied. Idempotent
+        and cheap: a no-op once the planes exist (their geometry is kept current
+        by the slice-node observers)."""
+        if not self._triplanar_mode:
+            return
+        if self._triplanar_frame_nodes:
+            return
+        bg = {v: self._view_background_volume(v)
+              for v in PLANE_DISPLAY_SELECTOR_NAMES}
+        distinct = {n.GetID() for n in bg.values() if n is not None}
+        if len(distinct) < 2:
+            return
+        self._enable_triplanar_slice_frames()
+
     def _enable_triplanar_slice_frames(self):
-        """Create one hidden line-only model per realized standard view and
-        observe its slice node so the 3D locator frame follows scroll/rotation.
+        """Create one hidden filled-plane model per realized standard view and
+        observe its slice node so the 3D locator plane follows scroll/rotation.
         Idempotent: any existing frames/observers are torn down first."""
         self._disable_triplanar_slice_frames()
-        n_3d = len(slicer.util.getNodesByClass("vtkMRMLViewNode"))
-        lm = slicer.app.layoutManager()
-        n_3d_widgets = lm.threeDViewCount if lm is not None else -1
-        realized = [v for v, _l, _s in self._iter_standard_slice_logics()]
-        print("[DEBUG triplanar.frames] ENABLE start: 3D view nodes=%d, "
-              "3D widgets in layout=%s, realized slice views=%s" % (
-                  n_3d, n_3d_widgets, realized))
-        if n_3d_widgets == 0:
-            print("[DEBUG triplanar.frames] WARN: current layout has NO 3D "
-                  "view -- frames will be created but are not visible until you "
-                  "switch to a layout that includes a 3D view (e.g. Four-Up).")
         for view_name, _slice_logic, slice_node in (
             self._iter_standard_slice_logics()
         ):
@@ -2870,22 +2891,18 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 display_node.SetColor(*color)
                 display_node.SetEdgeColor(*color)
                 display_node.SetLineWidth(2)
-                # Lines have no surface normals; lighting would dim the color.
+                # Translucent filled plane so the segmentation shows through;
+                # the colored border (line cells) is drawn on top.
+                display_node.SetOpacity(TRIPLANAR_FRAME_OPACITY)
+                display_node.SetBackfaceCulling(False)
+                # Flat color (no shading) for a clean translucent sheet.
                 display_node.SetLighting(False)
                 # 2D views already draw slice intersection lines; only show the
-                # frame in 3D.
+                # plane in 3D.
                 display_node.SetVisibility2D(False)
                 display_node.SetVisibility3D(True)
-                display_node.SetVisibility(True)
-                print("[DEBUG triplanar.frames] created %s id=%s color=%s "
-                      "display(vis=%s,vis3D=%s)" % (
-                          view_name, model_node.GetID(),
-                          [round(c, 2) for c in color],
-                          display_node.GetVisibility(),
-                          display_node.GetVisibility3D()))
-            else:
-                print("[DEBUG triplanar.frames] WARN %s: no display node" % (
-                    view_name))
+                # Per-view show/hide, controlled by the overlay R/Y/G buttons.
+                display_node.SetVisibility(self._get_frame_visible(view_name))
             self._triplanar_frame_nodes[view_name] = model_node
             # Single shared callback: each slice Modified refreshes all frames.
             callback = lambda caller, event: (
@@ -2893,14 +2910,35 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             )
             tag = slice_node.AddObserver(vtk.vtkCommand.ModifiedEvent, callback)
             self._triplanar_frame_observers.append((slice_node, tag))
-        # One-shot verbose geometry dump on the first update after enable.
-        self._frame_debug_pending = True
         self._update_triplanar_slice_frames()
-        print("[DEBUG triplanar.frames] ENABLE done: %d frame(s)" % (
-            len(self._triplanar_frame_nodes)))
+        # Overlay the R/Y/G show/hide buttons on the 3D view.
+        self._create_triplanar_frame_buttons()
+        # On the FIRST entry the 3D view's model displayable manager has not yet
+        # built actors for the just-added nodes (the scene is still settling
+        # from the heavy setup), so the synchronous render above paints nothing
+        # and the planes only appeared after toggling the mode off/on. Re-render
+        # on later event-loop turns, once actors exist (matches the off/on fix
+        # automatically). Same singleShot idiom used elsewhere in this file.
+        # On the FIRST entry the 3D view's model displayable manager may not have
+        # built actors for the just-added nodes yet (the scene is still settling
+        # from the heavy setup), so the synchronous render above can paint
+        # nothing and the planes would only appear after an off/on toggle.
+        # Re-render on later event-loop turns, once actors exist.
+        for delay_ms in (0, 250):
+            qt.QTimer.singleShot(delay_ms, self._deferred_frame_render)
+
+    def _deferred_frame_render(self):
+        """Deferred re-render so the locator planes show on first entry without
+        an off/on toggle. No-op if tri-planar was left in the meantime."""
+        if not (self._triplanar_mode and self._triplanar_frame_nodes):
+            return
+        self._update_triplanar_slice_frames()
+        bar = getattr(self, "_triplanar_frame_button_bar", None)
+        if bar is not None:
+            bar.raise_()
 
     def _update_triplanar_slice_frames(self):
-        """Refresh every locator frame's geometry + color from its slice node's
+        """Refresh every locator plane's geometry + color from its slice node's
         current orientation/offset. Cheap (4 points each); safe on every slice
         ModifiedEvent. Never modifies slice nodes, so there is no observer
         recursion (do NOT call enable_slice_intersections here -- it would call
@@ -2910,31 +2948,19 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         layout_manager = slicer.app.layoutManager()
         if layout_manager is None:
             return
-        debug = getattr(self, "_frame_debug_pending", False)
-        self._frame_debug_pending = False
         for view_name, model_node in list(self._triplanar_frame_nodes.items()):
             if (model_node is None
                     or not slicer.mrmlScene.IsNodePresent(model_node)):
-                if debug:
-                    print("[DEBUG triplanar.frames] update %s: model missing "
-                          "from scene" % view_name)
                 continue
             slice_widget = layout_manager.sliceWidget(view_name)
             if slice_widget is None:
-                if debug:
-                    print("[DEBUG triplanar.frames] update %s: no slice widget"
-                          % view_name)
                 continue
             slice_node = slice_widget.mrmlSliceNode()
             if slice_node is None:
                 continue
             poly = self._make_slice_frame_polydata(
-                slice_node, self._view_background_volume(view_name),
-                view_name=view_name, debug=debug)
+                slice_node, self._view_background_volume(view_name))
             if poly is None:
-                if debug:
-                    print("[DEBUG triplanar.frames] update %s: polydata None "
-                          "(see geom log)" % view_name)
                 continue
             model_node.SetAndObservePolyData(poly)
             display_node = model_node.GetDisplayNode()
@@ -2942,40 +2968,28 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 color = self._get_frame_color(view_name, slice_node)
                 display_node.SetColor(*color)
                 display_node.SetEdgeColor(*color)
-            if debug:
-                bnd = [0.0] * 6
-                model_node.GetRASBounds(bnd)
-                print("[DEBUG triplanar.frames] update %s: points=%d lines=%d "
-                      "modelRASbounds=%s vis=%s" % (
-                          view_name, poly.GetNumberOfPoints(),
-                          poly.GetNumberOfLines(),
-                          [round(b, 1) for b in bnd],
-                          display_node.GetVisibility()
-                          if display_node is not None else "?"))
-        # Newly created/updated model polydata does not repaint the 3D view on
-        # its own when it changes outside an interaction (e.g. built at the end
-        # of _setup_triplanar_views), so the frames were invisible until the
-        # next click. Force a render of the 3D view(s); line actors are cheap.
-        self._force_render_3d_views(debug=debug)
+                # Keep each plane's persisted show/hide state across rebuilds.
+                display_node.SetVisibility(self._get_frame_visible(view_name))
+        # Programmatic polydata changes do not always repaint the 3D view on
+        # their own (e.g. built at the end of _setup_triplanar_views), so force
+        # a render; the plane actors are cheap.
+        self._force_render_3d_views()
 
-    def _force_render_3d_views(self, debug=False):
+    def _force_render_3d_views(self):
         """Force an immediate repaint of every 3D view. Needed because model
         polydata set programmatically does not always trigger a 3D render."""
         layout_manager = slicer.app.layoutManager()
         if layout_manager is None:
             return
-        count = layout_manager.threeDViewCount
-        for i in range(count):
+        for i in range(layout_manager.threeDViewCount):
             widget = layout_manager.threeDWidget(i)
             if widget is not None:
                 widget.threeDView().forceRender()
-        if debug:
-            print("[DEBUG triplanar.frames] forced render of %d 3D view(s)" % (
-                count))
 
     def _disable_triplanar_slice_frames(self):
-        """Tear down the 3D locator frames: drop observers, remove the model
-        nodes, then clear the containers (all three or it leaks/leaves ghosts)."""
+        """Tear down the 3D locator planes: drop observers, remove the model
+        nodes, destroy the overlay buttons, then clear the containers (all or it
+        leaks/leaves ghosts)."""
         for slice_node, tag in getattr(self, "_triplanar_frame_observers", []):
             if slice_node is not None:
                 slice_node.RemoveObserver(tag)
@@ -2985,6 +2999,90 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                     and slicer.mrmlScene.IsNodePresent(model_node)):
                 slicer.mrmlScene.RemoveNode(model_node)
         self._triplanar_frame_nodes = {}
+        self._destroy_triplanar_frame_buttons()
+
+    # -- Overlay R/Y/G show/hide buttons (top-left of the 3D view) -----------
+
+    def _style_frame_button(self, button, view_name, checked):
+        """Color a plane toggle button: lit (filled view color) when the plane
+        is shown, dimmed (dark with colored text/border) when hidden."""
+        color = TRIPLANAR_FRAME_FALLBACK_COLORS.get(view_name, (1.0, 1.0, 1.0))
+        r, g, b = (int(round(255 * c)) for c in color)
+        if checked:
+            button.setStyleSheet(
+                "QToolButton { background-color: rgb(%d,%d,%d); color: black; "
+                "border: 1px solid black; border-radius: 3px; "
+                "font-weight: bold; padding: 2px; }" % (r, g, b))
+        else:
+            button.setStyleSheet(
+                "QToolButton { background-color: rgb(60,60,60); "
+                "color: rgb(%d,%d,%d); border: 1px solid rgb(%d,%d,%d); "
+                "border-radius: 3px; padding: 2px; }" % (r, g, b, r, g, b))
+
+    def _create_triplanar_frame_buttons(self):
+        """Overlay three small colored R/Y/G toggle buttons at the top-left of
+        the first 3D view, one per locator plane. Idempotent."""
+        self._destroy_triplanar_frame_buttons()
+        layout_manager = slicer.app.layoutManager()
+        if layout_manager is None or layout_manager.threeDViewCount == 0:
+            return
+        widget = layout_manager.threeDWidget(0)
+        view = widget.threeDView() if widget is not None else None
+        if view is None:
+            return
+        bar = qt.QWidget(view)
+        bar.setObjectName("TriPlanarFrameButtonBar")
+        # Transparent container so only the buttons paint over the 3D render.
+        bar.setStyleSheet(
+            "QWidget#TriPlanarFrameButtonBar { background: transparent; }")
+        layout = qt.QHBoxLayout(bar)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(3)
+        for view_name in PLANE_DISPLAY_SELECTOR_NAMES:
+            button = qt.QToolButton(bar)
+            button.setText(view_name[0])
+            button.setCheckable(True)
+            checked = self._get_frame_visible(view_name)
+            button.setChecked(checked)
+            button.setToolTip(
+                "Show/hide the %s locator plane in 3D" % view_name)
+            self._style_frame_button(button, view_name, checked)
+            button.toggled.connect(
+                lambda state, v=view_name: self._on_frame_button_toggled(
+                    v, state))
+            layout.addWidget(button)
+            self._triplanar_frame_buttons[view_name] = button
+        self._triplanar_frame_button_bar = bar
+        bar.move(8, 8)
+        bar.show()
+        bar.raise_()
+
+    def _on_frame_button_toggled(self, view_name, checked):
+        """Show/hide one locator plane, persist the choice, restyle the button,
+        and repaint the 3D view."""
+        self._set_frame_visible(view_name, checked)
+        model_node = self._triplanar_frame_nodes.get(view_name)
+        if model_node is not None and slicer.mrmlScene.IsNodePresent(model_node):
+            display_node = model_node.GetDisplayNode()
+            if display_node is not None:
+                display_node.SetVisibility(checked)
+        button = self._triplanar_frame_buttons.get(view_name)
+        if button is not None:
+            self._style_frame_button(button, view_name, checked)
+        self._force_render_3d_views()
+
+    def _destroy_triplanar_frame_buttons(self):
+        """Remove the overlay toggle buttons and their container."""
+        for button in getattr(self, "_triplanar_frame_buttons", {}).values():
+            if button is not None:
+                button.setParent(None)
+                button.deleteLater()
+        self._triplanar_frame_buttons = {}
+        bar = getattr(self, "_triplanar_frame_button_bar", None)
+        if bar is not None:
+            bar.setParent(None)
+            bar.deleteLater()
+        self._triplanar_frame_button_bar = None
 
     def _setup_triplanar_views(self):
         """Apply the user's manual Red/Yellow/Green series assignment as the
@@ -3034,9 +3132,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 "in the Multi-plane display panel (and Apply) first.", 6000
             )
             return False
-        # Show the 3D slice locator frames (3D counterpart of the 2D
-        # intersection lines) now that the views carry distinct series.
-        self._enable_triplanar_slice_frames()
+        # Show the 3D slice locator planes (3D counterpart of the 2D
+        # intersection lines) now that the views carry distinct series. Use the
+        # ensure variant so we do not rebuild if on_apply (above) already built
+        # them via the same _ensure hook.
+        self._ensure_triplanar_slice_frames("setup")
         slicer.util.showStatusMessage(
             "Tri-planar mode on: " + ", ".join(
                 "{}={}".format(v, n) for v, n in view_series.items()), 5000
@@ -3204,6 +3304,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         did. Overlap zones resolve to last-editor-wins, which is predictable and
         far better than averaging that silently erodes. Direction-weighted SDF
         smoothing is now opt-in via the manual Fuse button."""
+        # Safety net for the lazy-restore gap: any tri-planar interaction means
+        # we are active with series assigned, so make sure the locator planes
+        # exist (no-op once built).
+        self._ensure_triplanar_slice_frames("result")
         output_mask = self._resample_result_to_output(segmentation_mask)
         out_shape = self._output_grid_shape()
         new = np.asarray(output_mask).astype(bool)
@@ -3405,14 +3509,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.cbTriPlanarMode.setChecked(self._get_triplanar_enabled())
         self.ui.cbTriPlanarMode.blockSignals(blocked)
         self._triplanar_mode = self._get_triplanar_enabled()
-        if self._triplanar_mode:
-            # Lazy start: the checkbox is restored CHECKED without firing the
-            # toggle, so _setup_triplanar_views (and the 3D locator frames) did
-            # NOT run. If you do not see the frames, this is likely why -- untick
-            # and re-tick "Tri-planar mode" once your series are assigned.
-            print("[DEBUG triplanar.frames] startup: tri-planar restored as "
-                  "CHECKED via blocked signal -- frames NOT built yet (re-tick "
-                  "the checkbox to build them).")
+        # Lazy start: the checkbox is restored CHECKED without firing the toggle,
+        # so the planes are built later by _ensure_triplanar_slice_frames when
+        # the user applies their series (see _apply_plane_display_volumes).
         self.ui.pbRegisterSupplemental.clicked.connect(
             self.on_register_supplemental_clicked
         )
