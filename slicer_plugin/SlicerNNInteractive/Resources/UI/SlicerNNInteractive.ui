@@ -1124,6 +1124,113 @@
             </widget>
            </item>
            <item>
+            <layout class="QHBoxLayout" name="horizontalLayout_planeOpacity">
+             <item>
+              <widget class="QLabel" name="lblPlaneOpacity">
+               <property name="text">
+                <string>Locator plane opacity:</string>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QSlider" name="sldPlaneOpacity">
+               <property name="toolTip">
+                <string>Opacity of the filled tri-planar locator planes shown in the 3D view.</string>
+               </property>
+               <property name="minimum">
+                <number>0</number>
+               </property>
+               <property name="maximum">
+                <number>100</number>
+               </property>
+               <property name="value">
+                <number>25</number>
+               </property>
+               <property name="orientation">
+                <enum>Qt::Horizontal</enum>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QLabel" name="lblPlaneOpacityValue">
+               <property name="minimumSize">
+                <size>
+                 <width>48</width>
+                 <height>0</height>
+                </size>
+               </property>
+               <property name="text">
+                <string>25 %</string>
+               </property>
+               <property name="alignment">
+                <set>Qt::AlignRight|Qt::AlignTrailing|Qt::AlignVCenter</set>
+               </property>
+              </widget>
+             </item>
+            </layout>
+           </item>
+           <item>
+            <widget class="QCheckBox" name="cbAutoRotateCamera">
+             <property name="toolTip">
+              <string>When enabled, the 3D camera automatically rotates to face the series of the view you interact in (place a point/box/lasso/scribble).</string>
+             </property>
+             <property name="text">
+              <string>Auto-rotate 3D to the active series</string>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QCheckBox" name="cbShow3DTriPlanar">
+             <property name="toolTip">
+              <string>When enabled, the segmentation's 3D surface is shown in tri-planar mode. It is rebuilt once after you pause interacting (a heavy operation on the large fused grid), not on every interaction.</string>
+             </property>
+             <property name="text">
+              <string>Show segmentation in 3D (tri-planar)</string>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <layout class="QHBoxLayout" name="horizontalLayout_faceSeries">
+             <item>
+              <widget class="QLabel" name="lblFaceSeries">
+               <property name="text">
+                <string>Face series in 3D:</string>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QPushButton" name="pbFaceRed">
+               <property name="toolTip">
+                <string>Rotate the 3D camera to face the Red view's series.</string>
+               </property>
+               <property name="text">
+                <string>Red</string>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QPushButton" name="pbFaceYellow">
+               <property name="toolTip">
+                <string>Rotate the 3D camera to face the Yellow view's series.</string>
+               </property>
+               <property name="text">
+                <string>Yellow</string>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QPushButton" name="pbFaceGreen">
+               <property name="toolTip">
+                <string>Rotate the 3D camera to face the Green view's series.</string>
+               </property>
+               <property name="text">
+                <string>Green</string>
+               </property>
+              </widget>
+             </item>
+            </layout>
+           </item>
+           <item>
             <widget class="QCheckBox" name="cbEnableNativeSeriesInference">
              <property name="toolTip">
               <string>Run nnInteractive on a registered supplemental series. Results are previewed first and synchronized back to the Segment Editor source volume only when confirmed.</string>

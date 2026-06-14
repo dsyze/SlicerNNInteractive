@@ -153,6 +153,33 @@ Red/Yellow/Green 各建一个隐藏 `vtkMRMLModelNode`(`TRIPLANAR_FRAME_NODE_NAM
   (`blockSignals` 设勾选不触发 toggle)在用户分配序列/Apply 时也能自动建面,无需手动关再开复选框。
   需当前布局含 3D 视图(如 Four-Up)才看得到面与按钮。新前缀 `[DEBUG triplanar.frames]`。
   已知限制:按钮 attach 到进入时的 `threeDWidget(0)`,进入后切布局会丢按钮,重勾选 tri-planar 重建。
+- 不透明度:面板滑块 `sldPlaneOpacity`(0..100)→ `_on_plane_opacity_changed` 统一设三面 display `SetOpacity`
+  并持久化 `SETTING_PLANE_OPACITY`;`_enable_triplanar_slice_frames` 建面时用 `_get_plane_opacity()`(默认
+  `TRIPLANAR_FRAME_OPACITY`)。
+- 几何共享:`_slice_frame_geometry(slice_node, volume)` 返回 `(center,u,v,n,hu,hv)`,被 `_make_slice_frame_polydata`
+  与相机旋转共用。
+
+## 点击序列 -> 3D 相机自动旋转正对该序列
+
+`_rotate_camera_to_view(view_name)`:用 `_slice_frame_geometry` 取该视图定位面的 center/法向 n/半宽;相机
+**沿切片平面法向**(oblique 自适应)观察,焦点=center,距离 `1.3*max(hu,hv)/tan(viewAngle/2)` 容纳整面;
+法向符号按 `TRIPLANAR_CAMERA_PREFERRED_SIDE`(Red→Superior、Yellow→Anterior、Green→Left)消歧,使视点符合
+"上/前/左"惯例;view-up 取切片竖直轴(偏 Superior,近轴向退偏 Anterior)。相机节点经
+`slicer.modules.cameras.logic().GetViewActiveCameraNode(threeDWidget(0).mrmlViewNode())` 取得,设
+`SetFocalPoint/SetPosition/SetViewUp` 后 `ResetCameraClippingRange` + `_force_render_3d_views`。
+- 触发:`_route_prompt_to_view` 命中视图后,若 `_get_auto_camera_rotation()`(`SETTING_AUTO_CAMERA_ROTATION`,
+  复选框 `cbAutoRotateCamera`,默认 On)则旋转——覆盖 point/bbox/lasso/scribble 四类交互(单点钩子)。
+- 手动:面板按钮 `pbFaceRed/pbFaceYellow/pbFaceGreen` 直接调 `_rotate_camera_to_view`,不受总开关影响。
+
+## tri-planar 自动 Show 3D（分割闭合曲面，防抖）
+
+`show_segmentation` 在 tri-planar 下故意跳过每次交互的闭合曲面重建(大融合网格上 marching cubes 很重)。
+改为:`with RenderBlocker()` 块后,若 `cbShow3DTriPlanar`(`SETTING_SHOW_3D_TRIPLANAR`,默认 On)开启则
+`_schedule_triplanar_3d_surface()` —— 用 `qt.QTimer.singleShot(TRIPLANAR_3D_SURFACE_DEBOUNCE_MS=600, ...)` +
+自增 token 防抖:连续快速交互各自排程,仅最后一个(停手 600ms 后)token 匹配,`_rebuild_triplanar_3d_surface`
+才真正 `RemoveRepresentation(_closed_surface_name()) → CreateClosedSurfaceRepresentation() →
+SetVisibility3D(True)/SetSegmentVisibility3D(seg_id,True)`(display-smooth 开时先设 Smoothing factor)。
+开关勾上立即排一次、取消则 `SetVisibility3D(False)`;`_setup_triplanar_views` 成功路径也排一次显示已有分割。
 
 ## 关键符号
 
@@ -166,4 +193,9 @@ Red/Yellow/Green 各建一个隐藏 `vtkMRMLModelNode`(`TRIPLANAR_FRAME_NODE_NAM
 `_get_frame_visible`、`_set_frame_visible`、`_ensure_triplanar_slice_frames`、`_enable_triplanar_slice_frames`、
 `_update_triplanar_slice_frames`、`_disable_triplanar_slice_frames`、`_force_render_3d_views`、
 `_style_frame_button`、`_create_triplanar_frame_buttons`、`_on_frame_button_toggled`、
-`_destroy_triplanar_frame_buttons`。
+`_destroy_triplanar_frame_buttons`、`_slice_frame_geometry`、`SETTING_PLANE_OPACITY`、`_get_plane_opacity`、
+`_on_plane_opacity_changed`、`sldPlaneOpacity`、`SETTING_AUTO_CAMERA_ROTATION`、`cbAutoRotateCamera`、
+`_get_auto_camera_rotation`、`_on_auto_camera_rotation_toggled`、`_rotate_camera_to_view`、
+`TRIPLANAR_CAMERA_PREFERRED_SIDE`、`pbFaceRed`/`pbFaceYellow`/`pbFaceGreen`、`SETTING_SHOW_3D_TRIPLANAR`、
+`cbShow3DTriPlanar`、`_get_show_3d_triplanar`、`_on_show_3d_triplanar_toggled`、`_schedule_triplanar_3d_surface`、
+`_rebuild_triplanar_3d_surface`、`TRIPLANAR_3D_SURFACE_DEBOUNCE_MS`。

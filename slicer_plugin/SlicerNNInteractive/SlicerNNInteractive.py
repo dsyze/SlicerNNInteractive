@@ -92,6 +92,16 @@ TRIPLANAR_FRAME_FALLBACK_COLORS = {
 # Opacity of the filled locator plane (the colored border is drawn on top via
 # the same model's line cells). Low enough to see the segmentation through it.
 TRIPLANAR_FRAME_OPACITY = 0.25
+# Preferred camera side (RAS unit vector) per view for auto-rotation: which side
+# the camera sits on when facing that series. Red=Superior(+S), Yellow=Anterior
+# (+A), Green=Left(-R). The actual view direction is the series' slice-plane
+# normal (oblique-aware); this only disambiguates the normal's sign so the
+# viewpoint matches the conventional top/front/left expectation.
+TRIPLANAR_CAMERA_PREFERRED_SIDE = {
+    "Red": (0.0, 0.0, 1.0),
+    "Yellow": (0.0, 1.0, 0.0),
+    "Green": (-1.0, 0.0, 0.0),
+}
 
 # Hidden, geometry-only scalar volume that defines the canonical segmentation
 # output grid when the high-resolution output feature is enabled.
@@ -158,6 +168,15 @@ SETTING_TRIPLANAR_ENABLED = "SlicerNNInteractive/triplanar_mode_enabled"
 SETTING_TRIPLANAR_FRAME_VISIBLE_PREFIX = (
     "SlicerNNInteractive/triplanar_frame_visible_"
 )
+# Opacity of the filled locator planes (0..1), adjustable via a slider.
+SETTING_PLANE_OPACITY = "SlicerNNInteractive/plane_opacity"
+# Auto-rotate the 3D camera to face the series of the view being interacted with.
+SETTING_AUTO_CAMERA_ROTATION = "SlicerNNInteractive/auto_camera_rotation"
+# Show the segmentation's 3D closed surface while in tri-planar mode.
+SETTING_SHOW_3D_TRIPLANAR = "SlicerNNInteractive/show_3d_triplanar"
+# Debounce (ms) for rebuilding the tri-planar 3D surface so rapid interactions
+# trigger a single (heavy) marching-cubes pass after the user pauses.
+TRIPLANAR_3D_SURFACE_DEBOUNCE_MS = 600
 
 
 def debug_print(*args):
@@ -2743,14 +2762,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     # -- Tri-planar 3D slice locator frames ----------------------------------
 
-    def _make_slice_frame_polydata(self, slice_node, volume):
-        """Build a filled translucent quad + closed border (vtkPolyData) lying
-        on the current slice plane of `slice_node`, sized to the RAS bounding
-        box of `volume` (its own series). The plane slides along the slice
-        normal as the user scrolls and rotates with oblique re-orientation
-        because orientation/offset are read live from SliceToRAS. Falls back to
-        the view's field of view when `volume` is missing or degenerate.
-        Returns None when the plane axes or extents are degenerate."""
+    def _slice_frame_geometry(self, slice_node, volume):
+        """Return (center, u, v, n, hu, hv) for a view's locator plane, or None.
+
+        center: RAS center of the plane on the current slice offset; u/v/n: the
+        normalized in-plane axes and normal from SliceToRAS; hu/hv: half-widths
+        sized to `volume`'s RAS bounding box (falls back to the view field of
+        view when the volume is missing/degenerate). Shared by the polydata
+        builder and the camera-rotation feature so both stay consistent."""
         m = slice_node.GetSliceToRAS()
         u = [m.GetElement(i, 0) for i in range(3)]
         v = [m.GetElement(i, 1) for i in range(3)]
@@ -2801,6 +2820,20 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             center = list(origin)
         if hu < 1e-6 or hv < 1e-6:
             return None
+        return center, u, v, n, hu, hv
+
+    def _make_slice_frame_polydata(self, slice_node, volume):
+        """Build a filled translucent quad + closed border (vtkPolyData) lying
+        on the current slice plane of `slice_node`, sized to the RAS bounding
+        box of `volume` (its own series). The plane slides along the slice
+        normal as the user scrolls and rotates with oblique re-orientation
+        because orientation/offset are read live from SliceToRAS. Falls back to
+        the view's field of view when `volume` is missing or degenerate.
+        Returns None when the plane axes or extents are degenerate."""
+        geometry = self._slice_frame_geometry(slice_node, volume)
+        if geometry is None:
+            return None
+        center, u, v, _n, hu, hv = geometry
 
         points = vtk.vtkPoints()
         for su, sv in ((1.0, 1.0), (1.0, -1.0), (-1.0, -1.0), (-1.0, 1.0)):
@@ -2853,6 +2886,164 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             SETTING_TRIPLANAR_FRAME_VISIBLE_PREFIX + view_name.lower(),
             bool(visible))
 
+    def _get_plane_opacity(self):
+        """Persisted locator-plane fill opacity (0..1). Default from constant."""
+        v = self._get_qsetting(
+            SETTING_PLANE_OPACITY, TRIPLANAR_FRAME_OPACITY, cast=float)
+        return max(0.0, min(1.0, v))
+
+    def _on_plane_opacity_changed(self, value):
+        """Slider drag -- set every locator plane's opacity and persist it."""
+        pct = int(value)
+        if hasattr(self, "ui") and hasattr(self.ui, "lblPlaneOpacityValue"):
+            self.ui.lblPlaneOpacityValue.setText("%d %%" % pct)
+        fraction = float(pct) / 100.0
+        self._set_qsetting(SETTING_PLANE_OPACITY, fraction)
+        for model_node in self._triplanar_frame_nodes.values():
+            if model_node is None or not slicer.mrmlScene.IsNodePresent(
+                    model_node):
+                continue
+            display_node = model_node.GetDisplayNode()
+            if display_node is not None:
+                display_node.SetOpacity(fraction)
+        self._force_render_3d_views()
+
+    # -- Auto-rotate the 3D camera to face a series ---------------------------
+
+    def _get_auto_camera_rotation(self):
+        """Persisted auto-rotate-camera-on-interaction preference (default On)."""
+        return self._get_qsetting(
+            SETTING_AUTO_CAMERA_ROTATION, True, cast=bool)
+
+    def _on_auto_camera_rotation_toggled(self, checked):
+        """Persist the auto-rotate toggle."""
+        self._set_qsetting(SETTING_AUTO_CAMERA_ROTATION, bool(checked))
+
+    def _rotate_camera_to_view(self, view_name):
+        """Rotate the 3D camera to face the series shown in `view_name`.
+
+        View direction is the series' slice-plane normal (oblique-aware); the
+        focal point is the locator plane center and the distance fits the plane.
+        The normal's sign is chosen so the camera sits on the conventional side
+        (Red=above, Yellow=front, Green=left). No-op without a 3D view, series,
+        or valid geometry."""
+        layout_manager = slicer.app.layoutManager()
+        if layout_manager is None or layout_manager.threeDViewCount == 0:
+            return
+        slice_widget = layout_manager.sliceWidget(view_name)
+        slice_node = (
+            slice_widget.mrmlSliceNode() if slice_widget is not None else None)
+        if slice_node is None:
+            return
+        geometry = self._slice_frame_geometry(
+            slice_node, self._view_background_volume(view_name))
+        if geometry is None:
+            return
+        center, _u, v, n, hu, hv = geometry
+
+        # Oblique-aware direction; flip so the camera is on the expected side.
+        pref = TRIPLANAR_CAMERA_PREFERRED_SIDE.get(view_name, (0.0, 0.0, 1.0))
+        if (n[0] * pref[0] + n[1] * pref[1] + n[2] * pref[2]) < 0:
+            n = [-n[0], -n[1], -n[2]]
+
+        # View-up: the slice vertical, signed toward Superior (toward Anterior
+        # when the plane is near-axial so "up" is not ambiguous).
+        up = list(v)
+        d_sup = up[2]
+        if abs(d_sup) >= 0.1:
+            if d_sup < 0:
+                up = [-up[0], -up[1], -up[2]]
+        elif up[1] < 0:
+            up = [-up[0], -up[1], -up[2]]
+
+        view_node = layout_manager.threeDWidget(0).mrmlViewNode()
+        try:
+            cameras_logic = slicer.modules.cameras.logic()
+            camera_node = cameras_logic.GetViewActiveCameraNode(view_node)
+        except Exception:  # noqa: BLE001 - cameras module/camera not available
+            camera_node = None
+        if camera_node is None:
+            return
+
+        angle = camera_node.GetCamera().GetViewAngle()
+        half_angle = math.radians(angle) / 2.0
+        tan_half = math.tan(half_angle)
+        dist = (1.3 * max(hu, hv) / tan_half) if tan_half > 1e-6 else (
+            3.0 * max(hu, hv))
+        pos = [center[i] + n[i] * dist for i in range(3)]
+
+        camera_node.SetFocalPoint(center[0], center[1], center[2])
+        camera_node.SetPosition(pos[0], pos[1], pos[2])
+        camera_node.SetViewUp(up[0], up[1], up[2])
+        try:
+            renderer = (layout_manager.threeDWidget(0).threeDView()
+                        .renderWindow().GetRenderers().GetFirstRenderer())
+            renderer.ResetCameraClippingRange()
+        except Exception:  # noqa: BLE001 - clipping reset is a convenience
+            pass
+        self._force_render_3d_views()
+
+    # -- Show the segmentation 3D surface in tri-planar (debounced) -----------
+
+    def _get_show_3d_triplanar(self):
+        """Persisted 'show segmentation in 3D while tri-planar' pref (default On)."""
+        return self._get_qsetting(SETTING_SHOW_3D_TRIPLANAR, True, cast=bool)
+
+    def _on_show_3d_triplanar_toggled(self, checked):
+        """Persist the toggle; build the surface now when turned on, hide the 3D
+        surface when turned off (2D fill and locator planes are untouched)."""
+        self._set_qsetting(SETTING_SHOW_3D_TRIPLANAR, bool(checked))
+        if checked:
+            self._schedule_triplanar_3d_surface()
+            return
+        seg_node = self._existing_segmentation_node()
+        if seg_node is None:
+            return
+        display_node = seg_node.GetDisplayNode()
+        if display_node is not None:
+            display_node.SetVisibility3D(False)
+        self._force_render_3d_views()
+
+    def _schedule_triplanar_3d_surface(self):
+        """Debounce the (heavy) closed-surface rebuild: only the last schedule in
+        a burst of rapid interactions actually runs, once the user pauses."""
+        self._tp3d_token = getattr(self, "_tp3d_token", 0) + 1
+        token = self._tp3d_token
+        qt.QTimer.singleShot(
+            TRIPLANAR_3D_SURFACE_DEBOUNCE_MS,
+            lambda t=token: self._rebuild_triplanar_3d_surface(t))
+
+    def _rebuild_triplanar_3d_surface(self, token):
+        """Rebuild + show the current segment's 3D closed surface. No-op if a
+        newer interaction has been scheduled since (token mismatch), if not in
+        tri-planar mode, or if the feature is off."""
+        if token != getattr(self, "_tp3d_token", 0):
+            return
+        if not self._triplanar_mode or not self._get_show_3d_triplanar():
+            return
+        seg_node = self._existing_segmentation_node()
+        if seg_node is None:
+            return
+        seg_id = self.get_current_segment_id()
+        display_node = seg_node.GetDisplayNode()
+        try:
+            segmentation = seg_node.GetSegmentation()
+            if self._get_display_smooth_enabled():
+                segmentation.SetConversionParameter(
+                    "Smoothing factor",
+                    str(self._current_display_smooth_strength()))
+            # Drop the stale surface so it is rebuilt from the current labelmap.
+            segmentation.RemoveRepresentation(self._closed_surface_name())
+            seg_node.CreateClosedSurfaceRepresentation()
+            if display_node is not None:
+                display_node.SetVisibility3D(True)
+                if seg_id:
+                    display_node.SetSegmentVisibility3D(seg_id, True)
+        except Exception as exc:  # noqa: BLE001 - never break the prompt flow
+            print("[nni] tri-planar 3D surface build failed: %s" % exc)
+            return
+        self._force_render_3d_views()
+
     def _ensure_triplanar_slice_frames(self, reason=""):
         """Build the locator planes if we are in tri-planar mode, they are not
         built yet, and at least two distinct series are assigned to the views.
@@ -2892,8 +3083,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 display_node.SetEdgeColor(*color)
                 display_node.SetLineWidth(2)
                 # Translucent filled plane so the segmentation shows through;
-                # the colored border (line cells) is drawn on top.
-                display_node.SetOpacity(TRIPLANAR_FRAME_OPACITY)
+                # the colored border (line cells) is drawn on top. Opacity is
+                # user-adjustable via the sldPlaneOpacity slider.
+                display_node.SetOpacity(self._get_plane_opacity())
                 display_node.SetBackfaceCulling(False)
                 # Flat color (no shading) for a clean translucent sheet.
                 display_node.SetLighting(False)
@@ -3137,6 +3329,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # ensure variant so we do not rebuild if on_apply (above) already built
         # them via the same _ensure hook.
         self._ensure_triplanar_slice_frames("setup")
+        # Show any existing segmentation in 3D now that we are tri-planar.
+        if self._get_show_3d_triplanar():
+            self._schedule_triplanar_3d_surface()
         slicer.util.showStatusMessage(
             "Tri-planar mode on: " + ", ".join(
                 "{}={}".format(v, n) for v, n in view_series.items()), 5000
@@ -3245,6 +3440,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._active_inference_volume_override = series
         print("[DEBUG triplanar.route] routed to view {} (series '{}')".format(
             view, series.GetName()))
+        # Auto-rotate the 3D camera to face the series the user is working in.
+        if self._get_auto_camera_rotation():
+            self._rotate_camera_to_view(view)
         return view
 
     def _resample_result_to_output(self, working_mask):
@@ -3512,6 +3710,33 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Lazy start: the checkbox is restored CHECKED without firing the toggle,
         # so the planes are built later by _ensure_triplanar_slice_frames when
         # the user applies their series (see _apply_plane_display_volumes).
+        # Locator plane opacity slider (controls all three planes together).
+        self.ui.sldPlaneOpacity.valueChanged.connect(
+            self._on_plane_opacity_changed)
+        plane_pct = int(round(self._get_plane_opacity() * 100))
+        blocked = self.ui.sldPlaneOpacity.blockSignals(True)
+        self.ui.sldPlaneOpacity.setValue(plane_pct)
+        self.ui.sldPlaneOpacity.blockSignals(blocked)
+        self.ui.lblPlaneOpacityValue.setText("%d %%" % plane_pct)
+        # Auto-rotate the 3D camera to face the active series.
+        self.ui.cbAutoRotateCamera.toggled.connect(
+            self._on_auto_camera_rotation_toggled)
+        blocked = self.ui.cbAutoRotateCamera.blockSignals(True)
+        self.ui.cbAutoRotateCamera.setChecked(self._get_auto_camera_rotation())
+        self.ui.cbAutoRotateCamera.blockSignals(blocked)
+        # Show the segmentation 3D surface while in tri-planar (debounced).
+        self.ui.cbShow3DTriPlanar.toggled.connect(
+            self._on_show_3d_triplanar_toggled)
+        blocked = self.ui.cbShow3DTriPlanar.blockSignals(True)
+        self.ui.cbShow3DTriPlanar.setChecked(self._get_show_3d_triplanar())
+        self.ui.cbShow3DTriPlanar.blockSignals(blocked)
+        # Manual "face series in 3D" buttons (always active, ignore the toggle).
+        self.ui.pbFaceRed.clicked.connect(
+            lambda *a, v="Red": self._rotate_camera_to_view(v))
+        self.ui.pbFaceYellow.clicked.connect(
+            lambda *a, v="Yellow": self._rotate_camera_to_view(v))
+        self.ui.pbFaceGreen.clicked.connect(
+            lambda *a, v="Green": self._rotate_camera_to_view(v))
         self.ui.pbRegisterSupplemental.clicked.connect(
             self.on_register_supplemental_clicked
         )
@@ -4686,6 +4911,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 segmentationNode.CreateClosedSurfaceRepresentation()
                 _perf_log("[DEBUG triplanar.perf] CreateClosedSurfaceRepresentation "
                       "done", flush=True)
+        # Tri-planar skips the per-interaction surface rebuild above; instead
+        # show the 3D surface via a debounced rebuild so rapid interactions only
+        # pay the heavy marching-cubes cost once, after the user pauses.
+        if self._triplanar_mode and self._get_show_3d_triplanar():
+            self._schedule_triplanar_3d_surface()
         _perf_log("[DEBUG triplanar.perf] show_segmentation: done", flush=True)
 
         # Mark the segment as being edited (can be useful for selective saving of only modified segments)
