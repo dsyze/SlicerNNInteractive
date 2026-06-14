@@ -72,6 +72,24 @@ PLANE_DISPLAY_SELECTOR_NAMES = {
     "Green": "cbGreenDisplayVolume",
 }
 
+# Tri-planar 3D locator frames: one hidden line-only model per standard view,
+# drawn in the 3D view to mark where each slice plane currently sits (the 3D
+# counterpart of the 2D slice intersection lines). Names end with the usual
+# "(do not touch)" marker so they read as internal scaffolding.
+TRIPLANAR_FRAME_NODE_NAMES = {
+    "Red": "TriPlanarSliceFrameRed (do not touch)",
+    "Yellow": "TriPlanarSliceFrameYellow (do not touch)",
+    "Green": "TriPlanarSliceFrameGreen (do not touch)",
+}
+# Fallback RGB (0..1) per view when a slice node does not expose GetLayoutColor;
+# values mirror Slicer's standard Red/Yellow/Green slice colors so the 3D frame
+# matches the 2D intersection line color.
+TRIPLANAR_FRAME_FALLBACK_COLORS = {
+    "Red": (0.952, 0.297, 0.252),
+    "Yellow": (0.952, 0.871, 0.255),
+    "Green": (0.426, 0.748, 0.270),
+}
+
 # Hidden, geometry-only scalar volume that defines the canonical segmentation
 # output grid when the high-resolution output feature is enabled.
 OUTPUT_GEOMETRY_NODE_NAME = "NNInteractiveOutputGeometry (do not touch)"
@@ -291,6 +309,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # to return that view's series.
         self._triplanar_mode = False
         self._active_inference_volume_override = None
+        # 3D locator frames for tri-planar mode: {view_name: vtkMRMLModelNode}
+        # and the slice-node ModifiedEvent observers that keep them in sync,
+        # stored as (slice_node, tag) like the snap observers.
+        self._triplanar_frame_nodes = {}
+        self._triplanar_frame_observers = []
         # Applying per-plane display volumes enables a sticky view override.
         # Hidden Segment Editor widgets may reset slice backgrounds while
         # activating effects, so restore the user's selections afterward.
@@ -2702,6 +2725,267 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """Read the persisted tri-planar mode preference. Default False."""
         return self._get_qsetting(SETTING_TRIPLANAR_ENABLED, False, cast=bool)
 
+    # -- Tri-planar 3D slice locator frames ----------------------------------
+
+    def _make_slice_frame_polydata(self, slice_node, volume, view_name=None,
+                                   debug=False):
+        """Build a closed 4-corner rectangle (line-only vtkPolyData) lying on
+        the current slice plane of `slice_node`, sized to the RAS bounding box
+        of `volume` (its own series). The rectangle slides along the slice
+        normal as the user scrolls and rotates with oblique re-orientation
+        because orientation/offset are read live from SliceToRAS. Falls back to
+        the view's field of view when `volume` is missing or degenerate.
+        Returns None when the plane axes or extents are degenerate."""
+        tag = "[DEBUG triplanar.frames.geom %s]" % (view_name or "?")
+        m = slice_node.GetSliceToRAS()
+        u = [m.GetElement(i, 0) for i in range(3)]
+        v = [m.GetElement(i, 1) for i in range(3)]
+        n = [m.GetElement(i, 2) for i in range(3)]
+        origin = [m.GetElement(i, 3) for i in range(3)]
+
+        def _normalize(a):
+            length = (a[0] ** 2 + a[1] ** 2 + a[2] ** 2) ** 0.5
+            if length < 1e-9:
+                return None
+            return [a[0] / length, a[1] / length, a[2] / length]
+
+        u = _normalize(u)
+        v = _normalize(v)
+        n = _normalize(n)
+        if u is None or v is None or n is None:
+            if debug:
+                print("%s ABORT: degenerate slice axes u=%s v=%s n=%s" % (
+                    tag, u, v, n))
+            return None
+
+        hu = hv = 0.0
+        center = list(origin)
+        have_bounds = False
+        if volume is not None:
+            bounds = [0.0] * 6
+            volume.GetRASBounds(bounds)
+            ext = [bounds[1] - bounds[0], bounds[3] - bounds[2],
+                   bounds[5] - bounds[4]]
+            if debug:
+                print("%s volume=%s bounds=%s ext=%s" % (
+                    tag, volume.GetName(),
+                    [round(b, 1) for b in bounds],
+                    [round(e, 1) for e in ext]))
+            if min(ext) > 1e-6:
+                have_bounds = True
+                # Half span of an axis-aligned box projected onto a unit
+                # direction d is 0.5 * sum(|d_axis| * extent_axis).
+                hu = 0.5 * (abs(u[0]) * ext[0] + abs(u[1]) * ext[1]
+                            + abs(u[2]) * ext[2])
+                hv = 0.5 * (abs(v[0]) * ext[0] + abs(v[1]) * ext[1]
+                            + abs(v[2]) * ext[2])
+                # Project the box center onto the live slice plane (through
+                # origin with normal n) so the frame rides the slice offset.
+                box_c = [0.5 * (bounds[0] + bounds[1]),
+                         0.5 * (bounds[2] + bounds[3]),
+                         0.5 * (bounds[4] + bounds[5])]
+                d = [box_c[i] - origin[i] for i in range(3)]
+                dist = d[0] * n[0] + d[1] * n[1] + d[2] * n[2]
+                center = [box_c[i] - dist * n[i] for i in range(3)]
+        elif debug:
+            print("%s no background volume; using FOV fallback" % tag)
+        if not have_bounds:
+            # Fall back to the (zoom-dependent) FOV about the view center.
+            fov = slice_node.GetFieldOfView()
+            hu = 0.5 * float(fov[0])
+            hv = 0.5 * float(fov[1])
+            center = list(origin)
+            if debug:
+                print("%s FOV fallback fov=%s" % (tag, list(fov)))
+        if hu < 1e-6 or hv < 1e-6:
+            if debug:
+                print("%s ABORT: degenerate half-extents hu=%s hv=%s" % (
+                    tag, hu, hv))
+            return None
+
+        points = vtk.vtkPoints()
+        corners = []
+        for su, sv in ((1.0, 1.0), (1.0, -1.0), (-1.0, -1.0), (-1.0, 1.0)):
+            c = (
+                center[0] + su * hu * u[0] + sv * hv * v[0],
+                center[1] + su * hu * u[1] + sv * hv * v[1],
+                center[2] + su * hu * u[2] + sv * hv * v[2],
+            )
+            corners.append(c)
+            points.InsertNextPoint(*c)
+        line = vtk.vtkPolyLine()
+        line.GetPointIds().SetNumberOfIds(5)
+        for idx, pid in enumerate((0, 1, 2, 3, 0)):
+            line.GetPointIds().SetId(idx, pid)
+        cells = vtk.vtkCellArray()
+        cells.InsertNextCell(line)
+        poly = vtk.vtkPolyData()
+        poly.SetPoints(points)
+        poly.SetLines(cells)
+        if debug:
+            print("%s OK center=%s hu=%.1f hv=%.1f corner0=%s corner2=%s" % (
+                tag, [round(c, 1) for c in center], hu, hv,
+                [round(c, 1) for c in corners[0]],
+                [round(c, 1) for c in corners[2]]))
+        return poly
+
+    def _get_frame_color(self, view_name, slice_node):
+        """RGB (0..1) for a view's 3D locator frame: the slice node's layout
+        color when available (matching the 2D intersection line), else a fixed
+        per-view fallback."""
+        try:
+            color = slice_node.GetLayoutColor()
+            if color is not None and len(color) == 3:
+                return (float(color[0]), float(color[1]), float(color[2]))
+        except Exception:  # noqa: BLE001 - defensive around optional accessor
+            pass
+        return TRIPLANAR_FRAME_FALLBACK_COLORS.get(view_name, (1.0, 1.0, 1.0))
+
+    def _enable_triplanar_slice_frames(self):
+        """Create one hidden line-only model per realized standard view and
+        observe its slice node so the 3D locator frame follows scroll/rotation.
+        Idempotent: any existing frames/observers are torn down first."""
+        self._disable_triplanar_slice_frames()
+        n_3d = len(slicer.util.getNodesByClass("vtkMRMLViewNode"))
+        lm = slicer.app.layoutManager()
+        n_3d_widgets = lm.threeDViewCount if lm is not None else -1
+        realized = [v for v, _l, _s in self._iter_standard_slice_logics()]
+        print("[DEBUG triplanar.frames] ENABLE start: 3D view nodes=%d, "
+              "3D widgets in layout=%s, realized slice views=%s" % (
+                  n_3d, n_3d_widgets, realized))
+        if n_3d_widgets == 0:
+            print("[DEBUG triplanar.frames] WARN: current layout has NO 3D "
+                  "view -- frames will be created but are not visible until you "
+                  "switch to a layout that includes a 3D view (e.g. Four-Up).")
+        for view_name, _slice_logic, slice_node in (
+            self._iter_standard_slice_logics()
+        ):
+            model_node = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode")
+            model_node.SetName(TRIPLANAR_FRAME_NODE_NAMES[view_name])
+            model_node.HideFromEditorsOn()
+            model_node.CreateDefaultDisplayNodes()
+            display_node = model_node.GetDisplayNode()
+            if display_node is not None:
+                color = self._get_frame_color(view_name, slice_node)
+                display_node.SetColor(*color)
+                display_node.SetEdgeColor(*color)
+                display_node.SetLineWidth(2)
+                # Lines have no surface normals; lighting would dim the color.
+                display_node.SetLighting(False)
+                # 2D views already draw slice intersection lines; only show the
+                # frame in 3D.
+                display_node.SetVisibility2D(False)
+                display_node.SetVisibility3D(True)
+                display_node.SetVisibility(True)
+                print("[DEBUG triplanar.frames] created %s id=%s color=%s "
+                      "display(vis=%s,vis3D=%s)" % (
+                          view_name, model_node.GetID(),
+                          [round(c, 2) for c in color],
+                          display_node.GetVisibility(),
+                          display_node.GetVisibility3D()))
+            else:
+                print("[DEBUG triplanar.frames] WARN %s: no display node" % (
+                    view_name))
+            self._triplanar_frame_nodes[view_name] = model_node
+            # Single shared callback: each slice Modified refreshes all frames.
+            callback = lambda caller, event: (
+                self._update_triplanar_slice_frames()
+            )
+            tag = slice_node.AddObserver(vtk.vtkCommand.ModifiedEvent, callback)
+            self._triplanar_frame_observers.append((slice_node, tag))
+        # One-shot verbose geometry dump on the first update after enable.
+        self._frame_debug_pending = True
+        self._update_triplanar_slice_frames()
+        print("[DEBUG triplanar.frames] ENABLE done: %d frame(s)" % (
+            len(self._triplanar_frame_nodes)))
+
+    def _update_triplanar_slice_frames(self):
+        """Refresh every locator frame's geometry + color from its slice node's
+        current orientation/offset. Cheap (4 points each); safe on every slice
+        ModifiedEvent. Never modifies slice nodes, so there is no observer
+        recursion (do NOT call enable_slice_intersections here -- it would call
+        Modified on the slice nodes and re-fire this callback in a loop)."""
+        if not self._triplanar_frame_nodes:
+            return
+        layout_manager = slicer.app.layoutManager()
+        if layout_manager is None:
+            return
+        debug = getattr(self, "_frame_debug_pending", False)
+        self._frame_debug_pending = False
+        for view_name, model_node in list(self._triplanar_frame_nodes.items()):
+            if (model_node is None
+                    or not slicer.mrmlScene.IsNodePresent(model_node)):
+                if debug:
+                    print("[DEBUG triplanar.frames] update %s: model missing "
+                          "from scene" % view_name)
+                continue
+            slice_widget = layout_manager.sliceWidget(view_name)
+            if slice_widget is None:
+                if debug:
+                    print("[DEBUG triplanar.frames] update %s: no slice widget"
+                          % view_name)
+                continue
+            slice_node = slice_widget.mrmlSliceNode()
+            if slice_node is None:
+                continue
+            poly = self._make_slice_frame_polydata(
+                slice_node, self._view_background_volume(view_name),
+                view_name=view_name, debug=debug)
+            if poly is None:
+                if debug:
+                    print("[DEBUG triplanar.frames] update %s: polydata None "
+                          "(see geom log)" % view_name)
+                continue
+            model_node.SetAndObservePolyData(poly)
+            display_node = model_node.GetDisplayNode()
+            if display_node is not None:
+                color = self._get_frame_color(view_name, slice_node)
+                display_node.SetColor(*color)
+                display_node.SetEdgeColor(*color)
+            if debug:
+                bnd = [0.0] * 6
+                model_node.GetRASBounds(bnd)
+                print("[DEBUG triplanar.frames] update %s: points=%d lines=%d "
+                      "modelRASbounds=%s vis=%s" % (
+                          view_name, poly.GetNumberOfPoints(),
+                          poly.GetNumberOfLines(),
+                          [round(b, 1) for b in bnd],
+                          display_node.GetVisibility()
+                          if display_node is not None else "?"))
+        # Newly created/updated model polydata does not repaint the 3D view on
+        # its own when it changes outside an interaction (e.g. built at the end
+        # of _setup_triplanar_views), so the frames were invisible until the
+        # next click. Force a render of the 3D view(s); line actors are cheap.
+        self._force_render_3d_views(debug=debug)
+
+    def _force_render_3d_views(self, debug=False):
+        """Force an immediate repaint of every 3D view. Needed because model
+        polydata set programmatically does not always trigger a 3D render."""
+        layout_manager = slicer.app.layoutManager()
+        if layout_manager is None:
+            return
+        count = layout_manager.threeDViewCount
+        for i in range(count):
+            widget = layout_manager.threeDWidget(i)
+            if widget is not None:
+                widget.threeDView().forceRender()
+        if debug:
+            print("[DEBUG triplanar.frames] forced render of %d 3D view(s)" % (
+                count))
+
+    def _disable_triplanar_slice_frames(self):
+        """Tear down the 3D locator frames: drop observers, remove the model
+        nodes, then clear the containers (all three or it leaks/leaves ghosts)."""
+        for slice_node, tag in getattr(self, "_triplanar_frame_observers", []):
+            if slice_node is not None:
+                slice_node.RemoveObserver(tag)
+        self._triplanar_frame_observers = []
+        for model_node in getattr(self, "_triplanar_frame_nodes", {}).values():
+            if (model_node is not None
+                    and slicer.mrmlScene.IsNodePresent(model_node)):
+                slicer.mrmlScene.RemoveNode(model_node)
+        self._triplanar_frame_nodes = {}
+
     def _setup_triplanar_views(self):
         """Apply the user's manual Red/Yellow/Green series assignment as the
         sticky per-plane display, then enable the high-resolution output grid and
@@ -2744,11 +3028,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         distinct_ids = {n.GetID() for n in bg.values() if n is not None}
         if len(distinct_ids) < 2:
             print("[DEBUG triplanar.setup] WARN: fewer than 2 distinct series in views")
+            self._disable_triplanar_slice_frames()
             slicer.util.showStatusMessage(
                 "Tri-planar mode: assign your series to the Red/Yellow/Green views "
                 "in the Multi-plane display panel (and Apply) first.", 6000
             )
             return False
+        # Show the 3D slice locator frames (3D counterpart of the 2D
+        # intersection lines) now that the views carry distinct series.
+        self._enable_triplanar_slice_frames()
         slicer.util.showStatusMessage(
             "Tri-planar mode on: " + ", ".join(
                 "{}={}".format(v, n) for v, n in view_series.items()), 5000
@@ -2773,6 +3061,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self._fusion_grid_shape = None
             self._clear_selection_op_undo_stack(
                 "Output grid reverted to source; undo history cleared.")
+            self._disable_triplanar_slice_frames()
         self._refresh_native_series_inference_ui()
 
     @staticmethod
@@ -3116,6 +3405,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.cbTriPlanarMode.setChecked(self._get_triplanar_enabled())
         self.ui.cbTriPlanarMode.blockSignals(blocked)
         self._triplanar_mode = self._get_triplanar_enabled()
+        if self._triplanar_mode:
+            # Lazy start: the checkbox is restored CHECKED without firing the
+            # toggle, so _setup_triplanar_views (and the 3D locator frames) did
+            # NOT run. If you do not see the frames, this is likely why -- untick
+            # and re-tick "Tri-planar mode" once your series are assigned.
+            print("[DEBUG triplanar.frames] startup: tri-planar restored as "
+                  "CHECKED via blocked signal -- frames NOT built yet (re-tick "
+                  "the checkbox to build them).")
         self.ui.pbRegisterSupplemental.clicked.connect(
             self.on_register_supplemental_clicked
         )
@@ -3387,6 +3684,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.removeObservers()
         self._remove_slice_snap_observers()
         self._teardown_scribble_observer()
+        # Tri-planar 3D locator frames (model nodes + slice-node observers).
+        self._disable_triplanar_slice_frames()
 
         # Tear down the hidden lasso (3D) Scissors editor and region/preview nodes.
         self._destroy_lasso3d()
