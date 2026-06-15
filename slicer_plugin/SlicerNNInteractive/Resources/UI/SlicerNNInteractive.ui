@@ -786,6 +786,52 @@
               </item>
              </layout>
             </item>
+            <item>
+             <layout class="QHBoxLayout" name="horizontalLayout_crop_box">
+              <item>
+               <widget class="QPushButton" name="pbPlaceCropRoi">
+                <property name="minimumSize">
+                 <size>
+                  <width>0</width>
+                  <height>30</height>
+                 </size>
+                </property>
+                <property name="toolTip">
+                 <string>Create or show a box ROI sized to the current segment; rotate the view and drag it to frame the region to keep.</string>
+                </property>
+                <property name="text">
+                 <string>Place Crop ROI</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QPushButton" name="pbCropSegmentByBox">
+                <property name="minimumSize">
+                 <size>
+                  <width>0</width>
+                  <height>30</height>
+                 </size>
+                </property>
+                <property name="toolTip">
+                 <string>Clear the current segment's voxels outside the crop box (keep only what is inside the box). Undoable; synced to the server.</string>
+                </property>
+                <property name="text">
+                 <string>Crop Segment by Box</string>
+                </property>
+               </widget>
+              </item>
+             </layout>
+            </item>
+            <item>
+             <widget class="QCheckBox" name="cbKeepCropRoi">
+              <property name="toolTip">
+               <string>Keep the crop box after cropping so you can adjust it and crop again. When off, the box is removed after each crop.</string>
+              </property>
+              <property name="text">
+               <string>Keep crop box after cropping</string>
+              </property>
+             </widget>
+            </item>
            </layout>
           </widget>
          </item>
@@ -1176,6 +1222,16 @@
              </property>
              <property name="text">
               <string>Auto-rotate 3D to the active series</string>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QCheckBox" name="cbObliqueCameraAlign">
+             <property name="toolTip">
+              <string>When enabled, align the 3D camera to the series' acquisition frame (its direction matrix and registration transform), so an obliquely acquired or obliquely registered series faces the camera squarely. When off, the camera uses the standard 2D slice orientation.</string>
+             </property>
+             <property name="text">
+              <string>Align 3D camera to oblique series</string>
              </property>
             </widget>
            </item>

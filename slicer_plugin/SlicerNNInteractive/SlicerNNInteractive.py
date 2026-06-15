@@ -174,6 +174,9 @@ SETTING_PLANE_OPACITY = "SlicerNNInteractive/plane_opacity"
 SETTING_AUTO_CAMERA_ROTATION = "SlicerNNInteractive/auto_camera_rotation"
 # Show the segmentation's 3D closed surface while in tri-planar mode.
 SETTING_SHOW_3D_TRIPLANAR = "SlicerNNInteractive/show_3d_triplanar"
+# Align the 3D camera to a series' acquisition frame (its direction matrix
+# composed with any registration transform) instead of the 2D slice plane.
+SETTING_OBLIQUE_CAMERA_ALIGN = "SlicerNNInteractive/oblique_camera_align"
 # Debounce (ms) for rebuilding the tri-planar 3D surface so rapid interactions
 # trigger a single (heavy) marching-cubes pass after the user pauses.
 TRIPLANAR_3D_SURFACE_DEBOUNCE_MS = 600
@@ -283,6 +286,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         VTKObservationMixin.__init__(self)  # needed for parameter node observation
         # Operation ROI used as an alternative operand for Selection Operations.
         self._sel_op_roi_node = None
+        # Dedicated ROI for the "Crop Segment by Box" tool (independent of the
+        # Selection Operations operand ROI above).
+        self._crop_roi_node = None
         # Sphere/ellipsoid visualization for the operation ROI.
         self._sel_op_roi_preview_node = None
         self._sel_op_roi_preview_transform_node = None
@@ -2919,6 +2925,85 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """Persist the auto-rotate toggle."""
         self._set_qsetting(SETTING_AUTO_CAMERA_ROTATION, bool(checked))
 
+    def _get_oblique_camera_align(self):
+        """Persisted 'align camera to series acquisition frame' pref (default On)."""
+        return self._get_qsetting(
+            SETTING_OBLIQUE_CAMERA_ALIGN, True, cast=bool)
+
+    def _on_oblique_camera_align_toggled(self, checked):
+        """Persist the oblique-camera-align toggle."""
+        self._set_qsetting(SETTING_OBLIQUE_CAMERA_ALIGN, bool(checked))
+
+    def _volume_acquisition_frame(self, volume):
+        """Return (center, i_axis, j_axis, k_axis) in world/RAS for a volume's
+        acquisition frame, or None.
+
+        i/j/k are the unit IJK column directions of GetIJKToRASDirectionMatrix
+        rotated into world space by the volume's parent transform (so a series
+        made oblique purely by a registration transform is handled). j is the
+        image column direction (view-up); k is the slice-stacking direction
+        (the plane normal). center is the world bounding-box center
+        (GetRASBounds applies the parent transform). None on a missing or
+        degenerate direction matrix."""
+        if volume is None:
+            return None
+        get_dirs = getattr(volume, "GetIJKToRASDirectionMatrix", None)
+        if get_dirs is None:
+            return None
+        dm = vtk.vtkMatrix4x4()
+        get_dirs(dm)
+        cols = [[dm.GetElement(r, c) for r in range(3)] for c in range(3)]
+        # Rotate the direction vectors into world space via the parent
+        # transform. Subtracting the transformed origin keeps only rotation
+        # (no translation) -- the correct operation for a direction vector.
+        tnode = volume.GetParentTransformNode()
+        if tnode is not None:
+            local_to_world = vtk.vtkGeneralTransform()
+            slicer.vtkMRMLTransformNode.GetTransformBetweenNodes(
+                tnode, None, local_to_world)
+            origin_w = list(local_to_world.TransformPoint([0.0, 0.0, 0.0]))
+            rotated = []
+            for vec in cols:
+                pw = list(local_to_world.TransformPoint(vec))
+                rotated.append([pw[a] - origin_w[a] for a in range(3)])
+            cols = rotated
+
+        def _norm(a):
+            length = (a[0] ** 2 + a[1] ** 2 + a[2] ** 2) ** 0.5
+            if length < 1e-9:
+                return None
+            return [a[0] / length, a[1] / length, a[2] / length]
+
+        i_axis, j_axis, k_axis = _norm(cols[0]), _norm(cols[1]), _norm(cols[2])
+        if i_axis is None or j_axis is None or k_axis is None:
+            return None
+        bounds = [0.0] * 6  # GetRASBounds applies the parent transform (world).
+        volume.GetRASBounds(bounds)
+        center = [0.5 * (bounds[0] + bounds[1]),
+                  0.5 * (bounds[2] + bounds[3]),
+                  0.5 * (bounds[4] + bounds[5])]
+        return center, i_axis, j_axis, k_axis
+
+    def _has_oblique_world_frame(self, volume):
+        """True when the volume is oblique in world space: either its own
+        direction matrix is oblique, or a parent transform tilts its axes off
+        RAS. Plain _volume_is_oblique only inspects the direction matrix, so it
+        misses series made oblique purely by a registration transform -- the
+        very case this camera alignment targets."""
+        if volume is None:
+            return False
+        if self._volume_is_oblique(volume):
+            return True
+        frame = self._volume_acquisition_frame(volume)
+        if frame is None:
+            return False
+        _center, i_axis, j_axis, k_axis = frame
+        for axis in (i_axis, j_axis, k_axis):
+            if max(abs(axis[0]), abs(axis[1]),
+                   abs(axis[2])) < OBLIQUE_COS_THRESHOLD:
+                return True
+        return False
+
     def _rotate_camera_to_view(self, view_name):
         """Rotate the 3D camera to face the series shown in `view_name`.
 
@@ -2935,20 +3020,43 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             slice_widget.mrmlSliceNode() if slice_widget is not None else None)
         if slice_node is None:
             return
-        geometry = self._slice_frame_geometry(
-            slice_node, self._view_background_volume(view_name))
-        if geometry is None:
-            return
-        center, _u, v, n, hu, hv = geometry
+        volume = self._view_background_volume(view_name)
+
+        # Preferred source: the series' true acquisition frame (its direction
+        # matrix composed with any registration transform), so an obliquely
+        # acquired or obliquely registered series is faced squarely. Fall back
+        # to the 2D slice plane when the feature is off, the volume is missing,
+        # the frame is not oblique in world space, or the frame is degenerate.
+        center = n = up = hu = hv = None
+        if (self._get_oblique_camera_align()
+                and volume is not None
+                and self._has_oblique_world_frame(volume)):
+            frame = self._volume_acquisition_frame(volume)
+            if frame is not None:
+                center, i_axis, j_axis, k_axis = frame
+                n = list(k_axis)   # slice-stacking direction = view normal
+                up = list(j_axis)  # image column direction = view up
+                bounds = [0.0] * 6  # world AABB (parent transform applied).
+                volume.GetRASBounds(bounds)
+                ext = [bounds[1] - bounds[0], bounds[3] - bounds[2],
+                       bounds[5] - bounds[4]]
+                hu = 0.5 * sum(abs(i_axis[a]) * ext[a] for a in range(3))
+                hv = 0.5 * sum(abs(j_axis[a]) * ext[a] for a in range(3))
+
+        if center is None:
+            geometry = self._slice_frame_geometry(slice_node, volume)
+            if geometry is None:
+                return
+            center, _u, v, n, hu, hv = geometry
+            up = list(v)
 
         # Oblique-aware direction; flip so the camera is on the expected side.
         pref = TRIPLANAR_CAMERA_PREFERRED_SIDE.get(view_name, (0.0, 0.0, 1.0))
         if (n[0] * pref[0] + n[1] * pref[1] + n[2] * pref[2]) < 0:
             n = [-n[0], -n[1], -n[2]]
 
-        # View-up: the slice vertical, signed toward Superior (toward Anterior
-        # when the plane is near-axial so "up" is not ambiguous).
-        up = list(v)
+        # View-up signed toward Superior (toward Anterior when the plane is
+        # near-axial so "up" is not ambiguous).
         d_sup = up[2]
         if abs(d_sup) >= 0.1:
             if d_sup < 0:
@@ -3727,6 +3835,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         blocked = self.ui.cbAutoRotateCamera.blockSignals(True)
         self.ui.cbAutoRotateCamera.setChecked(self._get_auto_camera_rotation())
         self.ui.cbAutoRotateCamera.blockSignals(blocked)
+        # Align the auto-rotate / "face series" camera to each series' oblique
+        # acquisition frame (its direction matrix + registration transform).
+        self.ui.cbObliqueCameraAlign.toggled.connect(
+            self._on_oblique_camera_align_toggled)
+        blocked = self.ui.cbObliqueCameraAlign.blockSignals(True)
+        self.ui.cbObliqueCameraAlign.setChecked(self._get_oblique_camera_align())
+        self.ui.cbObliqueCameraAlign.blockSignals(blocked)
         # Show the segmentation 3D surface while in tri-planar (debounced).
         self.ui.cbShow3DTriPlanar.toggled.connect(
             self._on_show_3d_triplanar_toggled)
@@ -3815,6 +3930,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.cbRoiShape.currentIndexChanged.connect(self._on_roi_shape_changed)
         self.ui.pbPlaceRoi.clicked.connect(self.on_place_roi_clicked)
         self.ui.pbClearRoi.clicked.connect(self.on_clear_roi_clicked)
+        self.ui.pbPlaceCropRoi.clicked.connect(self.on_place_crop_roi_clicked)
+        self.ui.pbCropSegmentByBox.clicked.connect(
+            self.on_crop_segment_by_box_clicked)
         self.ui.pbPlaceWandSeed.clicked.connect(self.on_place_wand_seed_clicked)
         self.ui.pbClearWandSeed.clicked.connect(self.on_clear_wand_seed_clicked)
         self.ui.pbPreviewWand.clicked.connect(self.on_preview_wand_clicked)
@@ -4020,6 +4138,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # wand seeds (+ their placement observer) and the hidden wand preview
         # segmentation would otherwise survive a module close/Reload.
         self._destroy_selection_roi()
+        self._destroy_crop_roi()
         self._destroy_wand_seed()
         self._destroy_wand_preview_segmentation()
         self._destroy_inference_preview()
@@ -5997,7 +6116,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     # -- ROI operand --
 
-    def roi_node_to_mask(self, roi_node):
+    def roi_node_to_mask(self, roi_node, shape_idx=None):
         """
         Rasterize a vtkMRMLMarkupsROINode into a bool numpy mask by testing
         each candidate voxel inside the ROI's local (OBB) frame. This handles
@@ -6005,6 +6124,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         world-AABB approach over-included voxels heavily for oblique scans).
         The candidate IJK box is first restricted by the ROI's world AABB
         (clamped to the volume) so iteration stays bounded.
+
+        shape_idx overrides the ROI shape (ROI_SHAPE_BOX/SPHERE/ELLIPSOID);
+        when None it follows the cbRoiShape selector. Crop-by-box passes
+        ROI_SHAPE_BOX so it never depends on the Selection Operations UI.
         """
         # --- Production geometry fetch ---
         radius = [0.0, 0.0, 0.0]
@@ -6122,7 +6245,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         y = M[1, 0] * ii + M[1, 1] * jj + M[1, 2] * kk + M[1, 3]
         z = M[2, 0] * ii + M[2, 1] * jj + M[2, 2] * kk + M[2, 3]
 
-        shape_idx = self.ui.cbRoiShape.currentIndex  # 0=Box, 1=Sphere, 2=Ellipsoid
+        if shape_idx is None:
+            shape_idx = self.ui.cbRoiShape.currentIndex  # 0=Box,1=Sphere,2=Ellipsoid
         if shape_idx == ROI_SHAPE_SPHERE:
             # Sphere: inscribed in the (possibly non-cube) ROI box.
             r = min(rx, ry, rz)
@@ -6244,6 +6368,99 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 slicer.mrmlScene.RemoveNode(node)
         self._sel_op_roi_node = None
         self._destroy_selection_roi_preview()
+
+    # -- Crop Segment by Box (dedicated ROI) --
+
+    def _segment_ras_bounds(self):
+        """World/RAS bounding box [xmin, xmax, ymin, ymax, zmin, zmax] of the
+        current segment's non-zero voxels, or None when empty/unavailable.
+
+        Used to size the crop ROI to the segment rather than the whole volume.
+        Computed on the output grid (where the segment lives) and mapped to RAS
+        via the output volume's IJKToRAS composed with any parent transform, so
+        it is correct for oblique/registered series."""
+        try:
+            mask = self.get_segment_data()
+        except Exception:  # noqa: BLE001 - reading the segment may fail
+            mask = None
+        if mask is None or not np.asarray(mask).any():
+            return None
+        output_volume = self.get_output_volume_node()
+        if output_volume is None:
+            return None
+        idx = np.argwhere(np.asarray(mask) > 0)  # rows of (k, j, i)
+        k_lo, j_lo, i_lo = idx.min(axis=0)
+        k_hi, j_hi, i_hi = idx.max(axis=0)
+        ijk_to_ras = vtk.vtkMatrix4x4()
+        output_volume.GetIJKToRASMatrix(ijk_to_ras)
+        tnode = output_volume.GetParentTransformNode()
+        local_to_world = None
+        if tnode is not None:
+            local_to_world = vtk.vtkGeneralTransform()
+            slicer.vtkMRMLTransformNode.GetTransformBetweenNodes(
+                tnode, None, local_to_world)
+        xs, ys, zs = [], [], []
+        for i in (int(i_lo), int(i_hi)):
+            for j in (int(j_lo), int(j_hi)):
+                for k in (int(k_lo), int(k_hi)):
+                    ras = ijk_to_ras.MultiplyPoint(
+                        [float(i), float(j), float(k), 1.0])
+                    p = [ras[0], ras[1], ras[2]]
+                    if local_to_world is not None:
+                        p = list(local_to_world.TransformPoint(p))
+                    xs.append(p[0])
+                    ys.append(p[1])
+                    zs.append(p[2])
+        return [min(xs), max(xs), min(ys), max(ys), min(zs), max(zs)]
+
+    def _initialize_crop_roi_geometry(self, node):
+        """Place a freshly created crop ROI around the current segment's RAS
+        bounding box (so it defaults to framing the segment). Falls back to the
+        volume-center geometry when the segment is empty/unavailable."""
+        bounds = self._segment_ras_bounds()
+        if bounds is None:
+            self._initialize_selection_roi_geometry(node)
+            return
+        center = [0.5 * (bounds[0] + bounds[1]),
+                  0.5 * (bounds[2] + bounds[3]),
+                  0.5 * (bounds[4] + bounds[5])]
+        # 1.05x half-extent so the box starts just outside the segment rather
+        # than clipping its border voxels.
+        radius = [0.5 * 1.05 * max(1.0, bounds[1] - bounds[0]),
+                  0.5 * 1.05 * max(1.0, bounds[3] - bounds[2]),
+                  0.5 * 1.05 * max(1.0, bounds[5] - bounds[4])]
+        node.SetCenter(center)
+        node.SetRadiusXYZ(radius)
+
+    def _get_or_create_crop_roi(self):
+        """Ensure a vtkMRMLMarkupsROINode named "CropSegmentROI" exists with
+        interactive box handles, sized to the current segment. Independent from
+        the Selection Operations operand ROI. Returns the node."""
+        name = "CropSegmentROI"
+        node = self._crop_roi_node
+        if node is None or not slicer.mrmlScene.IsNodePresent(node):
+            existing = slicer.mrmlScene.GetFirstNodeByName(name)
+            if existing is not None and existing.IsA("vtkMRMLMarkupsROINode"):
+                node = existing
+            else:
+                node = slicer.mrmlScene.AddNewNodeByClass(
+                    "vtkMRMLMarkupsROINode")
+                node.SetName(name)
+                self._initialize_crop_roi_geometry(node)
+            node.CreateDefaultDisplayNodes()
+            display_node = node.GetDisplayNode()
+            if display_node is not None:
+                self._configure_selection_roi_display(display_node)
+            self._crop_roi_node = node
+        node.SetDisplayVisibility(True)
+        return node
+
+    def _destroy_crop_roi(self):
+        """Remove the crop ROI node from the scene."""
+        node = self._crop_roi_node
+        if node is not None and slicer.mrmlScene.IsNodePresent(node):
+            slicer.mrmlScene.RemoveNode(node)
+        self._crop_roi_node = None
 
     # -- ROI shape preview (sphere / ellipsoid visualization) --
 
@@ -6384,6 +6601,90 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """Remove the operation ROI."""
         self._destroy_selection_roi()
         self._refresh_apply_enabled()
+
+    def on_place_crop_roi_clicked(self, checked=False):
+        """Create or show the crop ROI, sized to the current segment."""
+        _seg_node, seg_id = self.get_selected_segmentation_node_and_segment_id()
+        if not seg_id:
+            slicer.util.showStatusMessage(
+                "Select a segment to crop first.", 3000)
+            return
+        self._get_or_create_crop_roi()
+        slicer.util.showStatusMessage(
+            "Rotate the 3D view and drag the box to frame the region to KEEP, "
+            "then click 'Crop Segment by Box'.", 6000)
+
+    def on_crop_segment_by_box_clicked(self, checked=False):
+        """Clear the current segment's voxels lying OUTSIDE the crop box (keep
+        the intersection of the segment AND the box). Local edit; undoable via
+        the Selection Operations Undo; synced to the server."""
+        if self._crop_roi_node is None or not slicer.mrmlScene.IsNodePresent(
+                self._crop_roi_node):
+            slicer.util.showStatusMessage(
+                "Place the crop box first (Place Crop ROI).", 4000)
+            return
+        _seg_node, seg_id = self.get_selected_segmentation_node_and_segment_id()
+        if not seg_id:
+            slicer.util.showStatusMessage(
+                "Select a segment to crop first.", 3000)
+            return
+        try:
+            # Current segment on the canonical output grid.
+            current = self.get_segment_data()
+            if current is None:
+                slicer.util.showStatusMessage(
+                    "Could not read the current segment; crop aborted.", 4000)
+                return
+            current = current.astype(np.uint8)
+            if current.sum() == 0:
+                slicer.util.showStatusMessage(
+                    "The current segment is empty; nothing to crop.", 3000)
+                return
+            # Box mask on the source grid, then bridge to the output grid (same
+            # path as apply_boolean_operation, so the shapes always match even
+            # under high-resolution output / tri-planar mode).
+            box_src = self.roi_node_to_mask(
+                self._crop_roi_node, shape_idx=ROI_SHAPE_BOX)
+            box_out = self._to_output_grid(box_src.astype(np.uint8))
+            if box_out is None:
+                self._disable_high_res_output(
+                    "High-resolution resample failed; reverted to the source "
+                    "grid.")
+                box_out = box_src.astype(np.uint8)
+            if tuple(box_out.shape) != tuple(current.shape):
+                slicer.util.showStatusMessage(
+                    "Crop box grid mismatch; crop aborted.", 4000)
+                return
+            cropped = (current.astype(bool) & box_out.astype(bool)).astype(
+                np.uint8)
+            if int(cropped.sum()) == int(current.sum()):
+                slicer.util.showStatusMessage(
+                    "The box already contains the whole segment; nothing "
+                    "removed.", 3000)
+                return
+            if int(cropped.sum()) == 0:
+                slicer.util.showStatusMessage(
+                    "The box does not overlap the segment; the segment was "
+                    "cleared (use Undo to revert).", 5000)
+            # Snapshot for our own Undo, write back, refresh 3D, sync.
+            self._record_selection_op_undo(seg_id, current.copy())
+            self.show_segmentation(cropped)
+            # setup_prompts rebuilds the hidden scribble editor (which resets
+            # slice backgrounds); it schedules a sticky per-plane reapply.
+            self.setup_prompts()
+            if not self.ui.cbKeepCropRoi.isChecked():
+                self._destroy_crop_roi()
+            sync_result = self.upload_segment_to_server()
+            if sync_result is None:
+                slicer.util.showStatusMessage(
+                    "Cropped locally, but syncing to the server failed (use "
+                    "'Sync to server').", 5000)
+            else:
+                slicer.util.showStatusMessage("Segment cropped to box.", 3000)
+        except Exception as exc:  # noqa: BLE001 - report and keep the UI alive
+            print("[DEBUG crop] crop failed: {}".format(exc))
+            slicer.util.showStatusMessage(
+                "Crop failed: {}".format(exc), 5000)
 
     def _on_roi_shape_changed(self, index):
         """Status-bar hint clarifying what each ROI shape means, plus preview refresh."""
