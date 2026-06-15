@@ -3004,6 +3004,21 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 return True
         return False
 
+    def _slice_view_screen_up(self, view_name):
+        """The clicked 2D slice view's on-screen up direction in world RAS
+        (its SliceToRAS column 1), or None when the view/slice is unavailable.
+        Used to roll the 3D camera so the 2D view's up appears up in 3D."""
+        layout_manager = slicer.app.layoutManager()
+        slice_widget = (
+            layout_manager.sliceWidget(view_name)
+            if layout_manager is not None else None)
+        slice_node = (
+            slice_widget.mrmlSliceNode() if slice_widget is not None else None)
+        if slice_node is None:
+            return None
+        m = slice_node.GetSliceToRAS()
+        return [m.GetElement(i, 1) for i in range(3)]
+
     def _view_world_plane(self, view_name):
         """World-RAS (normal, up_candidate) unit vectors for one view's plane,
         or None.
@@ -3046,8 +3061,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         view's normal on its preferred side (Red=above, Yellow=front, Green=left)
         so the camera never flips 180 deg between calls. The current focal point
         and distance are kept (pure reorientation); view-up is the clicked view's
-        column direction, re-orthogonalized against the new forward. No-op
-        without a 3D view/camera or valid plane geometry."""
+        2D screen-up (its SliceToRAS column 1) rolled about the view axis, so the
+        3D up matches what the 2D view shows, re-orthogonalized against the
+        forward. No-op without a 3D view/camera or valid plane geometry."""
         layout_manager = slicer.app.layoutManager()
         if layout_manager is None or layout_manager.threeDViewCount == 0:
             return
@@ -3104,14 +3120,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         cam_axis = target  # focal -> camera direction (camera sits on this side)
         forward = [-cam_axis[0], -cam_axis[1], -cam_axis[2]]
 
-        # View-up: clicked view's column direction, signed toward Superior
-        # (Anterior when near-axial), projected orthogonal to forward.
-        up = list(up_candidate)
-        if abs(up[2]) >= 0.1:
-            if up[2] < 0:
-                up = [-up[0], -up[1], -up[2]]
-        elif up[1] < 0:
-            up = [-up[0], -up[1], -up[2]]
+        # View-up: roll about the view axis so the clicked view's 2D screen-up
+        # (its SliceToRAS column 1) appears up in 3D. Read straight from the
+        # slice (natural sign = what is shown); no Superior correction. Projected
+        # orthogonal to forward below.
+        up = self._slice_view_screen_up(view_name) or list(up_candidate)
         proj = _dot(up, forward)
         up = _unit([up[i] - forward[i] * proj for i in range(3)])
         if up is None:  # column parallel to forward: pick any off-axis vector
