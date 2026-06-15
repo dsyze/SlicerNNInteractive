@@ -3019,6 +3019,32 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         m = slice_node.GetSliceToRAS()
         return [m.GetElement(i, 1) for i in range(3)]
 
+    def _slice_view_toward_viewer(self, view_name):
+        """The direction the clicked 2D slice view is looked at FROM, in world
+        RAS: its SliceToRAS screen-right (column 0) cross screen-up (column 1).
+        This equals +column2 for an un-flipped slice and -column2 for a
+        radiologically left-right-flipped one (e.g. the default Red axial), so
+        it always points to the real viewer side regardless of the matrix
+        handedness. None when the view/slice is unavailable or degenerate."""
+        layout_manager = slicer.app.layoutManager()
+        slice_widget = (
+            layout_manager.sliceWidget(view_name)
+            if layout_manager is not None else None)
+        slice_node = (
+            slice_widget.mrmlSliceNode() if slice_widget is not None else None)
+        if slice_node is None:
+            return None
+        m = slice_node.GetSliceToRAS()
+        right = [m.GetElement(i, 0) for i in range(3)]
+        up = [m.GetElement(i, 1) for i in range(3)]
+        toward = [right[1] * up[2] - right[2] * up[1],
+                  right[2] * up[0] - right[0] * up[2],
+                  right[0] * up[1] - right[1] * up[0]]
+        length = (toward[0] ** 2 + toward[1] ** 2 + toward[2] ** 2) ** 0.5
+        if length < 1e-9:
+            return None
+        return [toward[0] / length, toward[1] / length, toward[2] / length]
+
     def _view_world_plane(self, view_name):
         """World-RAS (normal, up_candidate) unit vectors for one view's plane,
         or None.
@@ -3119,6 +3145,16 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             target = [-target[0], -target[1], -target[2]]
         cam_axis = target  # focal -> camera direction (camera sits on this side)
         forward = [-cam_axis[0], -cam_axis[1], -cam_axis[2]]
+
+        # Front/back: put the camera on the side the 2D view is looked at from --
+        # its screen-right x screen-up (SliceToRAS col0 x col1). That is the true
+        # viewer side for every view, including the radiologically flipped Red
+        # axial (where col0 x col1 = -col2), so all three faces reproduce their
+        # 2D view's front/back (and left/right). Not the fixed preferred side.
+        toward_viewer = self._slice_view_toward_viewer(view_name)
+        if toward_viewer is not None and _dot(cam_axis, toward_viewer) < 0:
+            cam_axis = [-cam_axis[0], -cam_axis[1], -cam_axis[2]]
+            forward = [-cam_axis[0], -cam_axis[1], -cam_axis[2]]
 
         # View-up: roll about the view axis so the clicked view's 2D screen-up
         # (its SliceToRAS column 1) appears up in 3D. Read straight from the
