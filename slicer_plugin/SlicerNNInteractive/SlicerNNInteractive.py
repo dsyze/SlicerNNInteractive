@@ -3004,66 +3004,53 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 return True
         return False
 
-    def _rotate_camera_to_view(self, view_name):
-        """Rotate the 3D camera to face the series shown in `view_name`.
+    def _view_world_plane(self, view_name):
+        """World-RAS (normal, up_candidate) unit vectors for one view's plane,
+        or None.
 
-        View direction is the series' slice-plane normal (oblique-aware); the
-        focal point is the locator plane center and the distance fits the plane.
-        The normal's sign is chosen so the camera sits on the conventional side
-        (Red=above, Yellow=front, Green=left). No-op without a 3D view, series,
-        or valid geometry."""
+        Prefers the series' acquisition frame (k = plane normal, j = image
+        column / view-up) when oblique alignment is on and the series is oblique
+        in world space; otherwise reads the 2D slice plane (SliceToRAS n/v).
+        Shared by the camera 'face view' logic so every view's normal comes from
+        the same source."""
         layout_manager = slicer.app.layoutManager()
-        if layout_manager is None or layout_manager.threeDViewCount == 0:
-            return
-        slice_widget = layout_manager.sliceWidget(view_name)
+        slice_widget = (
+            layout_manager.sliceWidget(view_name)
+            if layout_manager is not None else None)
         slice_node = (
             slice_widget.mrmlSliceNode() if slice_widget is not None else None)
-        if slice_node is None:
-            return
         volume = self._view_background_volume(view_name)
-
-        # Preferred source: the series' true acquisition frame (its direction
-        # matrix composed with any registration transform), so an obliquely
-        # acquired or obliquely registered series is faced squarely. Fall back
-        # to the 2D slice plane when the feature is off, the volume is missing,
-        # the frame is not oblique in world space, or the frame is degenerate.
-        center = n = up = hu = hv = None
         if (self._get_oblique_camera_align()
                 and volume is not None
                 and self._has_oblique_world_frame(volume)):
             frame = self._volume_acquisition_frame(volume)
             if frame is not None:
-                center, i_axis, j_axis, k_axis = frame
-                n = list(k_axis)   # slice-stacking direction = view normal
-                up = list(j_axis)  # image column direction = view up
-                bounds = [0.0] * 6  # world AABB (parent transform applied).
-                volume.GetRASBounds(bounds)
-                ext = [bounds[1] - bounds[0], bounds[3] - bounds[2],
-                       bounds[5] - bounds[4]]
-                hu = 0.5 * sum(abs(i_axis[a]) * ext[a] for a in range(3))
-                hv = 0.5 * sum(abs(j_axis[a]) * ext[a] for a in range(3))
+                _center, _i_axis, j_axis, k_axis = frame
+                return list(k_axis), list(j_axis)
+        if slice_node is None:
+            return None
+        geometry = self._slice_frame_geometry(slice_node, volume)
+        if geometry is None:
+            return None
+        _center, _u, v, n, _hu, _hv = geometry
+        return list(n), list(v)
 
-        if center is None:
-            geometry = self._slice_frame_geometry(slice_node, volume)
-            if geometry is None:
-                return
-            center, _u, v, n, hu, hv = geometry
-            up = list(v)
+    def _rotate_camera_to_view(self, view_name):
+        """Orthographically 'face' the plane of `view_name` along the line where
+        the OTHER two views' planes intersect.
 
-        # Oblique-aware direction; flip so the camera is on the expected side.
-        pref = TRIPLANAR_CAMERA_PREFERRED_SIDE.get(view_name, (0.0, 0.0, 1.0))
-        if (n[0] * pref[0] + n[1] * pref[1] + n[2] * pref[2]) < 0:
-            n = [-n[0], -n[1], -n[2]]
-
-        # View-up signed toward Superior (toward Anterior when the plane is
-        # near-axial so "up" is not ambiguous).
-        d_sup = up[2]
-        if abs(d_sup) >= 0.1:
-            if d_sup < 0:
-                up = [-up[0], -up[1], -up[2]]
-        elif up[1] < 0:
-            up = [-up[0], -up[1], -up[2]]
-
+        Forward = normalize(cross(normal_of_other_a, normal_of_other_b)) -- e.g.
+        facing Red looks along cross(Yellow_normal, Green_normal). For mutually
+        orthogonal planes this equals the clicked view's own normal; it differs
+        only for oblique / multi-series planes. The sign is fixed by the clicked
+        view's normal on its preferred side (Red=above, Yellow=front, Green=left)
+        so the camera never flips 180 deg between calls. The current focal point
+        and distance are kept (pure reorientation); view-up is the clicked view's
+        column direction, re-orthogonalized against the new forward. No-op
+        without a 3D view/camera or valid plane geometry."""
+        layout_manager = slicer.app.layoutManager()
+        if layout_manager is None or layout_manager.threeDViewCount == 0:
+            return
         view_node = layout_manager.threeDWidget(0).mrmlViewNode()
         try:
             cameras_logic = slicer.modules.cameras.logic()
@@ -3072,15 +3059,79 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             camera_node = None
         if camera_node is None:
             return
+        camera = camera_node.GetCamera()
 
-        angle = camera_node.GetCamera().GetViewAngle()
-        half_angle = math.radians(angle) / 2.0
-        tan_half = math.tan(half_angle)
-        dist = (1.3 * max(hu, hv) / tan_half) if tan_half > 1e-6 else (
-            3.0 * max(hu, hv))
-        pos = [center[i] + n[i] * dist for i in range(3)]
+        def _dot(a, b):
+            return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 
-        camera_node.SetFocalPoint(center[0], center[1], center[2])
+        def _cross(a, b):
+            return [a[1] * b[2] - a[2] * b[1],
+                    a[2] * b[0] - a[0] * b[2],
+                    a[0] * b[1] - a[1] * b[0]]
+
+        def _unit(a):
+            length = _dot(a, a) ** 0.5
+            if length < 1e-9:
+                return None
+            return [a[0] / length, a[1] / length, a[2] / length]
+
+        own = self._view_world_plane(view_name)
+        if own is None:
+            return
+        own_normal, up_candidate = own
+
+        others = [v for v in ("Red", "Yellow", "Green") if v != view_name]
+        plane_a = self._view_world_plane(others[0])
+        plane_b = self._view_world_plane(others[1])
+        target = None
+        if plane_a is not None and plane_b is not None:
+            crossed = _cross(plane_a[0], plane_b[0])
+            if _dot(crossed, crossed) ** 0.5 >= 1e-3:  # the two planes diverge
+                target = _unit(crossed)
+        if target is None:  # single/parallel series -> face the clicked plane
+            target = _unit(own_normal)
+            if target is None:
+                return
+
+        # Sign: align to the clicked view's normal on its conventional side so
+        # the result is deterministic (no 180 deg flip between invocations).
+        pref = TRIPLANAR_CAMERA_PREFERRED_SIDE.get(view_name, (0.0, 0.0, 1.0))
+        on = _unit(own_normal) or [0.0, 0.0, 1.0]
+        if _dot(on, pref) < 0:
+            on = [-on[0], -on[1], -on[2]]
+        if _dot(target, on) < 0:
+            target = [-target[0], -target[1], -target[2]]
+        cam_axis = target  # focal -> camera direction (camera sits on this side)
+        forward = [-cam_axis[0], -cam_axis[1], -cam_axis[2]]
+
+        # View-up: clicked view's column direction, signed toward Superior
+        # (Anterior when near-axial), projected orthogonal to forward.
+        up = list(up_candidate)
+        if abs(up[2]) >= 0.1:
+            if up[2] < 0:
+                up = [-up[0], -up[1], -up[2]]
+        elif up[1] < 0:
+            up = [-up[0], -up[1], -up[2]]
+        proj = _dot(up, forward)
+        up = _unit([up[i] - forward[i] * proj for i in range(3)])
+        if up is None:  # column parallel to forward: pick any off-axis vector
+            fallback = ([0.0, 0.0, 1.0] if abs(forward[2]) < 0.9
+                        else [0.0, 1.0, 0.0])
+            proj = _dot(fallback, forward)
+            up = _unit([fallback[i] - forward[i] * proj for i in range(3)])
+        if up is None:
+            return
+        # Gram-Schmidt so the basis stays orthonormal (no roll/shear).
+        right = _cross(forward, up)
+        up = _unit(_cross(right, forward)) or up
+
+        focal = list(camera.GetFocalPoint())
+        distance = camera.GetDistance()
+        if distance <= 1e-6:  # degenerate camera: fall back to a safe distance
+            distance = 300.0
+        pos = [focal[i] + cam_axis[i] * distance for i in range(3)]
+
+        camera_node.SetFocalPoint(focal[0], focal[1], focal[2])
         camera_node.SetPosition(pos[0], pos[1], pos[2])
         camera_node.SetViewUp(up[0], up[1], up[2])
         try:
