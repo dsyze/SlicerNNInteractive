@@ -132,6 +132,9 @@ FUSE3_ROI_MARGIN_MM = 5.0
 # Hidden linear transform that aligns a supplemental series to the source volume
 # when their DICOM frames of reference differ (auto-registration).
 SERIES_ALIGNMENT_TRANSFORM_NODE_NAME = "NNInteractiveSeriesAlignment (do not touch)"
+# Closed-curve markup the user draws in the 3D view for "Draw Crop Region".
+# A visible markup (not a hidden scaffold node), like "CropSegmentROI".
+CROP_REGION_CURVE_NODE_NAME = "CropRegionCurve"
 # A registered translation larger than this (mm) is flagged for visual review.
 REGISTRATION_OFFSET_WARN_MM = 30.0
 # Below these magnitudes a registration result is treated as identity (series
@@ -289,6 +292,20 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Dedicated ROI for the "Crop Segment by Box" tool (independent of the
         # Selection Operations operand ROI above).
         self._crop_roi_node = None
+        # "Draw Crop Region": a dedicated closed curve drawn in the 3D view and
+        # extruded along the (frozen-at-finish) camera view direction to crop
+        # the current segment by a pure geometric boolean. Independent of the
+        # lasso prompt node so the two never clobber each other.
+        self._crop_region_curve_node = None
+        # Manual AddObserver tag on the curve node (NOT covered by
+        # removeObservers(); torn down explicitly in cleanup()).
+        self._crop_region_curve_observer_tag = None
+        # Manual observer tag on the interaction node, used to detect when the
+        # user finishes drawing (double-click/right-click returns to view mode).
+        self._crop_region_interaction_observer_tag = None
+        # Frozen camera basis dict {forward,right,up,cam_pos,parallel} captured
+        # the moment drawing finishes; None until a valid (>=3 point) loop.
+        self._crop_region_camera_basis = None
         # Sphere/ellipsoid visualization for the operation ROI.
         self._sel_op_roi_preview_node = None
         self._sel_op_roi_preview_transform_node = None
@@ -4033,6 +4050,18 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.pbPlaceCropRoi.clicked.connect(self.on_place_crop_roi_clicked)
         self.ui.pbCropSegmentByBox.clicked.connect(
             self.on_crop_segment_by_box_clicked)
+        # Draw Crop Region (closed curve drawn in the 3D view, extruded along
+        # the view direction to crop the current segment by a pure boolean).
+        self.ui.pbDrawCropRegion.clicked.connect(
+            self.on_draw_crop_region_clicked)
+        self.ui.pbCancelDrawingCrop.clicked.connect(
+            self.on_cancel_drawing_crop_clicked)
+        self.ui.pbCropInsideRegion.clicked.connect(
+            self.on_crop_inside_region_clicked)
+        self.ui.pbCropOutsideRegion.clicked.connect(
+            self.on_crop_outside_region_clicked)
+        self.ui.pbCancelDrawingCrop.setVisible(False)
+        self._set_crop_region_buttons_enabled(False)
         self.ui.pbPlaceWandSeed.clicked.connect(self.on_place_wand_seed_clicked)
         self.ui.pbClearWandSeed.clicked.connect(self.on_clear_wand_seed_clicked)
         self.ui.pbPreviewWand.clicked.connect(self.on_preview_wand_clicked)
@@ -4239,6 +4268,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # segmentation would otherwise survive a module close/Reload.
         self._destroy_selection_roi()
         self._destroy_crop_roi()
+        # Draw Crop Region: remove the curve node (+ its manual observer) and
+        # the interaction-node mode observer used to auto-finish drawing.
+        self._remove_crop_region_interaction_observer()
+        self._destroy_crop_region_curve()
         self._destroy_wand_seed()
         self._destroy_wand_preview_segmentation()
         self._destroy_inference_preview()
@@ -6783,6 +6816,528 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 slicer.util.showStatusMessage("Segment cropped to box.", 3000)
         except Exception as exc:  # noqa: BLE001 - report and keep the UI alive
             print("[DEBUG crop] crop failed: {}".format(exc))
+            slicer.util.showStatusMessage(
+                "Crop failed: {}".format(exc), 5000)
+
+    # -- Draw Crop Region (closed curve in the 3D view) -----------------------
+
+    def _set_crop_region_buttons_enabled(self, enabled):
+        """Enable/disable the Crop Inside and Crop Outside buttons together."""
+        try:
+            self.ui.pbCropInsideRegion.setEnabled(bool(enabled))
+            self.ui.pbCropOutsideRegion.setEnabled(bool(enabled))
+        except Exception:  # noqa: BLE001 - UI may not be built yet
+            pass
+
+    def _configure_crop_region_curve_display(self, display_node):
+        """Bright-yellow loop with a translucent fill, shown in the 3D view
+        only. Setters are guarded because the markups display API varies across
+        Slicer versions."""
+        if display_node is None:
+            return
+        color = (1.0, 0.95, 0.1)
+
+        def _try(call):
+            try:
+                call()
+            except Exception:  # noqa: BLE001 - tolerate display API differences
+                pass
+
+        _try(lambda: display_node.SetColor(*color))
+        _try(lambda: display_node.SetSelectedColor(*color))
+        _try(lambda: display_node.SetActiveColor(*color))
+        _try(lambda: display_node.SetFillVisibility(True))
+        _try(lambda: display_node.SetFillOpacity(0.30))
+        _try(lambda: display_node.SetOutlineOpacity(0.9))
+        _try(lambda: display_node.SetLineThickness(0.4))
+        _try(lambda: display_node.SetTextScale(0.0))
+        _try(lambda: display_node.SetGlyphScale(1.5))
+        _try(lambda: display_node.SetHandlesInteractive(False))
+        _try(lambda: display_node.SetVisibility2D(False))
+        # Restrict to the first 3D view so the loop is only drawn/shown there.
+        try:
+            lm = slicer.app.layoutManager()
+            if lm is not None and lm.threeDViewCount > 0:
+                view_node = lm.threeDWidget(0).mrmlViewNode()
+                if view_node is not None:
+                    display_node.SetViewNodeIDs([view_node.GetID()])
+        except Exception:  # noqa: BLE001 - view restriction is best-effort
+            pass
+
+    def _get_or_create_crop_region_curve(self):
+        """Ensure the dedicated closed-curve markup for Draw Crop Region exists,
+        is configured for the 3D view, and carries its point observer. Mirrors
+        _get_or_create_crop_roi. Returns the node, or None on failure."""
+        node = self._crop_region_curve_node
+        if node is None or not slicer.mrmlScene.IsNodePresent(node):
+            existing = slicer.mrmlScene.GetFirstNodeByName(
+                CROP_REGION_CURVE_NODE_NAME)
+            if existing is not None and existing.IsA(
+                    "vtkMRMLMarkupsClosedCurveNode"):
+                node = existing
+            else:
+                node = slicer.mrmlScene.AddNewNodeByClass(
+                    "vtkMRMLMarkupsClosedCurveNode",
+                    CROP_REGION_CURVE_NODE_NAME)
+            if node is None:
+                return None
+            node.CreateDefaultDisplayNodes()
+            self._configure_crop_region_curve_display(node.GetDisplayNode())
+            self._crop_region_curve_node = node
+            # Manual observer (NOT covered by removeObservers()): keep the Cancel
+            # button visibility in sync as points are placed.
+            if self._crop_region_curve_observer_tag is None:
+                self._crop_region_curve_observer_tag = node.AddObserver(
+                    slicer.vtkMRMLMarkupsNode.PointModifiedEvent,
+                    self.on_crop_region_point_modified)
+        node.SetDisplayVisibility(True)
+        return node
+
+    def _destroy_crop_region_curve(self):
+        """Remove the crop-region curve node and its manual observer, and clear
+        the frozen camera basis. Safe to call repeatedly."""
+        node = self._crop_region_curve_node
+        if node is not None:
+            if (self._crop_region_curve_observer_tag is not None
+                    and slicer.mrmlScene.IsNodePresent(node)):
+                try:
+                    node.RemoveObserver(self._crop_region_curve_observer_tag)
+                except Exception:  # noqa: BLE001
+                    pass
+            if slicer.mrmlScene.IsNodePresent(node):
+                slicer.mrmlScene.RemoveNode(node)
+        self._crop_region_curve_node = None
+        self._crop_region_curve_observer_tag = None
+        self._crop_region_camera_basis = None
+
+    def _remove_crop_region_interaction_observer(self):
+        """Detach the interaction-node mode observer used to auto-detect when
+        the user finishes drawing (double-click/right-click)."""
+        tag = self._crop_region_interaction_observer_tag
+        if tag is not None:
+            try:
+                interaction_node = (
+                    slicer.app.applicationLogic().GetInteractionNode())
+                if interaction_node is not None:
+                    interaction_node.RemoveObserver(tag)
+            except Exception:  # noqa: BLE001
+                pass
+        self._crop_region_interaction_observer_tag = None
+
+    def on_draw_crop_region_clicked(self, checked=False):
+        """Enter/leave Draw Crop Region mode. While drawing, the user places
+        closed-curve control points in the 3D view; double-click/right-click
+        closes the loop. The extrusion direction is frozen when drawing ends."""
+        interaction_node = slicer.app.applicationLogic().GetInteractionNode()
+        if checked:
+            lm = slicer.app.layoutManager()
+            if lm is None or lm.threeDViewCount == 0:
+                slicer.util.showStatusMessage(
+                    "Draw Crop Region needs a layout with a 3D view.", 4000)
+                self.ui.pbDrawCropRegion.setChecked(False)
+                return
+            if self.get_volume_node() is None:
+                slicer.util.showStatusMessage(
+                    "Load a volume before drawing a crop region.", 4000)
+                self.ui.pbDrawCropRegion.setChecked(False)
+                return
+            # Do not let other placement tools compete for the clicks.
+            try:
+                self.ui.pbInteractionScribble.setChecked(False)
+            except Exception:  # noqa: BLE001
+                pass
+            node = self._get_or_create_crop_region_curve()
+            if node is None:
+                slicer.util.showStatusMessage(
+                    "Could not create the crop-region curve.", 4000)
+                self.ui.pbDrawCropRegion.setChecked(False)
+                return
+            # Fresh loop: drop previous points / frozen basis / button state.
+            node.RemoveAllControlPoints()
+            self._crop_region_camera_basis = None
+            self._set_crop_region_buttons_enabled(False)
+            self.ui.pbCancelDrawingCrop.setVisible(False)
+            # Auto-finish when the loop is closed (mode returns to view mode).
+            if self._crop_region_interaction_observer_tag is None:
+                self._crop_region_interaction_observer_tag = (
+                    interaction_node.AddObserver(
+                        interaction_node.InteractionModeChangedEvent,
+                        self._on_crop_region_interaction_mode_changed))
+            selection_node = slicer.app.applicationLogic().GetSelectionNode()
+            selection_node.SetReferenceActivePlaceNodeClassName(
+                "vtkMRMLMarkupsClosedCurveNode")
+            selection_node.SetActivePlaceNodeID(node.GetID())
+            interaction_node.SetPlaceModePersistence(1)
+            interaction_node.SetCurrentInteractionMode(interaction_node.Place)
+            slicer.util.showStatusMessage(
+                "Left-click in the 3D view to place crop-region points; "
+                "double-click or right-click to close the loop (or click "
+                "'Draw Crop Region' again to finish).", 6000)
+        else:
+            self._remove_crop_region_interaction_observer()
+            try:
+                interaction_node.SetCurrentInteractionMode(
+                    interaction_node.ViewTransform)
+            except Exception:  # noqa: BLE001
+                pass
+            self._finalize_crop_region_drawing()
+
+    def on_cancel_drawing_crop_clicked(self, checked=False):
+        """Discard the loop being drawn and leave drawing mode."""
+        self._exit_crop_region_drawing()
+        slicer.util.showStatusMessage("Crop region drawing cancelled.", 2000)
+
+    def on_crop_region_point_modified(self, caller, event):
+        """Show the Cancel button once points exist. The camera basis is NOT
+        frozen here -- only when drawing ends (_finalize_crop_region_drawing)."""
+        try:
+            n = caller.GetNumberOfControlPoints()
+        except Exception:  # noqa: BLE001
+            return
+        try:
+            self.ui.pbCancelDrawingCrop.setVisible(n > 0)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_crop_region_interaction_mode_changed(self, caller, event):
+        """Auto-finish drawing when the user closes the loop (double-click /
+        right-click) and the interaction mode returns from Place to view
+        transform. The button is unchecked without re-entering the handler."""
+        try:
+            if caller.GetCurrentInteractionMode() == caller.Place:
+                return  # still placing points
+        except Exception:  # noqa: BLE001
+            return
+        if not self.ui.pbDrawCropRegion.isChecked():
+            return  # not our drawing session
+        blocked = self.ui.pbDrawCropRegion.blockSignals(True)
+        self.ui.pbDrawCropRegion.setChecked(False)
+        self.ui.pbDrawCropRegion.blockSignals(blocked)
+        self._remove_crop_region_interaction_observer()
+        self._finalize_crop_region_drawing()
+
+    def _finalize_crop_region_drawing(self):
+        """Called when drawing ends. If the loop has at least 3 points, freeze
+        the current 3D camera basis (the extrusion direction) and enable the
+        Crop buttons. Idempotent."""
+        node = self._crop_region_curve_node
+        n = node.GetNumberOfControlPoints() if node is not None else 0
+        if n < 3:
+            self._crop_region_camera_basis = None
+            self._set_crop_region_buttons_enabled(False)
+            if n > 0:
+                slicer.util.showStatusMessage(
+                    "A crop region needs at least 3 points.", 4000)
+            return
+        basis = self._capture_3d_camera_basis()
+        if basis is None:
+            self._crop_region_camera_basis = None
+            self._set_crop_region_buttons_enabled(False)
+            slicer.util.showStatusMessage(
+                "No 3D view/camera available; cannot crop.", 4000)
+            return
+        self._crop_region_camera_basis = basis
+        self._set_crop_region_buttons_enabled(True)
+        slicer.util.showStatusMessage(
+            "Crop region ready. Click Crop Inside or Crop Outside.", 4000)
+
+    def _exit_crop_region_drawing(self):
+        """Leave drawing mode and clear the drawn loop (after a crop or on a
+        cancel/reset). Resets buttons and the frozen basis."""
+        self._remove_crop_region_interaction_observer()
+        try:
+            interaction_node = (
+                slicer.app.applicationLogic().GetInteractionNode())
+            if interaction_node is not None:
+                interaction_node.SetCurrentInteractionMode(
+                    interaction_node.ViewTransform)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            blocked = self.ui.pbDrawCropRegion.blockSignals(True)
+            self.ui.pbDrawCropRegion.setChecked(False)
+            self.ui.pbDrawCropRegion.blockSignals(blocked)
+        except Exception:  # noqa: BLE001
+            pass
+        self._destroy_crop_region_curve()
+        self._set_crop_region_buttons_enabled(False)
+        try:
+            self.ui.pbCancelDrawingCrop.setVisible(False)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _capture_3d_camera_basis(self):
+        """Snapshot an orthonormal screen basis from the first 3D view's camera.
+        Returns a dict {forward, right, up, cam_pos, parallel} or None. forward
+        is the extrusion direction; right/up span the screen plane."""
+        lm = slicer.app.layoutManager()
+        if lm is None or lm.threeDViewCount == 0:
+            return None
+        view_node = lm.threeDWidget(0).mrmlViewNode()
+        try:
+            camera_node = slicer.modules.cameras.logic(
+                ).GetViewActiveCameraNode(view_node)
+        except Exception:  # noqa: BLE001 - cameras module/camera not available
+            camera_node = None
+        if camera_node is None:
+            return None
+        camera = camera_node.GetCamera()
+        forward = np.array(camera.GetDirectionOfProjection(), dtype=float)
+        up_in = np.array(camera.GetViewUp(), dtype=float)
+        cam_pos = np.array(camera.GetPosition(), dtype=float)
+        nf = np.linalg.norm(forward)
+        if nf < 1e-9:
+            return None
+        forward = forward / nf
+        right = np.cross(forward, up_in)
+        nr = np.linalg.norm(right)
+        if nr < 1e-9:  # up parallel to forward: pick an off-axis fallback
+            fb = (np.array([0.0, 0.0, 1.0]) if abs(forward[2]) < 0.9
+                  else np.array([0.0, 1.0, 0.0]))
+            right = np.cross(forward, fb)
+            nr = np.linalg.norm(right)
+            if nr < 1e-9:
+                return None
+        right = right / nr
+        up = np.cross(right, forward)  # orthonormal by construction
+        try:
+            parallel = bool(camera.GetParallelProjection())
+        except Exception:  # noqa: BLE001
+            parallel = True
+        return {"forward": forward, "right": right, "up": up,
+                "cam_pos": cam_pos, "parallel": parallel}
+
+    def _output_ijk_to_world_matrix(self):
+        """Return (A, linear). A is a numpy 4x4 mapping output-grid IJK
+        homogeneous coords (i, j, k, 1) to world RAS. When the output volume's
+        parent transform is linear it is folded into A (linear=True, fully
+        vectorizable). When non-linear, A holds only IJKToRAS (linear=False) and
+        the caller applies the parent transform per point."""
+        output_volume = self.get_output_volume_node()
+        if output_volume is None:
+            return None, True
+        ijk_to_ras = vtk.vtkMatrix4x4()
+        output_volume.GetIJKToRASMatrix(ijk_to_ras)
+        a = np.array([[ijk_to_ras.GetElement(r, c) for c in range(4)]
+                      for r in range(4)], dtype=float)
+        tnode = output_volume.GetParentTransformNode()
+        if tnode is None:
+            return a, True
+        try:
+            if tnode.IsTransformToWorldLinear():
+                m = vtk.vtkMatrix4x4()
+                tnode.GetMatrixTransformToWorld(m)
+                t = np.array([[m.GetElement(r, c) for c in range(4)]
+                              for r in range(4)], dtype=float)
+                return (t @ a), True
+        except Exception:  # noqa: BLE001 - fall back to per-point below
+            pass
+        return a, False
+
+    def _world_apply_parent_transform(self, pts_nx3):
+        """Apply the output volume's non-linear parent transform (node RAS ->
+        world) to an (N, 3) array, point by point. Only used for non-linear
+        parents; linear parents are folded into the IJK->world matrix."""
+        output_volume = self.get_output_volume_node()
+        if output_volume is None:
+            return pts_nx3
+        tnode = output_volume.GetParentTransformNode()
+        if tnode is None:
+            return pts_nx3
+        general = vtk.vtkGeneralTransform()
+        slicer.vtkMRMLTransformNode.GetTransformBetweenNodes(
+            tnode, None, general)
+        out = np.empty_like(pts_nx3)
+        for r in range(pts_nx3.shape[0]):
+            out[r] = general.TransformPoint(
+                [float(pts_nx3[r, 0]), float(pts_nx3[r, 1]),
+                 float(pts_nx3[r, 2])])
+        return out
+
+    def _project_to_screen(self, pts_nx3, basis):
+        """Project world points to 2D screen coords (u, v) using the frozen
+        camera basis. Parallel projection drops the view-direction component;
+        perspective divides by depth. Curve points and voxel centers must use
+        the same formula so the point-in-polygon test is consistent."""
+        pts = np.asarray(pts_nx3, dtype=float)
+        right = basis["right"]
+        up = basis["up"]
+        if basis.get("parallel", True):
+            return pts @ right, pts @ up
+        fwd = basis["forward"]
+        d = pts - basis["cam_pos"]
+        depth = d @ fwd
+        depth = np.where(np.abs(depth) < 1e-9, 1e-9, depth)
+        return (d @ right) / depth, (d @ up) / depth
+
+    def _points_in_polygon(self, px, py, vx, vy):
+        """Vectorized even-odd ray-casting point-in-polygon test. px, py are
+        (N,) test points; vx, vy are (M,) polygon vertices (implicitly closed).
+        Returns a bool (N,) array. Loops over the M edges; each edge step is
+        vectorized over all N points."""
+        px = np.asarray(px, dtype=float)
+        py = np.asarray(py, dtype=float)
+        vx = np.asarray(vx, dtype=float)
+        vy = np.asarray(vy, dtype=float)
+        inside = np.zeros(px.shape[0], dtype=bool)
+        m = vx.shape[0]
+        j = m - 1
+        for i in range(m):
+            yi = vy[i]
+            yj = vy[j]
+            cond = (yi > py) != (yj > py)
+            denom = yj - yi
+            if denom == 0.0:
+                denom = 1e-12
+            xint = (vx[j] - vx[i]) * (py - yi) / denom + vx[i]
+            inside ^= cond & (px < xint)
+            j = i
+        return inside
+
+    def _crop_region_to_mask(self, current_mask_bool):
+        """Build a bool mask (output grid, z, y, x): True where a foreground
+        voxel of current_mask_bool projects INSIDE the crop-region loop, using
+        the frozen camera basis. Only foreground voxels are tested (an infinite
+        prism along the view direction == inside the 2D screen polygon).
+        Returns None when the loop is unusable (<3 points / no basis)."""
+        basis = self._crop_region_camera_basis
+        node = self._crop_region_curve_node
+        if basis is None or node is None:
+            return None
+        if not slicer.mrmlScene.IsNodePresent(node):
+            return None
+        from vtk.util.numpy_support import vtk_to_numpy
+        vtk_pts = node.GetCurvePointsWorld()
+        if vtk_pts is None:
+            return None
+        poly_world = np.asarray(vtk_to_numpy(vtk_pts.GetData()), dtype=float)
+        if poly_world.ndim != 2 or poly_world.shape[0] < 3:
+            return None
+        # Cap the polygon vertex count: GetCurvePointsWorld can be very dense and
+        # the point-in-polygon loop is O(edges). Subsampling preserves the loop
+        # order (closed curve) and the silhouette.
+        max_poly_points = 1000
+        if poly_world.shape[0] > max_poly_points:
+            stride = int(np.ceil(poly_world.shape[0] / float(max_poly_points)))
+            poly_world = poly_world[::stride]
+        current_mask_bool = np.asarray(current_mask_bool, dtype=bool)
+        region = np.zeros(current_mask_bool.shape, dtype=bool)
+        idx = np.argwhere(current_mask_bool)  # rows (k, j, i) = (z, y, x)
+        if idx.shape[0] == 0:
+            return region
+        a, linear = self._output_ijk_to_world_matrix()
+        if a is None:
+            return None
+        # Voxel centers as homogeneous (i, j, k, 1); numpy axes are (z, y, x).
+        n = idx.shape[0]
+        ijk1 = np.empty((n, 4), dtype=float)
+        ijk1[:, 0] = idx[:, 2]  # i (x)
+        ijk1[:, 1] = idx[:, 1]  # j (y)
+        ijk1[:, 2] = idx[:, 0]  # k (z)
+        ijk1[:, 3] = 1.0
+        world = (ijk1 @ a.T)[:, :3]
+        if not linear:
+            world = self._world_apply_parent_transform(world)
+        poly_u, poly_v = self._project_to_screen(poly_world, basis)
+        vox_u, vox_v = self._project_to_screen(world, basis)
+        # Cheap screen-space bounding-box pre-filter: voxels outside the loop's
+        # 2D bbox are definitely outside the polygon, so only run the (heavier)
+        # point-in-polygon test on the candidates inside the bbox.
+        u_lo, u_hi = float(poly_u.min()), float(poly_u.max())
+        v_lo, v_hi = float(poly_v.min()), float(poly_v.max())
+        in_bbox = ((vox_u >= u_lo) & (vox_u <= u_hi)
+                   & (vox_v >= v_lo) & (vox_v <= v_hi))
+        inside = np.zeros(vox_u.shape[0], dtype=bool)
+        cand = np.where(in_bbox)[0]
+        if cand.size > 0:
+            inside[cand] = self._points_in_polygon(
+                vox_u[cand], vox_v[cand], poly_u, poly_v)
+        region[idx[:, 0], idx[:, 1], idx[:, 2]] = inside
+        return region
+
+    def on_crop_inside_region_clicked(self, checked=False):
+        """Crop: keep only the current segment voxels inside the drawn loop."""
+        self._apply_crop_region(keep_inside=True)
+
+    def on_crop_outside_region_clicked(self, checked=False):
+        """Crop: keep only the current segment voxels outside the drawn loop."""
+        self._apply_crop_region(keep_inside=False)
+
+    def _apply_crop_region(self, keep_inside):
+        """Crop the current segment to the inside (keep_inside=True) or outside
+        (False) of the drawn loop extruded along the frozen view direction.
+        Mirrors on_crop_segment_by_box_clicked: output-grid boolean, private
+        undo, write back, refresh, server sync."""
+        node = self._crop_region_curve_node
+        n = node.GetNumberOfControlPoints() if node is not None else 0
+        if (node is None or not slicer.mrmlScene.IsNodePresent(node) or n < 3
+                or self._crop_region_camera_basis is None):
+            slicer.util.showStatusMessage(
+                "Draw a crop region first (at least 3 points), then finish "
+                "drawing.", 4000)
+            return
+        _seg_node, seg_id = self.get_selected_segmentation_node_and_segment_id()
+        if not seg_id:
+            slicer.util.showStatusMessage(
+                "Select a segment to crop first.", 3000)
+            return
+        try:
+            current = self.get_segment_data()
+            if current is None:
+                slicer.util.showStatusMessage(
+                    "Could not read the current segment; crop aborted.", 4000)
+                return
+            current = current.astype(np.uint8)
+            if current.sum() == 0:
+                slicer.util.showStatusMessage(
+                    "The current segment is empty; nothing to crop.", 3000)
+                return
+            region = self._crop_region_to_mask(current.astype(bool))
+            if region is None:
+                slicer.util.showStatusMessage(
+                    "Crop region needs at least 3 points.", 4000)
+                return
+            if tuple(region.shape) != tuple(current.shape):
+                slicer.util.showStatusMessage(
+                    "Crop region grid mismatch; crop aborted.", 4000)
+                return
+            cur_bool = current.astype(bool)
+            overlap = cur_bool & region
+            if not overlap.any():
+                # Inside would clear everything; Outside would change nothing.
+                slicer.util.showStatusMessage(
+                    "The crop region does not cover any voxels; operation "
+                    "cancelled.", 5000)
+                return
+            if keep_inside:
+                cropped = cur_bool & region
+            else:
+                cropped = cur_bool & ~region
+            cropped = cropped.astype(np.uint8)
+            if int(cropped.sum()) == int(current.sum()):
+                slicer.util.showStatusMessage(
+                    "The crop region does not change the segment; nothing "
+                    "removed.", 3000)
+                return
+            # Snapshot for our own Undo, write back, refresh 3D, sync.
+            self._record_selection_op_undo(seg_id, current.copy())
+            self.show_segmentation(cropped)
+            # setup_prompts rebuilds the hidden scribble editor (which resets
+            # slice backgrounds); it schedules a sticky per-plane reapply.
+            self.setup_prompts()
+            # Auto-exit drawing mode after a successful crop (per spec).
+            self._exit_crop_region_drawing()
+            sync_result = self.upload_segment_to_server()
+            if sync_result is None:
+                slicer.util.showStatusMessage(
+                    "Cropped locally, but syncing to the server failed (use "
+                    "'Sync to server').", 5000)
+            else:
+                mode_text = "inside" if keep_inside else "outside"
+                slicer.util.showStatusMessage(
+                    "Segment cropped ({}).".format(mode_text), 3000)
+        except Exception as exc:  # noqa: BLE001 - report and keep the UI alive
+            print("[DEBUG crop_region] crop failed: {}".format(exc))
             slicer.util.showStatusMessage(
                 "Crop failed: {}".format(exc), 5000)
 

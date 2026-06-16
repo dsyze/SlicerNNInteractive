@@ -832,6 +832,100 @@
               </property>
              </widget>
             </item>
+            <item>
+             <widget class="QLabel" name="lblCropRegionHint">
+              <property name="toolTip">
+               <string>Draw Crop Region: place control points on the model in the 3D view to outline a closed loop, double-click or right-click to close, then crop the current segment to the inside or outside of the loop (extruded along the view direction at the moment you finish drawing).</string>
+              </property>
+              <property name="text">
+               <string>Or draw a closed loop in the 3D view, then crop inside/outside:</string>
+              </property>
+              <property name="wordWrap">
+               <bool>true</bool>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <layout class="QHBoxLayout" name="horizontalLayout_crop_region_draw">
+              <item>
+               <widget class="QPushButton" name="pbDrawCropRegion">
+                <property name="minimumSize">
+                 <size>
+                  <width>0</width>
+                  <height>30</height>
+                 </size>
+                </property>
+                <property name="toolTip">
+                 <string>Enter drawing mode: left-click on the model in the 3D view to place control points of a closed loop; double-click or right-click to close it. The loop is extruded along the current view direction.</string>
+                </property>
+                <property name="text">
+                 <string>Draw Crop Region</string>
+                </property>
+                <property name="checkable">
+                 <bool>true</bool>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QPushButton" name="pbCancelDrawingCrop">
+                <property name="minimumSize">
+                 <size>
+                  <width>0</width>
+                  <height>30</height>
+                 </size>
+                </property>
+                <property name="toolTip">
+                 <string>Discard the loop being drawn and leave drawing mode.</string>
+                </property>
+                <property name="text">
+                 <string>Cancel Drawing</string>
+                </property>
+               </widget>
+              </item>
+             </layout>
+            </item>
+            <item>
+             <layout class="QHBoxLayout" name="horizontalLayout_crop_region_apply">
+              <item>
+               <widget class="QPushButton" name="pbCropInsideRegion">
+                <property name="enabled">
+                 <bool>false</bool>
+                </property>
+                <property name="minimumSize">
+                 <size>
+                  <width>0</width>
+                  <height>30</height>
+                 </size>
+                </property>
+                <property name="toolTip">
+                 <string>Keep only the current segment voxels inside the drawn loop (extruded along the view direction). Undoable; synced to the server.</string>
+                </property>
+                <property name="text">
+                 <string>Crop Inside</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QPushButton" name="pbCropOutsideRegion">
+                <property name="enabled">
+                 <bool>false</bool>
+                </property>
+                <property name="minimumSize">
+                 <size>
+                  <width>0</width>
+                  <height>30</height>
+                 </size>
+                </property>
+                <property name="toolTip">
+                 <string>Keep only the current segment voxels outside the drawn loop (extruded along the view direction). Undoable; synced to the server.</string>
+                </property>
+                <property name="text">
+                 <string>Crop Outside</string>
+                </property>
+               </widget>
+              </item>
+             </layout>
+            </item>
            </layout>
           </widget>
          </item>

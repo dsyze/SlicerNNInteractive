@@ -267,19 +267,26 @@
 
 ---
 
-## 十三、盒子裁剪当前分割（新） — [[crop_segment_by_box]]
+## 十三、几何裁剪当前分割（新） — [[crop_segment_by_box]]、[[draw_crop_region]]
 
-### 能做什么
+两种"几何方式裁剪当前段"的工具，共享同一条安全链路：**输出网格上的纯布尔运算 → 私有撤销栈（`_record_selection_op_undo`）→ `show_segmentation` → `setup_prompts` → 立即同步服务端**；因此高分辨率/三平面/斜位/配准序列下均自动正确。区别只在"区域掩码"怎么来。两者都只删当前段体素、从不新增，也不新增 server 端点。
 
-- 像 CT 三维重建软件那样：转动 3D 视角、拖一个盒子框住要保留的区域，一键去除盒外部分。
-- 控件：`Place Crop ROI`、`Crop Segment by Box`、`Keep crop box after cropping`（默认裁后删盒）。
+### 13.1 盒子裁剪（Crop Segment by Box）
 
-### 实现原理
+**能做什么**：像 CT 三维重建软件那样转动 3D 视角、拖一个盒子框住要保留的区域，一键去除盒外部分。控件 `Place Crop ROI`、`Crop Segment by Box`、`Keep crop box after cropping`（默认裁后删盒）。
 
-- 本质是"当前段 ∩ 盒子掩码"，**完全复用布尔 Intersect 的路径与网格桥接**（盒子在源网格栅格化 → `_to_output_grid` → 与输出网格当前段求交），因此高分辨率/三平面/斜位/配准序列下自动正确。
-- 用**独立于 Selection Ops ROI 的专用 crop ROI 节点**（固定盒形，按当前段的世界包围盒初始化，便于一拖即框住目标）。
-- 选择**清除盒外体素**而非物理裁剪参考体积——后者会破坏输出网格不变量、与三平面/高分辨率几何系统冲突、且难撤销。
-- 进同一私有撤销栈（`_record_selection_op_undo`），写回后立即同步服务端。
+**实现原理**：本质是"当前段 ∩ 盒子掩码"，**完全复用布尔 Intersect 的网格桥接**（盒子在源网格栅格化 → `_to_output_grid` → 与输出网格当前段求交）。用**独立于 Selection Ops ROI 的专用 crop ROI 节点**（固定盒形，按当前段世界包围盒初始化，便于一拖即框住目标）。选择**清除盒外体素**而非物理裁剪参考体积——后者会破坏输出网格不变量、与三平面/高分辨率几何系统冲突、且难撤销。
+
+### 13.2 闭合曲线 3D 裁剪（Draw Crop Region）
+
+**能做什么**：在 **3D 视图**里左键依次放控制点画一条闭合曲线（双击/右键闭合，亮黄线 + 半透明填充），点 `Crop Inside` 或 `Crop Outside`，把当前段裁成"闭合曲线沿当前视线方向拉伸成的无限棱柱"的内部或外部——比盒子更贴合不规则轮廓。控件 `Draw Crop Region`（进入绘制）、`Cancel Drawing`、`Crop Inside`、`Crop Outside`（画好后才启用）。纯几何、不调用 AI。
+
+**实现原理**：
+- **专用闭合曲线节点** `vtkMRMLMarkupsClosedCurveNode`（限制只在第一个 3D 视图显示/绘制），独立于套索提示节点，二者互不干扰。
+- **冻结视线方向**：绘制结束的瞬间（再次点 `Draw Crop Region` 收尾，或双击闭合使交互模式回到 ViewTransform 触发的自动收尾）一次性快照 3D 相机正交基 `{forward, right, up, cam_pos, parallel}` 存入 `_crop_region_camera_basis`；之后旋转视角不再影响裁剪方向（与"实时读相机"的本质区别）。
+- **区域掩码 = 屏幕空间点在多边形内**（等价 `vtkImplicitSelectionLoop`，法线 = 冻结视线）：直接遍历**当前段前景体素**，用输出网格 IJK→世界矩阵（线性父变换并入矩阵、非线性逐点）把体素中心投到冻结相机的屏幕平面，再用向量化偶数-奇数射线法判定是否落在闭合曲线（稠密曲线点）多边形内。只测前景体素 → 高效；用真实 IJK→世界 → 斜位/高分辨率自动正确；平行/透视投影分别处理。
+- `Crop Inside = 当前段 & 区域`，`Crop Outside = 当前段 & ~区域`。**零重叠**（区域不覆盖任何前景体素）按需求**取消不写入**并提示；无变化则提示"未改动"。裁剪后**自动退出绘制态并清空曲线**（`_exit_crop_region_drawing`）。
+- 关键入口：`on_draw_crop_region_clicked` / `_finalize_crop_region_drawing` / `_capture_3d_camera_basis` / `_crop_region_to_mask`（+ `_output_ijk_to_world_matrix` / `_project_to_screen` / `_points_in_polygon`）/ `_apply_crop_region`。
 
 ---
 
@@ -369,9 +376,10 @@
   ├─ 前提：自动配准（坐标系不同时先配准）
   └─ 可选：序列融合（收集每序列结果）
 
-选区布尔操作 / 盒子裁剪
+选区布尔操作 / 几何裁剪（盒子 / 闭合曲线）
   ├─ 网格桥接到输出网格后位运算（不能裸 &）
   ├─ 魔棒 / Lasso(3D)：临时借用 AI（备份/恢复服务端状态）
+  ├─ 闭合曲线裁剪：前景体素投到冻结相机屏幕平面 + 点在多边形内（不调用 AI）
   └─ 结果经 show_segmentation -> 立即上传同步
 ```
 
@@ -388,6 +396,7 @@
 | BRAINSFit 依赖 | 自动配准需 Slicer 内置 BRAINSFit；非 DICOM 导入无 Frame-of-Reference UID，需手动确认对齐 |
 | 显示平滑纯视图 | 不烘焙时导出的数据仍为原始 labelmap |
 | 高分辨率内存 | 大视野细间距网格内存消耗大；超预算自动粗化间距 |
+| 闭合曲线裁剪沿视线 | Draw Crop Region 按"绘制结束瞬间"的视线方向拉伸成无限棱柱；该方向冻结后旋转视角不改变结果。透视相机用近似投影，平行相机精确 |
 
 ---
 
