@@ -4,6 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 必须用中文和我交流。这个仓库是用来对这个插件进行二次开发，以满足我们自己的需要。
 dev_docs目录是用来放计划文档跟随进度的，你会和codex协同工作，请合理使用说明文档交流。AGENTS.md是codex的记忆文件。
 加调试输出debug时，如果我没有明确说问题已解决，就不准擅自删除调试代码。
+`dev_docs/feature_inventory_and_internals.md` 是插件全部功能的「功能清单 + 实现原理（概念为主）」总览文档，`dev_docs/feature_inventory_and_internals.docx` 是它的 Word 导出件。**以后每次新增或修改功能并提交时，必须同步更新这份 `.md`**：按「能做什么 → 解决什么问题 → 实现原理 → 关键入口/跳转」的小节模板补一节或修订对应小节，并相应更新文末的「功能依赖关系图」与「已知限制」；文中不写死行号（行号会随代码漂移）。`.docx` 由 `.md` 生成，需要时重新导出即可（环境无 pandoc/LibreOffice，可用 Word COM：Markdown→HTML→另存 .docx）。
 ## Overview
 
 `SlicerNNInteractive` brings [nnInteractive](https://github.com/MIC-DKFZ/nnInteractive) (deep-learning-based interactive 3D image segmentation) into [3D Slicer](https://www.slicer.org/). It has two independently deployed halves that talk over HTTP:
@@ -74,6 +75,8 @@ The test class is imported into the module file at the bottom and exposed as `Sl
 ### Custom features (secondary development)
 
 These were added on top of upstream nnInteractive and live **entirely in the client** (`SlicerNNInteractive.py`); the server (`server/.../main.py`) is unchanged from upstream, so none of them add or call new endpoints. Design notes and reviews live in `dev_docs/`, named `feature_name.md` (proposal) plus optional `feature_name_review.md` (review) -- e.g. `dev_docs/semantic_selection_boolean_operations.md` and its `_review.md`.
+
+For a single global, concept-level inventory of every feature (upstream + custom) with its implementation principles, see `dev_docs/feature_inventory_and_internals.md` (exported as `feature_inventory_and_internals.docx`). It is the authoritative overview and must be kept in sync whenever features change -- see the Chinese maintenance note near the top of this file. The list below is a quick architecture summary, not the complete catalog.
 
 **Selection Operations** (`dev_docs/semantic_selection_boolean_operations.md`) -- boolean editing of the current segment (Add = OR, Subtract = AND NOT, Intersect = AND) against one of four operands chosen in `cbOperandSource` (indices are the module constants `OPERAND_SOURCE_ROI/WAND/SEGMENT/LASSO3D`):
 - **ROI operand** -- box/sphere/ellipsoid (`cbRoiShape` -> `ROI_SHAPE_BOX/SPHERE/ELLIPSOID`); `roi_node_to_mask` rasterizes via OBB containment so it is correct on oblique volumes.
