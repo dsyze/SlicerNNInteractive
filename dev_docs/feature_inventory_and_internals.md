@@ -81,7 +81,7 @@
 
 ### 1.7 偏好持久化与观察者管理
 
-- **跨会话偏好**集中在 `SlicerNNInteractive/` QSettings 命名空间，通过 `_get_qsetting` / `_set_qsetting` 读写，键名以 `SETTING_*` 常量声明（服务器 URL、滚轮吸附、输出间距、段不透明度、显示平滑开关/强度、套索裁剪开关/N、多视图套索、高分辨率输出、平滑插值、三平面、自动相机旋转、斜位相机对齐等）。
+- **跨会话偏好**集中在 `SlicerNNInteractive/` QSettings 命名空间，通过 `_get_qsetting` / `_set_qsetting` 读写，键名以 `SETTING_*` 常量声明（服务器 URL、滚轮吸附、输出间距、段不透明度、显示平滑开关/强度、套索裁剪开关/N、多视图套索、高分辨率输出、平滑插值、三平面、全序列融合、自动相机旋转、斜位相机对齐等）。
 - **观察者**多数走 `VTKObservationMixin`（`_safe_add_observer` / `_safe_remove_observer`），由 `removeObservers()` 统一回收；但有三类是手动管理、必须在 `cleanup()` 里显式摘除：**scribble 的 Paint 观察者、Lasso-3D 输入观察者、配准 CLI 观察者**。
 
 ---
@@ -292,7 +292,7 @@
 
 ## 十四、三平面多序列模式（新整合） — [[triplanar_multiseries]]
 
-把前述能力串起来，服务三个**共配准**序列（如横断/矢状/冠状），在任意视图交互时自动用该视图显示的序列推理，并融合显示。
+把前述能力串起来，服务三个**共配准**序列（如横断/矢状/冠状）。有两种交互→推理映射：默认**全序列融合**（14.6，每次交互用全部序列推理再融合）；关掉子开关则退回**按视图路由**（14.2，只用所点视图的序列）。
 
 ### 14.1 启用前提
 
@@ -316,6 +316,14 @@
 
 - 3D 定位面（半透明矩形标出各序列切片范围）+ 显隐切换按钮 + 交互后相机自动旋转（见第四节）。
 - 此模式下**旁路多视图套索累积**（各视图本就是不同序列，逐视图即时路由提交即可）。
+
+### 14.6 全序列融合（按提示自动融合，子开关 `cbAllSeriesFusion`，默认开）
+
+- **解决什么**：14.2 的按视图路由每次只用一个序列，其他序列的高分辨率信息浪费、纵轴不准。本子模式让**每次交互都用全部已分配序列分别推理再融合**，一步写入当前段。
+- **开关**：`Tri-planar multi-series mode` 下方子复选框 `cbAllSeriesFusion`（`SETTING_ALLSERIES_FUSION`，默认 True，仅三平面下可用）。取消即退回 14.2 按视图路由。`_allseries_fusion_active()` 判定生效。
+- **核心** `_run_allseries_fusion(send_for_series)`（泛化自一键三序列融合）：取 `_triplanar_coverage_volumes()`（**<2 个弹窗"至少需要 2 个有效序列"并回退**）→ 进入 capture 模式（`_fusion_capture_active`，结果只存 `_fusion_capture_store` 不显示）逐序列推理（状态栏 "processing series i/n"，单序列失败跳过）→ 有效 <2 回退 → `_fusion_results` 喂给 `_fuse_series_results()`（FOV 约束 + 方向加权 SDF，落输出网格，见 1.5）→ `_record_selection_op_undo`（可撤销）→ `show_segmentation` → `upload_segment_to_server`。
+- **各交互**：点/框由 RAS 良定义 → 在每序列网格重算坐标原样发；**套索/涂鸦走混合通路**（同 15 节）——来源视图序列发真提示，另两序列发从提示内部派生的点种子（`_lasso_interior_seeds` / `_mask_interior_seeds` + `_send_point_seeds_for_series`）。
+- **代价**：三序列串行、各自重传，约单次 2.5-3x；累计靠"上传当前已融合段作初始掩码"实现（与 native-series 一致）。
 
 ---
 
@@ -391,6 +399,7 @@
 |------|------|
 | 服务端单会话 | 多用户/多客户端并发会互相覆盖 |
 | 三平面逐视图重传 | 每路由到不同序列都要重传图像+分割，无法在跨视图同一会话内迭代细化 |
+| 全序列融合耗时 | 每次交互对全部序列串行推理（各自重传图像+分割），约单次 2.5-3x；套索/涂鸦在正交序列退化为点种子，细节略逊于来源序列 |
 | Scribble 分辨率 | 涂鸦在源体积分辨率绘制，再重采样到路由序列 |
 | 斜采集融合近似 | 强成角序列的方向加权融合用"近似到最近主轴"，极端成角精度有限 |
 | BRAINSFit 依赖 | 自动配准需 Slicer 内置 BRAINSFit；非 DICOM 导入无 Frame-of-Reference UID，需手动确认对齐 |

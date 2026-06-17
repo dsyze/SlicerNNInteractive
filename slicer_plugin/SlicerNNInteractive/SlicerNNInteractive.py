@@ -166,6 +166,10 @@ SETTING_LASSO_MULTIVIEW_ENABLED = "SlicerNNInteractive/lasso_multiview_enabled"
 SETTING_HIGH_RES_ENABLED = "SlicerNNInteractive/high_res_output_enabled"
 SETTING_SMOOTH_INTERPOLATE_ENABLED = "SlicerNNInteractive/smooth_interpolate_enabled"
 SETTING_TRIPLANAR_ENABLED = "SlicerNNInteractive/triplanar_mode_enabled"
+# All-series fusion: in tri-planar mode, run every prompt against ALL assigned
+# series and SDF-fuse the results, instead of routing each prompt to one view's
+# series. Default enabled (auto-active once tri-planar mode is on).
+SETTING_ALLSERIES_FUSION = "SlicerNNInteractive/allseries_fusion_enabled"
 # Per-view visibility of the 3D locator planes (one key per view, suffixed with
 # the lower-cased view name); default visible.
 SETTING_TRIPLANAR_FRAME_VISIBLE_PREFIX = (
@@ -2411,10 +2415,6 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         under-segment. Returns a list of [R, A, S] points (always >= 1)."""
         centroid = list(np.asarray(lasso_ras, dtype=float).mean(axis=0))
         try:
-            from scipy import ndimage
-        except Exception:
-            return [centroid]
-        try:
             xyzs = [
                 self.ras_to_xyz(list(p), volume_node=ref_grid_node)
                 for p in lasso_ras
@@ -2425,9 +2425,27 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         except Exception as e:  # noqa: BLE001
             print("[DEBUG fuse3] seed rasterization failed: {}".format(e))
             return [centroid]
-        filled = np.asarray(filled).astype(bool)
+        seeds_ras = self._mask_interior_seeds(filled, ref_grid_node, n_seeds)
+        print("[DEBUG fuse3] derived {} interior seed(s) from lasso".format(
+            len(seeds_ras)))
+        return seeds_ras if seeds_ras else [centroid]
+
+    def _mask_interior_seeds(self, mask, ref_grid_node, n_seeds=FUSE3_NUM_SEEDS):
+        """Derive positive 3D point seeds (RAS) from a filled binary mask on
+        ref_grid_node. The distance transform of the region yields the deepest
+        interior point (first seed, safe even for concave / ring shapes) plus a
+        few interior samples (depth above half the maximum, picked at an even
+        stride for spread) so one seed cannot under-segment. Shared by the lasso
+        (fills its polygon first) and the scribble (passes its mask directly)
+        all-series fusion paths. Returns a list of [R, A, S] points (possibly
+        empty if scipy is missing or the mask is empty -- callers fall back)."""
+        try:
+            from scipy import ndimage
+        except Exception:
+            return []
+        filled = np.asarray(mask).astype(bool)
         if not filled.any():
-            return [centroid]
+            return []
         dt = ndimage.distance_transform_edt(filled)
         kji = np.unravel_index(int(np.argmax(dt)), dt.shape)  # (k, j, i)
         seeds_kji = [tuple(int(c) for c in kji)]
@@ -2458,9 +2476,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             if local_to_world is not None:
                 p = list(local_to_world.TransformPoint(p))
             seeds_ras.append([p[0], p[1], p[2]])
-        print("[DEBUG fuse3] derived {} interior seed(s) from lasso".format(
-            len(seeds_ras)))
-        return seeds_ras if seeds_ras else [centroid]
+        return seeds_ras
 
     def _send_point_seeds_for_series(self, series, seeds_ras):
         """Send each in-bounds positive point seed to `series` via point_prompt.
@@ -3585,7 +3601,28 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self._clear_selection_op_undo_stack(
                 "Output grid reverted to source; undo history cleared.")
             self._disable_triplanar_slice_frames()
+        # The all-series-fusion sub-option only applies inside tri-planar mode.
+        if hasattr(self, "ui"):
+            self.ui.cbAllSeriesFusion.setEnabled(self._triplanar_mode)
         self._refresh_native_series_inference_ui()
+
+    def _get_allseries_fusion_enabled(self):
+        """Read the persisted all-series-fusion preference. Default True so the
+        richer multi-series behavior is on as soon as tri-planar mode is."""
+        return self._get_qsetting(SETTING_ALLSERIES_FUSION, True, cast=bool)
+
+    def _on_allseries_fusion_toggled(self, checked):
+        """Persist the all-series-fusion sub-option. No view rearrangement is
+        needed; the next prompt simply reads _allseries_fusion_active()."""
+        print("[DEBUG allseries.mode] toggled -> {}".format(bool(checked)))
+        self._set_qsetting(SETTING_ALLSERIES_FUSION, bool(checked))
+
+    def _allseries_fusion_active(self):
+        """True when every prompt should be run against all assigned series and
+        fused, i.e. tri-planar mode is on and the sub-option is checked."""
+        if not self._triplanar_mode or not hasattr(self, "ui"):
+            return False
+        return self.ui.cbAllSeriesFusion.isChecked()
 
     @staticmethod
     def _last_control_point_ras(caller):
@@ -3672,6 +3709,91 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if self._get_auto_camera_rotation():
             self._rotate_camera_to_view(view)
         return view
+
+    def _run_allseries_fusion(self, send_for_series):
+        """All-series fusion: run one interaction against EVERY assigned series
+        and direction-weighted-SDF-fuse the results into the current segment in
+        a single step (instead of routing the prompt to one view's series).
+
+        `send_for_series(series)` is a per-prompt-type callback that recomputes
+        the interaction on `series`' grid and calls the matching prompt method.
+        While it runs, _active_inference_volume_override is set to `series` and
+        _fusion_capture_active is True, so _handle_server_segmentation_result
+        captures the result onto the output grid (keyed by series id) instead of
+        displaying it. The callback may raise to skip a series (e.g. seeds fell
+        outside its FOV).
+
+        Returns True when a fused result was applied; False when the caller
+        should fall back to per-view routing (fewer than 2 assignable / valid
+        series). Generalizes the manual onFuseFromThreeSeriesWithROI loop to all
+        prompt types, fired automatically per prompt."""
+        series_list = self._triplanar_coverage_volumes()
+        if len(series_list) < 2:
+            QMessageBox.warning(
+                slicer.util.mainWindow(),
+                "All-series fusion",
+                "At least 2 valid series are required (assign distinct series to "
+                "the Red/Yellow/Green views in the Multi-plane display panel). "
+                "Falling back to per-view routing for this prompt.",
+            )
+            return False
+        n = len(series_list)
+        self._fusion_capture_active = True
+        self._fusion_capture_store = {}
+        valid = []
+        try:
+            for i, series in enumerate(series_list):
+                slicer.util.showStatusMessage(
+                    "All-series fusion: processing series {}/{} ('{}')...".format(
+                        i + 1, n, series.GetName()), 0
+                )
+                slicer.app.processEvents()
+                self._active_inference_volume_override = series
+                try:
+                    send_for_series(series)
+                except Exception as e:  # noqa: BLE001 - one bad series must not abort
+                    print("[DEBUG allseries] skip series '{}': {}".format(
+                        series.GetName(), e))
+                    continue
+                res = self._fusion_capture_store.get(series.GetID())
+                if res is not None and np.asarray(res).any():
+                    valid.append((series, res))
+        finally:
+            self._fusion_capture_active = False
+            self._active_inference_volume_override = None
+        if len(valid) < 2:
+            print("[DEBUG allseries] only {} series produced a result; "
+                  "falling back to per-view routing".format(len(valid)))
+            slicer.util.showStatusMessage(
+                "All-series fusion: fewer than 2 series produced a result; "
+                "using per-view routing instead.", 4000
+            )
+            return False
+        # _fuse_series_results reads self._fusion_results (series id -> output-grid
+        # mask) and applies FOV coverage + direction-weighted SDF averaging.
+        self._fusion_results = {s.GetID(): m for s, m in valid}
+        fused = self._fuse_series_results()
+        if fused is None:
+            print("[DEBUG allseries] fusion produced no result; falling back")
+            self._fusion_results = {}
+            return False
+        seg_id = self.get_current_segment_id()
+        pre = self.get_segment_data(self.get_output_volume_node())
+        if pre is not None:
+            self._record_selection_op_undo(
+                seg_id, np.asarray(pre).astype(np.uint8).copy()
+            )
+        # The fused mask is a full 3D result; never let a stale lasso slice
+        # marker clip it to a single slice in show_segmentation.
+        self._last_lasso_slice = None
+        self.show_segmentation(fused)
+        self._fusion_results = {}
+        self.upload_segment_to_server()
+        print("[DEBUG allseries] applied fusion of {} series".format(len(valid)))
+        slicer.util.showStatusMessage(
+            "All-series fusion: fused {} series.".format(len(valid)), 3000
+        )
+        return True
 
     def _resample_result_to_output(self, working_mask):
         """Bring an nnInteractive result from the inference grid onto the
@@ -3935,6 +4057,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.cbTriPlanarMode.setChecked(self._get_triplanar_enabled())
         self.ui.cbTriPlanarMode.blockSignals(blocked)
         self._triplanar_mode = self._get_triplanar_enabled()
+        # All-series fusion sub-option (auto-fuse every prompt across all series).
+        # Restored with signals blocked; only enabled while tri-planar mode is on.
+        self.ui.cbAllSeriesFusion.toggled.connect(self._on_allseries_fusion_toggled)
+        blocked = self.ui.cbAllSeriesFusion.blockSignals(True)
+        self.ui.cbAllSeriesFusion.setChecked(self._get_allseries_fusion_enabled())
+        self.ui.cbAllSeriesFusion.blockSignals(blocked)
+        self.ui.cbAllSeriesFusion.setEnabled(self._triplanar_mode)
         # Lazy start: the checkbox is restored CHECKED without firing the toggle,
         # so the planes are built later by _ensure_triplanar_slice_frames when
         # the user applies their series (see _apply_plane_display_volumes).
@@ -4325,6 +4454,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             )
 
             self.prev_caller = None
+            # RAS of the bbox's first corner; needed to recompute the box on each
+            # series' grid in all-series fusion (voxel coords differ per series).
+            self.prev_bbox_ras = None
 
             if prompt_type["on_placed_function"] is not None:
                 node.AddObserver(
@@ -4601,6 +4733,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             )
             return
 
+        # All-series fusion: run this point against every assigned series (point
+        # coords are well-defined on any grid) and fuse. A point is identical in
+        # intent for all series, so it is sent unchanged.
+        if self._allseries_fusion_active() and self.get_volume_node():
+            def send_point(series):
+                xyz = self.xyz_from_caller(caller, volume_node=series)
+                self.point_prompt(xyz=xyz, positive_click=self.is_positive)
+            if self._run_allseries_fusion(send_point):
+                return
+            # Fewer than 2 valid/contributing series: fall through to routing.
+
         # Tri-planar routing: run this prompt against the series shown in the
         # view the point was placed in (no-op outside tri-planar mode).
         self._route_prompt_to_view(self._last_control_point_ras(caller))
@@ -4656,10 +4799,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             )
             return
 
+        # RAS of the just-placed corner, captured before routing for both the
+        # per-view route and the all-series fusion box reconstruction.
+        corner_ras = self._last_control_point_ras(caller)
         # Tri-planar routing: run this box against the series shown in the view
         # the corner was placed in (no-op outside tri-planar mode). Routed before
         # voxel coordinates are computed so both corners land in that series' grid.
-        self._route_prompt_to_view(self._last_control_point_ras(caller))
+        self._route_prompt_to_view(corner_ras)
         try:
             xyz = self.xyz_from_caller(
                 caller, volume_node=self.get_inference_volume_node()
@@ -4682,11 +4828,40 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                         xyz[2] * 2 - outer_point_two[2],
                     ]
 
-                    self.bbox_prompt(
-                        outer_point_one=outer_point_one,
-                        outer_point_two=outer_point_two,
-                        positive_click=self.is_positive,
-                    )
+                    # All-series fusion: rebuild the box on each series' grid from
+                    # the two corners' RAS (the second corner is the box center,
+                    # the first corner is one extent) and fuse the results. Falls
+                    # back to the routed single-series box below when not applied.
+                    applied = False
+                    if (
+                        self._allseries_fusion_active()
+                        and self.prev_bbox_ras is not None
+                        and corner_ras is not None
+                    ):
+                        first_ras = list(self.prev_bbox_ras)
+                        center_ras = list(corner_ras)
+
+                        def send_box(series):
+                            p2 = self.ras_to_xyz(first_ras, volume_node=series)
+                            c = self.ras_to_xyz(center_ras, volume_node=series)
+                            p1 = [
+                                c[0] * 2 - p2[0],
+                                c[1] * 2 - p2[1],
+                                c[2] * 2 - p2[2],
+                            ]
+                            self.bbox_prompt(
+                                outer_point_one=p1,
+                                outer_point_two=p2,
+                                positive_click=self.is_positive,
+                            )
+
+                        applied = self._run_allseries_fusion(send_box)
+                    if not applied:
+                        self.bbox_prompt(
+                            outer_point_one=outer_point_one,
+                            outer_point_two=outer_point_two,
+                            positive_click=self.is_positive,
+                        )
 
                     def _next():
                         self.setup_prompts()
@@ -4698,6 +4873,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 self.prev_caller = None
             else:
                 self.prev_bbox_xyz = xyz
+                self.prev_bbox_ras = corner_ras
 
             self.prev_caller = caller
         finally:
@@ -4849,12 +5025,50 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
             qt.QTimer.singleShot(0, _next_mv)
         else:
-            self.lasso_or_scribble_prompt(
-                mask=mask,
-                positive_click=self.is_positive,
-                tp="lasso",
-                mask_volume_node=inference_volume,
-            )
+            # All-series fusion (hybrid): send the real lasso to its own view's
+            # series and derived interior point seeds to the orthogonal series (a
+            # lasso is degenerate off its own plane), then fuse. Falls back to the
+            # routed single-series lasso below when fewer than 2 series contribute.
+            applied = False
+            if self._allseries_fusion_active() and len(_ras_pts) >= 3:
+                lasso_ras = np.array(_ras_pts)
+                centroid = list(lasso_ras.mean(axis=0))
+                src_view = self._view_for_ras_point(centroid)
+                src_series = (
+                    self._view_background_volume(src_view)
+                    if src_view is not None else None
+                )
+                seeds = self._lasso_interior_seeds(
+                    lasso_ras, self.get_output_volume_node()
+                )
+
+                def send_lasso(series):
+                    if (
+                        src_series is not None
+                        and series.GetID() == src_series.GetID()
+                    ):
+                        s_xyzs = [
+                            self.ras_to_xyz(list(p), volume_node=series)
+                            for p in lasso_ras
+                        ]
+                        s_mask = self.lasso_points_to_mask(
+                            s_xyzs, ras_points=lasso_ras, volume_node=series
+                        )
+                        self.lasso_or_scribble_prompt(
+                            mask=s_mask, positive_click=self.is_positive,
+                            tp="lasso", mask_volume_node=series,
+                        )
+                    elif not self._send_point_seeds_for_series(series, seeds):
+                        raise RuntimeError("no in-FOV seeds for series")
+
+                applied = self._run_allseries_fusion(send_lasso)
+            if not applied:
+                self.lasso_or_scribble_prompt(
+                    mask=mask,
+                    positive_click=self.is_positive,
+                    tp="lasso",
+                    mask_volume_node=inference_volume,
+                )
             self._active_inference_volume_override = None
 
             def _next():
@@ -5031,23 +5245,58 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         diff_mask = mask - prev_scribble_mask
         self._prev_scribble_mask = mask
 
-        # Tri-planar routing: send the scribble to the series shown in the view
-        # it was drawn in, detected from the painted plane's RAS centroid. The
-        # diff mask is on the source grid; lasso_or_scribble_prompt resamples it
-        # onto the routed series before upload.
-        if self._triplanar_mode:
-            self._route_prompt_to_view(
-                self._mask_centroid_ras(diff_mask, self.get_volume_node())
+        source_volume = self.get_volume_node()
+
+        # All-series fusion (hybrid): send the real scribble to its own view's
+        # series and derived interior point seeds to the orthogonal series (a
+        # painted stroke is degenerate off its own plane, like a lasso), then
+        # fuse. Falls back to the routed single-series scribble below when fewer
+        # than 2 series contribute.
+        applied = False
+        if self._allseries_fusion_active():
+            src_centroid = self._mask_centroid_ras(diff_mask, source_volume)
+            src_view = (
+                self._view_for_ras_point(src_centroid)
+                if src_centroid is not None else None
             )
-        try:
-            self.lasso_or_scribble_prompt(
-                mask=diff_mask,
-                positive_click=self.is_positive,
-                tp="scribble",
-                mask_volume_node=self.get_volume_node(),
+            src_series = (
+                self._view_background_volume(src_view)
+                if src_view is not None else None
             )
-        finally:
-            self._active_inference_volume_override = None
+            seeds = self._mask_interior_seeds(diff_mask, source_volume)
+
+            def send_scribble(series):
+                if (
+                    src_series is not None
+                    and series.GetID() == src_series.GetID()
+                ):
+                    self.lasso_or_scribble_prompt(
+                        mask=diff_mask, positive_click=self.is_positive,
+                        tp="scribble", mask_volume_node=source_volume,
+                    )
+                elif not self._send_point_seeds_for_series(series, seeds):
+                    raise RuntimeError("no in-FOV seeds for series")
+
+            applied = self._run_allseries_fusion(send_scribble)
+
+        if not applied:
+            # Tri-planar routing: send the scribble to the series shown in the
+            # view it was drawn in, detected from the painted plane's RAS
+            # centroid. The diff mask is on the source grid;
+            # lasso_or_scribble_prompt resamples it onto the routed series.
+            if self._triplanar_mode:
+                self._route_prompt_to_view(
+                    self._mask_centroid_ras(diff_mask, source_volume)
+                )
+            try:
+                self.lasso_or_scribble_prompt(
+                    mask=diff_mask,
+                    positive_click=self.is_positive,
+                    tp="scribble",
+                    mask_volume_node=source_volume,
+                )
+            finally:
+                self._active_inference_volume_override = None
 
         self.ui.pbInteractionScribble.click()  # turn it off
         self.ui.pbInteractionScribble.click()  # turn it on
