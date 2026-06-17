@@ -47,11 +47,16 @@
 
 ## 三、多序列 SDF 融合
 
-- UI:`cbEnableSeriesFusion`、`pbFuseSeries`(显示已累计的序列数)。
+- UI:`cbEnableSeriesFusion`、`pbFuseSeries`(显示已累计的序列数)、`cbDirectionalFusion`(融合算法选择,默认开)。
 - 思路:每跑一个序列的结果就按推理体积 id 收集到 `_fusion_results`(都在输出网格);
-  Fuse 时对各 mask 求符号距离场(`distance_transform_edt` 内正外负),平均后阈值 0
+  Fuse 时对各 mask 求符号距离场(`distance_transform_edt` 内正外负),融合后阈值 0
   得到"平滑均值面",写回当前 segment(可撤销)。
-- 关键方法:`_get_fusion_enabled`、`_maybe_collect_fusion_result`(累计,网格变了就清空)、
+- 融合算法两选一(开关 `cbDirectionalFusion`,见 [[directional_fusion]]):
+  - **默认 方向性融合 + 动态等权**:按边界法向 `n` 与序列穿层方向 `t_s` 加权
+    `w_s=max(1-|n.t_s|,w_floor)*cov_s`,劣势(穿层)方向不投票,等权/动态适应自动涌现。
+  - **回退 各向异性平滑 + 等权 SDF 平均**:各序列 SDF 仅沿层叠方向高斯模糊后等权平均。
+- 关键方法:`_get_fusion_enabled`、`_get_directional_fusion_enabled`、`_directional_weighted_sdf`、
+  `_series_through_plane_np_dir`、`_maybe_collect_fusion_result`(累计,网格变了就清空)、
   `_fuse_series_results`、`on_fuse_series_clicked`、`_on_series_fusion_toggled`。
 - 状态:`_fusion_results`(volume_id -> uint8 输出网格 mask)、`_fusion_grid_shape`。
 

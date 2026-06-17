@@ -54,14 +54,17 @@
 - `_handle_server_segmentation_result` 顶部分支:三视图模式下走 `_handle_triplanar_result`
   -> `_resample_result_to_output`(结果重采样到输出网格)-> `_maybe_collect_fusion_result`
   (按路由序列 id 累积)-> `_maybe_autofuse`(>=2 序列时融合显示;不足时直接显示单序列)。
-- `_fuse_series_results`(已升级):对每个序列的 SDF,**仅沿其"层叠/采集方向"做各向异性高斯
-  平滑**(`_series_anisotropic_sigma`),抹掉该方向台阶锯齿、保留面内锐度;再平均、阈值 0。
-  这样某方向上锯齿的序列被该方向平滑、让在该方向清晰的序列主导,实现"各方向取最清晰"。
-  - **oblique 容忍(选项 A)**:层叠轴 = `argmax(GetSpacing())`;取其 RAS 方向投影到**最近的输出
-    网格轴**(|dot| 最大),沿该轴设 sigma=`clip(0.5*(层厚/该轴输出间距-1),0,3)`,其余 0。成角序列
-    也能去锯齿(近似到主轴)。`[DEBUG triplanar.obliq]` 打印层方向、所选输出轴、夹角(度),据此判断
-    近似是否足够;不够可升级 C(旋转-模糊-转回,仅动此处)。
-  - 注:直接用原生 spacing 当 edt `sampling` 的极性是反的(厚轴反而主导),故采用"按层方向平滑"。
+- `_fuse_series_results`(默认走**方向性融合 + 动态等权**,见 [[directional_fusion]]):对每个序列
+  的 SDF,按**该处边界法向 `n` 与序列穿层方向 `t_s`** 加权——`w_s=max(1-|n.t_s|,w_floor)*cov_s`,
+  即法向落在序列清晰平面内则满权、沿穿层方向则近零权,再加权平均、阈值 0。劣势(穿层)方向**完全
+  不投票**(旧法只是把它模糊后仍软投票),等权与缺序列动态适应自动涌现,不分主次。开关
+  `cbDirectionalFusion`(默认开);关闭回退**旧的各向异性平滑后等权 SDF 平均**(下述)。
+  - 穿层方向 `_series_through_plane_np_dir`:层叠轴 = `argmax(GetSpacing())`,取其 RAS 方向投影到
+    输出网格三轴 RAS 基,得连续单位向量(比旧"snap 到最近轴"更精确,oblique 容忍)。
+  - **回退路径(旧法,各向异性平滑)**:对每个序列的 SDF,仅沿其层叠方向做各向异性高斯平滑
+    (`_series_anisotropic_sigma`,sigma=`clip(0.5*(层厚/该轴输出间距-1),0,3)`,把层方向 snap 到最近
+    输出轴),再等权平均、阈值 0。`[DEBUG triplanar.obliq]` 打印层方向、所选输出轴、夹角(度)。
+  - 注:直接用原生 spacing 当 edt `sampling` 的极性是反的(厚轴反而主导),故回退法采用"按层方向平滑"。
 - `_maybe_autofuse` 每次融合记一次 undo(与手动 `pbFuseSeries` 一致,栈上限 10)。
 
 ## 四、注意点 / 限制

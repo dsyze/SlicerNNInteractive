@@ -1274,6 +1274,19 @@
             </widget>
            </item>
            <item>
+            <widget class="QCheckBox" name="cbDirectionalFusion">
+             <property name="toolTip">
+              <string>Directional Fusion: weight each series' contribution to the fused boundary by how well the local surface normal lies in that series' sharp (in-plane) acquisition plane. A series votes at full weight where the boundary runs in its clear plane and is suppressed toward zero where the boundary crosses its blurry through-plane (slice-stacking) direction, so its low-resolution axis no longer pulls the fused edge. Equal weighting and adaptation to the number of present series emerge automatically (no fixed priorities; a missing series simply yields its share to the others in the directions they share). Turn off to fall back to the legacy anisotropic-blur plus equal-weight SDF average.</string>
+             </property>
+             <property name="checked">
+              <bool>true</bool>
+             </property>
+             <property name="text">
+              <string>    Directional Fusion (normal-aligned equal weight)</string>
+             </property>
+            </widget>
+           </item>
+           <item>
             <layout class="QHBoxLayout" name="horizontalLayout_planeOpacity">
              <item>
               <widget class="QLabel" name="lblPlaneOpacity">

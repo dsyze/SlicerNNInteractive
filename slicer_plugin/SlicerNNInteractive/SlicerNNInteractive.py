@@ -170,6 +170,12 @@ SETTING_TRIPLANAR_ENABLED = "SlicerNNInteractive/triplanar_mode_enabled"
 # series and SDF-fuse the results, instead of routing each prompt to one view's
 # series. Default enabled (auto-active once tri-planar mode is on).
 SETTING_ALLSERIES_FUSION = "SlicerNNInteractive/allseries_fusion_enabled"
+# Directional fusion: weight each series' contribution to the fused level set by
+# how well the local boundary normal lies in that series' sharp (in-plane)
+# acquisition plane, so a series never votes along its blurry through-plane
+# direction. Default enabled; turn off to fall back to the legacy anisotropic-
+# blur + equal-weight SDF average.
+SETTING_DIRECTIONAL_FUSION = "SlicerNNInteractive/directional_fusion_enabled"
 # Per-view visibility of the 3D locator planes (one key per view, suffixed with
 # the lower-cased view name); default visible.
 SETTING_TRIPLANAR_FRAME_VISIBLE_PREFIX = (
@@ -2233,6 +2239,139 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                   tuple(round(s, 2) for s in sigma)))
         return tuple(sigma)
 
+    def _series_through_plane_np_dir(self, series_volume):
+        """Unit vector of `series_volume`'s thick (slice-stacking) acquisition
+        direction, expressed in the output grid's numpy-axis (z, y, x) basis.
+
+        Mirrors _series_anisotropic_sigma's thick-axis selection, but keeps the
+        full continuous direction (no snap to a single nearest axis) so
+        directional fusion can weight by the true through-plane orientation.
+        The output grid's three IJK-to-RAS columns (K, J, I -> numpy z, y, x)
+        are an orthonormal basis; projecting the series' thick RAS direction
+        onto them gives its components along each numpy axis. Returns a length-3
+        numpy array (z, y, x), or None when geometry is unavailable."""
+        output_volume = self.get_output_volume_node()
+        if output_volume is None or series_volume is None:
+            return None
+        get_s = getattr(series_volume, "GetIJKToRASDirectionMatrix", None)
+        get_o = getattr(output_volume, "GetIJKToRASDirectionMatrix", None)
+        if get_s is None or get_o is None:
+            return None
+        sm = vtk.vtkMatrix4x4()
+        get_s(sm)
+        om = vtk.vtkMatrix4x4()
+        get_o(om)
+        s_spacing = tuple(series_volume.GetSpacing())
+        slice_ijk = int(np.argmax(s_spacing))
+        slice_dir = np.array(
+            [sm.GetElement(r, slice_ijk) for r in range(3)], dtype=float
+        )
+        norm = float(np.linalg.norm(slice_dir))
+        if norm == 0:
+            return None
+        slice_dir /= norm
+        # Output numpy axes -> IJK columns: z=K(col2), y=J(col1), x=I(col0).
+        out_col_for_np_axis = (2, 1, 0)
+        comp = np.zeros(3, dtype=float)  # numpy z, y, x
+        for np_axis, col in enumerate(out_col_for_np_axis):
+            d = np.array([om.GetElement(r, col) for r in range(3)], dtype=float)
+            dn = float(np.linalg.norm(d))
+            if dn == 0:
+                continue
+            comp[np_axis] = float(np.dot(slice_dir, d / dn))
+        cnorm = float(np.linalg.norm(comp))
+        if cnorm == 0:
+            return None
+        return comp / cnorm
+
+    def _directional_weighted_sdf(self, items, shape, samp, w_floor=0.05):
+        """Normal-aligned, dynamic equal-weight SDF fusion shared by the whole-
+        grid and ROI fusion paths.
+
+        `items` is a list of (mask_bool, t_np_dir, cov_bool_or_None), where
+        `t_np_dir` is the series' through-plane unit direction in the output
+        numpy-axis basis (from _series_through_plane_np_dir; None == unknown)
+        and `cov_bool` is the series' FOV coverage on this grid (None == full).
+
+        Each series s gets a per-voxel weight w_s = max(1 - |n_hat . t_s|,
+        w_floor), masked to its own FOV, where n_hat is the unit boundary normal
+        of the consensus surface (gradient of the equal-weight mean SDF). A
+        series whose sharp plane contains the local surface (normal perpendicular
+        to its thick direction) votes at full weight; one whose thick direction
+        aligns with the normal (its stair-stepped through-plane case) is
+        suppressed toward w_floor and contributes almost nothing there. Equal
+        weighting and dynamic adaptation to the number of covering series both
+        emerge: where k series cover and align, each contributes about 1/k.
+
+        Returns (fused_bool, covered_bool) on `shape`, or None when nothing is
+        usable. w_floor keeps the total weight strictly positive on every
+        covered voxel (no divide-by-zero) and lets ambiguous spots degrade to
+        near-equal weighting."""
+        try:
+            from scipy import ndimage
+        except Exception:
+            print("[DEBUG fusion.dir] SKIP: scipy unavailable")
+            return None
+        shape = tuple(shape)
+        sdfs, covs, dirs = [], [], []
+        cnt = np.zeros(shape, dtype=np.uint8)
+        for mask_bool, t_np, cov in items:
+            mb = np.asarray(mask_bool, dtype=bool)
+            if mb.shape != shape or not mb.any():
+                continue
+            sdf = (
+                ndimage.distance_transform_edt(mb, sampling=samp)
+                - ndimage.distance_transform_edt(~mb, sampling=samp)
+            ).astype(np.float32)
+            sdfs.append(sdf)
+            if cov is not None:
+                cb = np.asarray(cov, dtype=bool)
+                covs.append(cb)
+                cnt += cb.astype(np.uint8)
+            else:
+                covs.append(None)
+                cnt += 1
+            dirs.append(None if t_np is None else np.asarray(t_np, dtype=float))
+        if not sdfs:
+            return None
+        covered = cnt > 0
+        # Consensus normal from the equal-weight mean of the covered SDFs. Only
+        # its direction is used, so the unnormalized mean (sum / count) is fine;
+        # guard uncovered voxels (count 0) against divide-by-zero.
+        safe_cnt = np.where(cnt > 0, cnt, 1).astype(np.float32)
+        mean_sdf = np.zeros(shape, dtype=np.float32)
+        for sdf, cov in zip(sdfs, covs):
+            mean_sdf += sdf if cov is None else (sdf * cov)
+        mean_sdf /= safe_cnt
+        grad = np.gradient(mean_sdf, *samp)  # d/dz, d/dy, d/dx
+        gmag = np.sqrt(sum(g * g for g in grad)).astype(np.float32)
+        have_normal = gmag > 1e-6
+        gsafe = np.where(have_normal, gmag, 1.0).astype(np.float32)
+        n_hat = [(g / gsafe) for g in grad]  # unit normal (z, y, x)
+        wsum = np.zeros(shape, dtype=np.float32)
+        swsum = np.zeros(shape, dtype=np.float32)
+        for sdf, cov, t_np in zip(sdfs, covs, dirs):
+            if t_np is None:
+                align = np.zeros(shape, dtype=np.float32)
+            else:
+                dot = (n_hat[0] * t_np[0]
+                       + n_hat[1] * t_np[1]
+                       + n_hat[2] * t_np[2])
+                align = np.abs(dot).astype(np.float32)
+            # Where the normal is undefined (flat field, deep in/outside) fall
+            # back to equal weight; the sign of the SDF is unambiguous there.
+            w = np.where(have_normal,
+                         np.maximum(1.0 - align, w_floor),
+                         1.0).astype(np.float32)
+            if cov is not None:
+                w = w * cov
+            wsum += w
+            swsum += w * sdf
+        wsafe = np.where(wsum > 0, wsum, 1.0).astype(np.float32)
+        fused_sdf = swsum / wsafe
+        fused = (fused_sdf >= 0) & covered & (wsum > 0)
+        return fused, covered
+
     def _fuse_series_results(self):
         """Direction-weighted SDF fusion of the collected per-series masks
         (output grid) into one smooth uint8 mask on the output grid, or None if
@@ -2268,6 +2407,39 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             baseline = self.get_segment_data(output_volume)
         if baseline is not None and tuple(np.asarray(baseline).shape) != tuple(out_shape):
             baseline = None
+        if self._get_directional_fusion_enabled():
+            items = []
+            for vid, m in list(self._fusion_results.items()):
+                node = slicer.mrmlScene.GetNodeByID(vid)
+                if node is None:
+                    print("[DEBUG fusion.fuse] drop id={} (node deleted)".format(vid))
+                    del self._fusion_results[vid]
+                    continue
+                if m is None or tuple(m.shape) != tuple(out_shape) or not m.any():
+                    continue
+                t_np = self._series_through_plane_np_dir(node)
+                cov = self._series_coverage_mask(vid)
+                items.append((m.astype(bool), t_np, cov))
+                print("[DEBUG fusion.dir] id={} name='{}' t_np(z,y,x)={}".format(
+                    vid, node.GetName(),
+                    None if t_np is None else
+                    [round(float(c), 3) for c in t_np]))
+            res = self._directional_weighted_sdf(items, out_shape, samp)
+            if res is None:
+                print("[DEBUG fusion.dir] SKIP: no usable masks (directional)")
+                return None
+            fused_bool, covered = res
+            kept = 0
+            if baseline is not None:
+                base_bool = np.asarray(baseline).astype(bool)
+                uncovered_keep = base_bool & ~covered
+                kept = int(uncovered_keep.sum())
+                fused_bool = fused_bool | uncovered_keep
+            fused = fused_bool.astype(np.uint8)
+            print("[DEBUG fusion.dir] directional fuse: series={}, uncovered "
+                  "kept from segment={}, fused voxels={}".format(
+                      len(items), kept, int(fused.sum())))
+            return fused
         sdf_sum = np.zeros(out_shape, dtype=np.float32)
         # Per-voxel vote count: how many series' FOV cover each voxel. A series
         # contributes its SDF only inside its own coverage, so a region imaged by
@@ -2581,6 +2753,35 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         spacing = output_volume.GetSpacing()  # (x, y, z) mm
         samp = (spacing[2], spacing[1], spacing[0])  # numpy (z, y, x)
         sub_shape = (z1 - z0, y1 - y0, x1 - x0)
+        if self._get_directional_fusion_enabled():
+            items = []
+            for series, m in valid:
+                if m is None or tuple(np.asarray(m).shape) != tuple(out_shape):
+                    continue
+                mb = np.asarray(m)[z0:z1, y0:y1, x0:x1].astype(bool)
+                if not mb.any():
+                    continue
+                t_np = self._series_through_plane_np_dir(series)
+                cov = self._get_series_valid_region(series, output_volume)
+                covc = (None if cov is None
+                        else np.asarray(cov)[z0:z1, y0:y1, x0:x1])
+                items.append((mb, t_np, covc))
+            res = self._directional_weighted_sdf(items, sub_shape, samp)
+            if res is None:
+                print("[DEBUG fuse3] directional fuse: no usable masks in ROI")
+                return None
+            fused_sub_bool, _covered = res
+            fused_sub = fused_sub_bool.astype(np.uint8)
+            baseline = self.get_segment_data(output_volume)
+            if (baseline is None
+                    or tuple(np.asarray(baseline).shape) != tuple(out_shape)):
+                final = np.zeros(out_shape, dtype=np.uint8)
+            else:
+                final = np.asarray(baseline).astype(np.uint8).copy()
+            final[z0:z1, y0:y1, x0:x1] = fused_sub
+            print("[DEBUG fuse3] directional fused {} series in ROI {} -> "
+                  "voxels={}".format(len(items), roi_box, int(final.sum())))
+            return final
         sdf_sum = np.zeros(sub_shape, dtype=np.float32)
         cnt = np.zeros(sub_shape, dtype=np.uint8)
         n = 0
@@ -3624,6 +3825,18 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             return False
         return self.ui.cbAllSeriesFusion.isChecked()
 
+    def _get_directional_fusion_enabled(self):
+        """Read the persisted directional-fusion preference. Default True so
+        each series only governs the fused boundary along its own sharp plane.
+        Off falls back to the legacy anisotropic-blur + equal-weight SDF mean."""
+        return self._get_qsetting(SETTING_DIRECTIONAL_FUSION, True, cast=bool)
+
+    def _on_directional_fusion_toggled(self, checked):
+        """Persist the directional-fusion preference. The next Fuse / all-series
+        fusion reads _get_directional_fusion_enabled() to pick the algorithm."""
+        print("[DEBUG fusion.dir] toggled -> {}".format(bool(checked)))
+        self._set_qsetting(SETTING_DIRECTIONAL_FUSION, bool(checked))
+
     @staticmethod
     def _last_control_point_ras(caller):
         """World RAS of the markup's most recently placed control point, or None."""
@@ -4064,6 +4277,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.cbAllSeriesFusion.setChecked(self._get_allseries_fusion_enabled())
         self.ui.cbAllSeriesFusion.blockSignals(blocked)
         self.ui.cbAllSeriesFusion.setEnabled(self._triplanar_mode)
+        # Directional fusion (normal-aligned equal weight). Applies to every SDF
+        # fusion (manual Fuse, all-series fusion, three-series ROI). Restored
+        # with signals blocked so it does not run anything at startup.
+        self.ui.cbDirectionalFusion.toggled.connect(
+            self._on_directional_fusion_toggled
+        )
+        blocked = self.ui.cbDirectionalFusion.blockSignals(True)
+        self.ui.cbDirectionalFusion.setChecked(
+            self._get_directional_fusion_enabled()
+        )
+        self.ui.cbDirectionalFusion.blockSignals(blocked)
         # Lazy start: the checkbox is restored CHECKED without firing the toggle,
         # so the planes are built later by _ensure_triplanar_slice_frames when
         # the user applies their series (see _apply_plane_display_volumes).
