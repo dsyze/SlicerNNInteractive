@@ -316,7 +316,9 @@
 
 ### 14.5 配套
 
-- 3D 定位面（半透明矩形标出各序列切片范围）+ 显隐切换按钮 + 交互后相机自动旋转（见第四节）。
+- **3D 定位面**：半透明矩形标出各序列切片范围（`TRIPLANAR_FRAME_NODE_NAMES`），不透明度由 `sldPlaneOpacity` 滑块调（`SETTING_PLANE_OPACITY`），可逐视图显隐（`SETTING_TRIPLANAR_FRAME_VISIBLE_PREFIX` + 红/黄/绿三个 R/Y/G 切换）。
+- **显示分割 3D 闭合曲面**（`cbShow3DTriPlanar`，`SETTING_SHOW_3D_TRIPLANAR`）：开启后每次交互在 3D 视图重建并显示当前段的封闭曲面。重建是**防抖**的（`_schedule_triplanar_3d_surface` → `QTimer.singleShot(TRIPLANAR_3D_SURFACE_DEBOUNCE_MS=600ms)` + 自增 token 去重）——一连串快速交互只在用户停手后跑**一次**（重的 marching-cubes），避免每点一下都卡顿；若显示平滑开启则把平滑因子并入曲面转换参数。
+- **交互后相机自动旋转**到激活序列采集平面（见第四节）。
 - 此模式下**旁路多视图套索累积**（各视图本就是不同序列，逐视图即时路由提交即可）。
 
 ### 14.6 全序列融合（按提示自动融合，子开关 `cbAllSeriesFusion`，默认开）
