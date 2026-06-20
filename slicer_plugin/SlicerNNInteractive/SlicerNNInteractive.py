@@ -1,6 +1,7 @@
 import io
 import os
 import gzip
+import json
 import math
 import requests
 import copy
@@ -217,7 +218,7 @@ def ensure_synched(func):
 
     def inner(self, *args, **kwargs):
         if getattr(self, "_alignment_in_progress", False):
-            slicer.util.showStatusMessage(
+            _status(
                 "Series registration in progress; prompt was not sent.", 4000
             )
             return
@@ -251,11 +252,70 @@ def ensure_synched(func):
         if not failed_to_sync:
             return func(self, *args, **kwargs)
 
-        slicer.util.showStatusMessage(
+        _status(
             "Sync to server failed; prompt was not sent.", 4000
         )
 
     return inner
+
+
+###############################################################################
+# Chinese localization helpers
+###############################################################################
+#
+# UI strings live in the .ui file (XML, may be non-ASCII) and, for strings built
+# at runtime in this module, in Resources/Strings/zh_CN.json. This .py file is
+# kept ASCII-only on purpose: CI (check-utf8.yml) fails on any non-ASCII byte in
+# .py source, so the Chinese text is stored in the (unchecked) JSON resource and
+# looked up here by its English source string.
+
+
+_I18N_TABLE = None
+
+
+def _cn(text):
+    """Translate a user-facing English string to Chinese via the external
+    Resources/Strings/zh_CN.json table. Returns the original text unchanged when
+    the table is missing or has no matching entry, so the plugin keeps working
+    (in English) even if the resource is absent."""
+    global _I18N_TABLE
+    if _I18N_TABLE is None:
+        table = {}
+        try:
+            path = os.path.join(
+                os.path.dirname(__file__), "Resources", "Strings", "zh_CN.json")
+            with open(path, "r", encoding="utf-8") as handle:
+                table = json.load(handle)
+        except Exception:  # noqa: BLE001 - localization must never break the app
+            table = {}
+        _I18N_TABLE = table
+    if not isinstance(text, str):
+        return text
+    return _I18N_TABLE.get(text, text)
+
+
+def _status(message, *args, **kwargs):
+    """Localized wrapper around slicer.util.showStatusMessage."""
+    show = slicer.util.showStatusMessage
+    show(_cn(message), *args, **kwargs)
+
+
+def _mb_warning(parent, title, text, *args, **kwargs):
+    """Localized wrapper around QMessageBox.warning."""
+    fn = QMessageBox.warning
+    return fn(parent, _cn(title), _cn(text), *args, **kwargs)
+
+
+def _mb_critical(parent, title, text, *args, **kwargs):
+    """Localized wrapper around QMessageBox.critical."""
+    fn = QMessageBox.critical
+    return fn(parent, _cn(title), _cn(text), *args, **kwargs)
+
+
+def _mb_information(parent, title, text, *args, **kwargs):
+    """Localized wrapper around QMessageBox.information."""
+    fn = QMessageBox.information
+    return fn(parent, _cn(title), _cn(text), *args, **kwargs)
 
 
 ###############################################################################
@@ -273,13 +333,12 @@ class SlicerNNInteractive(ScriptedLoadableModule):
         ]
         self.parent.dependencies = []  # List other modules if needed
         self.parent.contributors = ["Coen de Vente", "Kiran Vaidhya Venkadesh", "Bram van Ginneken", "Clara I. Sanchez"]
-        self.parent.helpText = """
-            This is an 3D Slicer extension for using nnInteractive.
-
-            Build: %s
-
-            Read more about this plugin here: https://github.com/coendevente/SlicerNNInteractive.
-            """ % PLUGIN_VERSION
+        self.parent.helpText = _cn(
+            "This is a 3D Slicer extension for using nnInteractive.\n\n"
+            "Build: %s\n\n"
+            "Read more about this plugin here: "
+            "https://github.com/coendevente/SlicerNNInteractive."
+        ) % PLUGIN_VERSION
         self.parent.acknowledgementText = """When using SlicerNNInteractive, please cite as described here: https://github.com/coendevente/SlicerNNInteractive?tab=readme-ov-file#citation."""
 
 
@@ -818,11 +877,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._set_qsetting(SETTING_SNAP_SLICES, bool(checked))
         self._refresh_slice_snap()
         if checked:
-            slicer.util.showStatusMessage(
+            _status(
                 "Slice scrolling now snaps to the original voxel grid.", 4000
             )
         else:
-            slicer.util.showStatusMessage(
+            _status(
                 "Slice scrolling restored to Slicer default.", 4000
             )
 
@@ -986,7 +1045,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         source_volume = self.get_volume_node()
         if source_volume is None:
             if show_status:
-                slicer.util.showStatusMessage(
+                _status(
                     "Load a source volume before configuring slice-view volumes.",
                     4000,
                 )
@@ -1011,8 +1070,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         if missing_views:
             if show_status:
-                slicer.util.showStatusMessage(
-                    "Slice views unavailable: " + ", ".join(missing_views),
+                _status(
+                    _cn("Slice views unavailable: ") + ", ".join(missing_views),
                     4000,
                 )
             return False
@@ -1025,7 +1084,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             _perf_log("[DEBUG triplanar.perf] apply: after align_views")
 
         if show_status:
-            slicer.util.showStatusMessage(
+            _status(
                 "Applied registered per-plane display volumes. "
                 "Segmentation source volume is unchanged.",
                 4000,
@@ -1121,7 +1180,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """Restore the Segment Editor source volume in all standard slice views."""
         source_volume = self.get_volume_node()
         if source_volume is None:
-            slicer.util.showStatusMessage(
+            _status(
                 "Load a source volume before resetting slice-view volumes.",
                 4000,
             )
@@ -1138,8 +1197,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             if not self._set_slice_view_background(slice_view_name, source_volume)
         ]
         if missing_views:
-            slicer.util.showStatusMessage(
-                "Slice views unavailable: " + ", ".join(missing_views),
+            _status(
+                _cn("Slice views unavailable: ") + ", ".join(missing_views),
                 4000,
             )
             return
@@ -1148,7 +1207,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if self._get_snap_slices_setting():
             self._align_views_to_volume_planes()
 
-        slicer.util.showStatusMessage(
+        _status(
             "Restored the Segment Editor source volume in all slice views.",
             4000,
         )
@@ -1254,7 +1313,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             return source_volume
         node = self._ensure_output_geometry_node(source_volume)
         if node is None:
-            slicer.util.showStatusMessage(
+            _status(
                 "Could not build the high-resolution output grid; "
                 "using the source grid.",
                 4000,
@@ -1496,8 +1555,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                   [round(e, 1) for e in extents], round(iso, 3),
                   tuple(new_dims), total))
         if total > TRIPLANAR_MAX_OUTPUT_VOXELS:
-            slicer.util.showStatusMessage(
-                "Tri-planar output grid coarsened to %.2f mm to fit the budget."
+            _status(
+                _cn("Tri-planar output grid coarsened to %.2f mm to fit the budget.")
                 % iso, 5000)
         return node
 
@@ -1520,14 +1579,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             iso = iso * factor
             new_dims = voxel_dims(iso)
             total = new_dims[0] * new_dims[1] * new_dims[2]
-            slicer.util.showStatusMessage(
-                "Output spacing coarsened to %.2f mm to fit the memory budget."
+            _status(
+                _cn("Output spacing coarsened to %.2f mm to fit the memory budget.")
                 % iso,
                 5000,
             )
         elif total > OUTPUT_GEOMETRY_SOFT_VOXEL_BUDGET:
-            slicer.util.showStatusMessage(
-                "High-resolution output grid is large: %d x %d x %d voxels."
+            _status(
+                _cn("High-resolution output grid is large: %d x %d x %d voxels.")
                 % (new_dims[0], new_dims[1], new_dims[2]),
                 5000,
             )
@@ -1589,7 +1648,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         n = len(self._fusion_results)
         self.ui.pbFuseSeries.setVisible(fusion_on)
         self.ui.pbFuseSeries.setEnabled(fusion_on and n >= 1)
-        self.ui.pbFuseSeries.setText("Fuse & apply ({})".format(n))
+        self.ui.pbFuseSeries.setText(_cn("Fuse & apply ({})").format(n))
 
     def _clear_inference_cache(self):
         """Drop the inference preview and force the next prompt to re-upload."""
@@ -1616,10 +1675,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if not hasattr(self, "ui"):
             return
         label = self.ui.lblRegistrationStatus
-        label.setText(text)
+        label.setText(_cn(text))
         label.setStyleSheet("color: #c0392b;" if warn else "")
         if text:
-            slicer.util.showStatusMessage(text, 5000)
+            _status(text, 5000)
 
     def _frame_of_reference_uid(self, volume_node):
         """
@@ -1906,7 +1965,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self._alignment_in_progress = False
             self._alignment_pending = None
             self._set_registration_status(
-                "Could not start registration: %s" % exc, True
+                _cn("Could not start registration: %s") % exc, True
             )
             self._refresh_native_series_inference_ui()
             return
@@ -1961,17 +2020,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 self._alignment_transforms[(moving_id, fixed_id)] = transform
                 self._enable_slice_intersections()
                 self._set_registration_status(
-                    "Registered the supplemental series to the source volume "
+                    _cn("Registered the supplemental series to the source volume "
                     "(translation %.1f mm, rotation %.1f deg). Verify alignment "
-                    "with slice intersections." % (offset, rotation),
+                    "with slice intersections.") % (offset, rotation),
                     offset > REGISTRATION_OFFSET_WARN_MM,
                 )
         else:
             if transform is not None and slicer.mrmlScene.IsNodePresent(transform):
                 slicer.mrmlScene.RemoveNode(transform)
             self._set_registration_status(
-                "Registration failed (%s). The supplemental series is NOT "
-                "aligned; results may be misplaced." % status,
+                _cn("Registration failed (%s). The supplemental series is NOT "
+                "aligned; results may be misplaced.") % status,
                 True,
             )
         # Any outcome (attach, near-identity discard, or failure) can change the
@@ -2227,7 +2286,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             output_volume,
         )
         self._refresh_native_series_inference_ui()
-        slicer.util.showStatusMessage(
+        _status(
             "Supplemental-series result updated as a preview. "
             "Sync it to the source volume when ready.",
             4000,
@@ -2255,14 +2314,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             return
         result = self.upload_segment_to_server()
         if result is None:
-            QMessageBox.warning(
+            _mb_warning(
                 slicer.util.mainWindow(),
                 "Native-series inference",
                 "The preview was cleared locally, but restoring the source "
                 "mask on the server failed.",
             )
             return
-        slicer.util.showStatusMessage(
+        _status(
             "Supplemental-series preview cleared; source mask restored on server.",
             4000,
         )
@@ -2719,7 +2778,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         fused = self._fuse_series_results()
         if fused is None:
             print("[DEBUG fusion.apply] RETURN: nothing to fuse")
-            slicer.util.showStatusMessage(
+            _status(
                 "Collect at least one series result first (run a prompt with "
                 "Fuse enabled).",
                 4000,
@@ -2729,7 +2788,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         pre = self.get_segment_data(self.get_output_volume_node())
         if pre is None:
             print("[DEBUG fusion.apply] RETURN: segment data unavailable")
-            slicer.util.showStatusMessage(
+            _status(
                 "Could not read the current segment; fuse was not applied.",
                 4000,
             )
@@ -2746,7 +2805,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._refresh_native_series_inference_ui()
         self.upload_segment_to_server()
         print("[DEBUG fusion.apply] applied; segment written and uploaded")
-        slicer.util.showStatusMessage("Fused series result applied.", 3000)
+        _status("Fused series result applied.", 3000)
 
     def _on_series_fusion_toggled(self, checked):
         self._fusion_results = {}
@@ -3064,7 +3123,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             if getattr(self.ui, sel).currentNode() is None
         ]
         if missing:
-            QMessageBox.warning(
+            _mb_warning(
                 slicer.util.mainWindow(),
                 "Three-series fusion",
                 "Assign a series to each of the Red/Yellow/Green views in the "
@@ -3074,7 +3133,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # 2) Require a lasso (live or last-submitted).
         lasso = self._get_active_lasso()
         if lasso is None:
-            QMessageBox.warning(
+            _mb_warning(
                 slicer.util.mainWindow(),
                 "Three-series fusion",
                 "Draw a region with the lasso (shortcut L) first.",
@@ -3087,7 +3146,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self.ui.cbTriPlanarMode.setChecked(True)
         output_volume = self.get_output_volume_node()
         if output_volume is None or self._output_grid_shape() is None:
-            QMessageBox.warning(
+            _mb_warning(
                 slicer.util.mainWindow(),
                 "Three-series fusion",
                 "Could not prepare the high-resolution output grid. Make sure "
@@ -3098,7 +3157,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         mn, mx = self._get_lasso_roi_world(lasso, FUSE3_ROI_MARGIN_MM)
         roi_box = self._ras_box_to_output_index_box(mn, mx)
         if roi_box is None:
-            QMessageBox.warning(
+            _mb_warning(
                 slicer.util.mainWindow(),
                 "Three-series fusion",
                 "Could not map the lasso ROI onto the output grid.",
@@ -3160,7 +3219,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self._active_inference_volume_override = None
         # 7) Need at least two contributing series to fuse.
         if len(valid) < 2:
-            QMessageBox.warning(
+            _mb_warning(
                 slicer.util.mainWindow(),
                 "Three-series fusion",
                 "Fewer than 2 series produced a result; fusion aborted.",
@@ -3169,7 +3228,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # 8) Fuse inside the ROI, apply (undoable), sync, build the 3D model.
         final = self._fuse_masks_in_roi(valid, roi_box, output_volume)
         if final is None:
-            QMessageBox.warning(
+            _mb_warning(
                 slicer.util.mainWindow(),
                 "Three-series fusion",
                 "Fusion produced no result.",
@@ -3188,8 +3247,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._fusion_results = {}
         self.upload_segment_to_server()
         self._export_to_vr(seg_id, smoothing=0.5)
-        slicer.util.showStatusMessage(
-            "Fused {} series and exported a 3D model.".format(len(valid)), 4000
+        _status(
+            _cn("Fused {} series and exported a 3D model.").format(len(valid)), 4000
         )
         print("[DEBUG fuse3] done; fused {} series".format(len(valid)))
 
@@ -3881,7 +3940,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             checked = self._get_frame_visible(view_name)
             button.setChecked(checked)
             button.setToolTip(
-                "Show/hide the %s locator plane in 3D" % view_name)
+                _cn("Show/hide the %s locator plane in 3D") % view_name)
             self._style_frame_button(button, view_name, checked)
             button.toggled.connect(
                 lambda state, v=view_name: self._on_frame_button_toggled(
@@ -3963,7 +4022,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if len(distinct_ids) < 2:
             print("[DEBUG triplanar.setup] WARN: fewer than 2 distinct series in views")
             self._disable_triplanar_slice_frames()
-            slicer.util.showStatusMessage(
+            _status(
                 "Tri-planar mode: assign your series to the Red/Yellow/Green views "
                 "in the Multi-plane display panel (and Apply) first.", 6000
             )
@@ -3976,8 +4035,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Show any existing segmentation in 3D now that we are tri-planar.
         if self._get_show_3d_triplanar():
             self._schedule_triplanar_3d_surface()
-        slicer.util.showStatusMessage(
-            "Tri-planar mode on: " + ", ".join(
+        _status(
+            _cn("Tri-planar mode on: ") + ", ".join(
                 "{}={}".format(v, n) for v, n in view_series.items()), 5000
         )
         return True
@@ -4149,7 +4208,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         prompt types, fired automatically per prompt."""
         series_list = self._triplanar_coverage_volumes()
         if len(series_list) < 2:
-            QMessageBox.warning(
+            _mb_warning(
                 slicer.util.mainWindow(),
                 "All-series fusion",
                 "At least 2 valid series are required (assign distinct series to "
@@ -4163,8 +4222,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         valid = []
         try:
             for i, series in enumerate(series_list):
-                slicer.util.showStatusMessage(
-                    "All-series fusion: processing series {}/{} ('{}')...".format(
+                _status(
+                    _cn("All-series fusion: processing series {}/{} ('{}')...").format(
                         i + 1, n, series.GetName()), 0
                 )
                 slicer.app.processEvents()
@@ -4184,7 +4243,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if len(valid) < 2:
             print("[DEBUG allseries] only {} series produced a result; "
                   "falling back to per-view routing".format(len(valid)))
-            slicer.util.showStatusMessage(
+            _status(
                 "All-series fusion: fewer than 2 series produced a result; "
                 "using per-view routing instead.", 4000
             )
@@ -4210,8 +4269,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._fusion_results = {}
         self.upload_segment_to_server()
         print("[DEBUG allseries] applied fusion of {} series".format(len(valid)))
-        slicer.util.showStatusMessage(
-            "All-series fusion: fused {} series.".format(len(valid)), 3000
+        _status(
+            _cn("All-series fusion: fused {} series.").format(len(valid)), 3000
         )
         return True
 
@@ -4375,14 +4434,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def on_sync_inference_result_clicked(self, checked=False):
         """Merge the current supplemental-series preview into the source segment."""
         if self._inference_result_source_mask is None:
-            QMessageBox.warning(
+            _mb_warning(
                 slicer.util.mainWindow(),
                 "Native-series inference",
                 "Run at least one prompt on the supplemental series first.",
             )
             return
         if self.get_current_segment_id() != self._inference_preview_target_segment_id:
-            QMessageBox.warning(
+            _mb_warning(
                 slicer.util.mainWindow(),
                 "Native-series inference",
                 "The selected source segment changed after the preview was "
@@ -4394,7 +4453,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             source_volume is None
             or source_volume.GetID() != self._inference_preview_source_volume_id
         ):
-            QMessageBox.warning(
+            _mb_warning(
                 slicer.util.mainWindow(),
                 "Native-series inference",
                 "The source volume changed after the preview was created. "
@@ -4411,14 +4470,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._destroy_inference_preview()
         result = self.upload_segment_to_server()
         if result is None:
-            QMessageBox.warning(
+            _mb_warning(
                 slicer.util.mainWindow(),
                 "Native-series inference",
                 "The preview was merged locally, but syncing the merged mask "
                 "to the server failed.",
             )
             return
-        slicer.util.showStatusMessage(
+        _status(
             "Supplemental-series preview merged into the source segment.", 4000
         )
 
@@ -5184,7 +5243,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             n = caller.GetNumberOfControlPoints()
             if n > 0:
                 caller.RemoveNthControlPoint(n - 1)
-            slicer.util.showStatusMessage(
+            _status(
                 "Series registration in progress; point was not sent.", 4000
             )
             return
@@ -5250,7 +5309,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             # two-corner state so the next placement starts cleanly.
             caller.RemoveAllControlPoints()
             self.prev_caller = None
-            slicer.util.showStatusMessage(
+            _status(
                 "Series registration in progress; box was not sent.", 4000
             )
             return
@@ -5415,7 +5474,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         print("[DEBUG submit_lasso] xyzs count:", len(xyzs))
 
         if len(xyzs) < 3:
-            slicer.util.showStatusMessage("Lasso needs at least 3 points.", 4000)
+            _status("Lasso needs at least 3 points.", 4000)
             print("[DEBUG submit_lasso] RETURN: fewer than 3 points")
             self._active_inference_volume_override = None
             return
@@ -5430,7 +5489,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             print("[DEBUG submit_lasso] mask ok, sum={}".format(mask.sum()))
         except ValueError as e:
             print("[DEBUG submit_lasso] RETURN: ValueError:", e)
-            slicer.util.showStatusMessage(
+            _status(
                 "Lasso must be drawn on a slice aligned with the "
                 "segmentation/inference volume; cleared.",
                 4000,
@@ -5442,7 +5501,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         volume_node = self.get_volume_node()
         if not volume_node:
-            slicer.util.showStatusMessage("No source volume selected.", 4000)
+            _status("No source volume selected.", 4000)
             print("[DEBUG submit_lasso] RETURN: no volume node")
             self._active_inference_volume_override = None
             return
@@ -5455,9 +5514,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             # Disable slice-range clip; multi-view spans multiple planes.
             self._last_lasso_slice = None
             self._update_multiview_lasso_ui()
-            slicer.util.showStatusMessage(
-                "Multi-view lasso: {} view(s) accumulated. "
-                "Click Submit to run.".format(self._multiview_lasso_count),
+            _status(
+                _cn("Multi-view lasso: {} view(s) accumulated. "
+                "Click Submit to run.").format(self._multiview_lasso_count),
                 3000,
             )
 
@@ -5620,7 +5679,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             # Nothing will be shown, so the marker would otherwise leak into
             # the next prompt's result.
             self._last_lasso_slice = None
-            slicer.util.showStatusMessage(
+            _status(
                 "Lasso/scribble produced an empty mask; nothing to send.", 4000
             )
             return
@@ -5659,7 +5718,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                     f"lasso_or_scribble_prompt upload failed with status code: {seg_response.status_code}"
                 )
                 self._last_lasso_slice = None
-                slicer.util.showStatusMessage(
+                _status(
                     f"Server rejected {tp} prompt (status "
                     f"{seg_response.status_code}).",
                     4000,
@@ -5667,7 +5726,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         except Exception as e:
             debug_print(f"Error in lasso_or_scribble_prompt: {e}")
             self._last_lasso_slice = None
-            slicer.util.showStatusMessage(
+            _status(
                 f"Failed to send {tp} prompt: {e}", 4000
             )
 
@@ -6240,11 +6299,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         seg_node = self._existing_segmentation_node()
         segment_id = self.get_current_segment_id()
         if seg_node is None or not segment_id:
-            slicer.util.showStatusMessage("No segment selected to bake.", 4000)
+            _status("No segment selected to bake.", 4000)
             return
         output_volume = self.get_output_volume_node()
         if output_volume is None:
-            slicer.util.showStatusMessage("No output volume available.", 4000)
+            _status("No output volume available.", 4000)
             return
 
         original = None
@@ -6289,7 +6348,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                     )
                 except Exception:
                     pass
-            slicer.util.showStatusMessage(
+            _status(
                 "Bake failed; the original segment was restored.", 5000
             )
             return
@@ -6304,7 +6363,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._clear_display_smoothing()
         self._refresh_display_smooth_ui()
         self.upload_segment_to_server()
-        slicer.util.showStatusMessage(
+        _status(
             "Smoothed surface baked into the segment.", 4000
         )
 
@@ -6354,7 +6413,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._update_multiview_lasso_ui()
         inference_volume = self.get_inference_volume_node()
         if inference_volume is None:
-            slicer.util.showStatusMessage("No inference volume available.", 4000)
+            _status("No inference volume available.", 4000)
             return
         # Send each plane as its own lasso interaction; the server session
         # accumulates them so the result is constrained by all views.
@@ -6372,7 +6431,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._clear_multiview_lasso_nodes()
         self._reset_active_lasso_node()
         self._update_multiview_lasso_ui()
-        slicer.util.showStatusMessage(
+        _status(
             "Multi-view lasso accumulation cleared.", 2000
         )
 
@@ -6384,7 +6443,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.pbLassoMultiViewSubmit.setEnabled(bool(has_mask))
         self.ui.pbLassoMultiViewClear.setEnabled(bool(has_mask))
         count = len(self._multiview_lasso_masks)
-        self.ui.pbLassoMultiViewSubmit.setText("Submit ({})".format(count))
+        self.ui.pbLassoMultiViewSubmit.setText(_cn("Submit ({})").format(count))
 
     def _clear_multiview_lasso_nodes(self):
         for node in self._multiview_lasso_nodes:
@@ -6441,7 +6500,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self.ui.cbEnableHighResOutput.setChecked(False)
             self.ui.cbEnableHighResOutput.blockSignals(blocked)
         self._set_qsetting(SETTING_HIGH_RES_ENABLED, False)
-        slicer.util.showStatusMessage(reason, 6000)
+        _status(reason, 6000)
         print("[nni] high-resolution output disabled: %s" % reason)
 
     def _rebuild_output_geometry_and_migrate(self):
@@ -6522,7 +6581,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self.ui.cbSmoothInterpolate.setChecked(False)
             self.ui.cbSmoothInterpolate.blockSignals(blocked)
             self._set_qsetting(SETTING_SMOOTH_INTERPOLATE_ENABLED, False)
-            slicer.util.showStatusMessage(
+            _status(
                 "Smoothing disabled (needs high-resolution output).", 4000
             )
         self._rebuild_output_geometry_and_migrate()
@@ -6542,7 +6601,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._rebuild_output_geometry_and_migrate()
         _perf_log("[DEBUG triplanar.perf] enable_high_res: after rebuild")
         self._refresh_native_series_inference_ui()
-        slicer.util.showStatusMessage(
+        _status(
             "High-resolution output enabled for smoothing.", 4000
         )
 
@@ -6562,11 +6621,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         source_volume = self.get_volume_node()
         if source_volume is None:
-            slicer.util.showStatusMessage("No source volume selected.", 4000)
+            _status("No source volume selected.", 4000)
             return
         self._enable_high_res_for_smoothing()
         if not self._output_geometry_active():
-            slicer.util.showStatusMessage(
+            _status(
                 "Could not enable high-resolution output for smoothing.", 4000
             )
             return
@@ -6575,16 +6634,16 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # then interpolates smoothly through-plane onto the fine output grid.
         coarse = self.get_segment_data(reference_volume_node=source_volume)
         if coarse is None or int(coarse.sum()) == 0:
-            slicer.util.showStatusMessage(
+            _status(
                 "Current segment is empty; nothing to smooth.", 4000
             )
             return
         smoothed = self._interpolate_mask_to_output_grid(coarse, source_volume)
         if smoothed is None:
-            slicer.util.showStatusMessage("Smoothing failed.", 4000)
+            _status("Smoothing failed.", 4000)
             return
         self.show_segmentation(smoothed)
-        slicer.util.showStatusMessage("Current segment smoothed.", 3000)
+        _status("Current segment smoothed.", 3000)
 
     def _on_output_spacing_changed(self, value):
         """Persist the output spacing and, if enabled, rebuild the output grid."""
@@ -6738,7 +6797,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         target_id = self.get_current_segment_id()
         if not target_id:
-            QMessageBox.warning(
+            _mb_warning(
                 slicer.util.mainWindow(),
                 "Selection Operations",
                 "Please select a target segment first.",
@@ -6749,7 +6808,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         source = self.ui.cbOperandSource.currentIndex
         if source == OPERAND_SOURCE_ROI:
             if not self._is_selection_roi_valid():
-                QMessageBox.warning(
+                _mb_warning(
                     slicer.util.mainWindow(),
                     "Selection Operations",
                     "Click 'Place / Show ROI' to position an ROI before applying.",
@@ -6758,7 +6817,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             operand_mask = self.roi_node_to_mask(self._sel_op_roi_node)
         elif source == OPERAND_SOURCE_WAND:
             if not self._is_selection_wand_seed_valid():
-                QMessageBox.warning(
+                _mb_warning(
                     slicer.util.mainWindow(),
                     "Selection Operations",
                     "Click 'Add Seed' and place a seed before applying.",
@@ -6766,7 +6825,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 return
             operand_mask = self._compute_magic_wand_mask()
             if operand_mask is None:
-                QMessageBox.warning(
+                _mb_warning(
                     slicer.util.mainWindow(),
                     "Selection Operations",
                     "Magic wand failed (no positive seed, server unreachable, "
@@ -6775,7 +6834,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 return
         elif source == OPERAND_SOURCE_LASSO3D:
             if not self._is_selection_lasso3d_valid():
-                QMessageBox.warning(
+                _mb_warning(
                     slicer.util.mainWindow(),
                     "Selection Operations",
                     "Draw a lasso region in the 3D view before applying.",
@@ -6783,7 +6842,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 return
             operand_mask = self._compute_lasso3d_mask()
             if operand_mask is None:
-                QMessageBox.warning(
+                _mb_warning(
                     slicer.util.mainWindow(),
                     "Selection Operations",
                     "Lasso (3D) failed (empty region, server unreachable, "
@@ -6793,7 +6852,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         else:
             operand_id = self.ui.cbSelectionOperand.currentData
             if not operand_id:
-                QMessageBox.warning(
+                _mb_warning(
                     slicer.util.mainWindow(),
                     "Selection Operations",
                     "No operand segment is available. Add another segment first.",
@@ -6801,7 +6860,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 return
 
             if operand_id == target_id:
-                QMessageBox.warning(
+                _mb_warning(
                     slicer.util.mainWindow(),
                     "Selection Operations",
                     "The operand segment must be different from the target segment.",
@@ -6811,7 +6870,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             operand_mask = self.segment_id_to_mask(operand_id)
 
         if operand_mask.sum() == 0:
-            slicer.util.showStatusMessage(
+            _status(
                 "Operand is empty; the operation may have no effect.", 3000
             )
 
@@ -6819,7 +6878,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         try:
             result_mask = self.apply_boolean_operation(operand_mask, operation)
         except ValueError as e:
-            QMessageBox.critical(
+            _mb_critical(
                 slicer.util.mainWindow(),
                 "Selection Operations",
                 f"Could not apply the operation:\n\n{e}",
@@ -6831,7 +6890,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # always populated for these programmatic edits.
         pre_state = self.get_segment_data()
         if pre_state is None:
-            slicer.util.showStatusMessage(
+            _status(
                 "Could not read the current segment; the operation was not "
                 "applied.",
                 4000,
@@ -6855,14 +6914,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         sync_result = self.upload_segment_to_server()
         if sync_result is None:
-            QMessageBox.warning(
+            _mb_warning(
                 slicer.util.mainWindow(),
                 "Selection Operations",
                 "The operation was applied locally, but syncing to the server "
                 "failed. You can retry with the 'Sync to server' button.",
             )
         else:
-            slicer.util.showStatusMessage(
+            _status(
                 "Selection operation applied and synced to server.", 3000
             )
 
@@ -6874,7 +6933,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if self.image_changed(do_prev_image_update=False):
             image_result = self.upload_image_to_server()
             if image_result is None:
-                QMessageBox.warning(
+                _mb_warning(
                     slicer.util.mainWindow(),
                     "Sync to server",
                     "Failed to sync the inference image to the server. Please "
@@ -6883,7 +6942,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 return
         result = self.upload_segment_to_server()
         if result is None:
-            QMessageBox.warning(
+            _mb_warning(
                 slicer.util.mainWindow(),
                 "Sync to server",
                 "Failed to sync the current segment to the server. Please check "
@@ -6894,7 +6953,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Keep previous_states in sync so the next prompt's @ensure_synched does
         # not re-upload the identical mask.
         self.previous_states["segment_data"] = self.get_segment_data()
-        slicer.util.showStatusMessage("Current segment synced to server.", 3000)
+        _status("Current segment synced to server.", 3000)
 
     def _install_selection_op_observers(self):
         """
@@ -7430,7 +7489,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """Create or show the operation ROI in the 3D view."""
         self._get_or_create_selection_roi()
         self._refresh_apply_enabled()
-        slicer.util.showStatusMessage(
+        _status(
             "Drag the ROI handles in the 3D view, then click Apply Operation.",
             5000,
         )
@@ -7444,11 +7503,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """Create or show the crop ROI, sized to the current segment."""
         _seg_node, seg_id = self.get_selected_segmentation_node_and_segment_id()
         if not seg_id:
-            slicer.util.showStatusMessage(
+            _status(
                 "Select a segment to crop first.", 3000)
             return
         self._get_or_create_crop_roi()
-        slicer.util.showStatusMessage(
+        _status(
             "Rotate the 3D view and drag the box to frame the region to KEEP, "
             "then click 'Crop Segment by Box'.", 6000)
 
@@ -7458,24 +7517,24 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         the Selection Operations Undo; synced to the server."""
         if self._crop_roi_node is None or not slicer.mrmlScene.IsNodePresent(
                 self._crop_roi_node):
-            slicer.util.showStatusMessage(
+            _status(
                 "Place the crop box first (Place Crop ROI).", 4000)
             return
         _seg_node, seg_id = self.get_selected_segmentation_node_and_segment_id()
         if not seg_id:
-            slicer.util.showStatusMessage(
+            _status(
                 "Select a segment to crop first.", 3000)
             return
         try:
             # Current segment on the canonical output grid.
             current = self.get_segment_data()
             if current is None:
-                slicer.util.showStatusMessage(
+                _status(
                     "Could not read the current segment; crop aborted.", 4000)
                 return
             current = current.astype(np.uint8)
             if current.sum() == 0:
-                slicer.util.showStatusMessage(
+                _status(
                     "The current segment is empty; nothing to crop.", 3000)
                 return
             # Box mask on the source grid, then bridge to the output grid (same
@@ -7490,18 +7549,18 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                     "grid.")
                 box_out = box_src.astype(np.uint8)
             if tuple(box_out.shape) != tuple(current.shape):
-                slicer.util.showStatusMessage(
+                _status(
                     "Crop box grid mismatch; crop aborted.", 4000)
                 return
             cropped = (current.astype(bool) & box_out.astype(bool)).astype(
                 np.uint8)
             if int(cropped.sum()) == int(current.sum()):
-                slicer.util.showStatusMessage(
+                _status(
                     "The box already contains the whole segment; nothing "
                     "removed.", 3000)
                 return
             if int(cropped.sum()) == 0:
-                slicer.util.showStatusMessage(
+                _status(
                     "The box does not overlap the segment; the segment was "
                     "cleared (use Undo to revert).", 5000)
             # Snapshot for our own Undo, write back, refresh 3D, sync.
@@ -7514,15 +7573,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 self._destroy_crop_roi()
             sync_result = self.upload_segment_to_server()
             if sync_result is None:
-                slicer.util.showStatusMessage(
+                _status(
                     "Cropped locally, but syncing to the server failed (use "
                     "'Sync to server').", 5000)
             else:
-                slicer.util.showStatusMessage("Segment cropped to box.", 3000)
+                _status("Segment cropped to box.", 3000)
         except Exception as exc:  # noqa: BLE001 - report and keep the UI alive
             print("[DEBUG crop] crop failed: {}".format(exc))
-            slicer.util.showStatusMessage(
-                "Crop failed: {}".format(exc), 5000)
+            _status(
+                _cn("Crop failed: {}").format(exc), 5000)
 
     # -- Draw Crop Region (closed curve in the 3D view) -----------------------
 
@@ -7637,12 +7696,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if checked:
             lm = slicer.app.layoutManager()
             if lm is None or lm.threeDViewCount == 0:
-                slicer.util.showStatusMessage(
+                _status(
                     "Draw Crop Region needs a layout with a 3D view.", 4000)
                 self.ui.pbDrawCropRegion.setChecked(False)
                 return
             if self.get_volume_node() is None:
-                slicer.util.showStatusMessage(
+                _status(
                     "Load a volume before drawing a crop region.", 4000)
                 self.ui.pbDrawCropRegion.setChecked(False)
                 return
@@ -7653,7 +7712,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 pass
             node = self._get_or_create_crop_region_curve()
             if node is None:
-                slicer.util.showStatusMessage(
+                _status(
                     "Could not create the crop-region curve.", 4000)
                 self.ui.pbDrawCropRegion.setChecked(False)
                 return
@@ -7674,7 +7733,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             selection_node.SetActivePlaceNodeID(node.GetID())
             interaction_node.SetPlaceModePersistence(1)
             interaction_node.SetCurrentInteractionMode(interaction_node.Place)
-            slicer.util.showStatusMessage(
+            _status(
                 "Left-click in the 3D view to place crop-region points; "
                 "double-click or right-click to close the loop (or click "
                 "'Draw Crop Region' again to finish).", 6000)
@@ -7690,7 +7749,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def on_cancel_drawing_crop_clicked(self, checked=False):
         """Discard the loop being drawn and leave drawing mode."""
         self._exit_crop_region_drawing()
-        slicer.util.showStatusMessage("Crop region drawing cancelled.", 2000)
+        _status("Crop region drawing cancelled.", 2000)
 
     def on_crop_region_point_modified(self, caller, event):
         """Show the Cancel button once points exist. The camera basis is NOT
@@ -7731,19 +7790,19 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self._crop_region_camera_basis = None
             self._set_crop_region_buttons_enabled(False)
             if n > 0:
-                slicer.util.showStatusMessage(
+                _status(
                     "A crop region needs at least 3 points.", 4000)
             return
         basis = self._capture_3d_camera_basis()
         if basis is None:
             self._crop_region_camera_basis = None
             self._set_crop_region_buttons_enabled(False)
-            slicer.util.showStatusMessage(
+            _status(
                 "No 3D view/camera available; cannot crop.", 4000)
             return
         self._crop_region_camera_basis = basis
         self._set_crop_region_buttons_enabled(True)
-        slicer.util.showStatusMessage(
+        _status(
             "Crop region ready. Click Crop Inside or Crop Outside.", 4000)
 
     def _exit_crop_region_drawing(self):
@@ -7977,40 +8036,40 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         n = node.GetNumberOfControlPoints() if node is not None else 0
         if (node is None or not slicer.mrmlScene.IsNodePresent(node) or n < 3
                 or self._crop_region_camera_basis is None):
-            slicer.util.showStatusMessage(
+            _status(
                 "Draw a crop region first (at least 3 points), then finish "
                 "drawing.", 4000)
             return
         _seg_node, seg_id = self.get_selected_segmentation_node_and_segment_id()
         if not seg_id:
-            slicer.util.showStatusMessage(
+            _status(
                 "Select a segment to crop first.", 3000)
             return
         try:
             current = self.get_segment_data()
             if current is None:
-                slicer.util.showStatusMessage(
+                _status(
                     "Could not read the current segment; crop aborted.", 4000)
                 return
             current = current.astype(np.uint8)
             if current.sum() == 0:
-                slicer.util.showStatusMessage(
+                _status(
                     "The current segment is empty; nothing to crop.", 3000)
                 return
             region = self._crop_region_to_mask(current.astype(bool))
             if region is None:
-                slicer.util.showStatusMessage(
+                _status(
                     "Crop region needs at least 3 points.", 4000)
                 return
             if tuple(region.shape) != tuple(current.shape):
-                slicer.util.showStatusMessage(
+                _status(
                     "Crop region grid mismatch; crop aborted.", 4000)
                 return
             cur_bool = current.astype(bool)
             overlap = cur_bool & region
             if not overlap.any():
                 # Inside would clear everything; Outside would change nothing.
-                slicer.util.showStatusMessage(
+                _status(
                     "The crop region does not cover any voxels; operation "
                     "cancelled.", 5000)
                 return
@@ -8020,7 +8079,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 cropped = cur_bool & ~region
             cropped = cropped.astype(np.uint8)
             if int(cropped.sum()) == int(current.sum()):
-                slicer.util.showStatusMessage(
+                _status(
                     "The crop region does not change the segment; nothing "
                     "removed.", 3000)
                 return
@@ -8034,28 +8093,28 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self._exit_crop_region_drawing()
             sync_result = self.upload_segment_to_server()
             if sync_result is None:
-                slicer.util.showStatusMessage(
+                _status(
                     "Cropped locally, but syncing to the server failed (use "
                     "'Sync to server').", 5000)
             else:
                 mode_text = "inside" if keep_inside else "outside"
-                slicer.util.showStatusMessage(
-                    "Segment cropped ({}).".format(mode_text), 3000)
+                _status(
+                    _cn("Segment cropped ({}).").format(mode_text), 3000)
         except Exception as exc:  # noqa: BLE001 - report and keep the UI alive
             print("[DEBUG crop_region] crop failed: {}".format(exc))
-            slicer.util.showStatusMessage(
-                "Crop failed: {}".format(exc), 5000)
+            _status(
+                _cn("Crop failed: {}").format(exc), 5000)
 
     def _on_roi_shape_changed(self, index):
         """Status-bar hint clarifying what each ROI shape means, plus preview refresh."""
         if index == ROI_SHAPE_SPHERE:
-            slicer.util.showStatusMessage(
+            _status(
                 "Sphere mode uses the inscribed sphere "
                 "(radius = min of the ROI's three half-extents).",
                 5000,
             )
         elif index == ROI_SHAPE_ELLIPSOID:
-            slicer.util.showStatusMessage(
+            _status(
                 "Ellipsoid mode uses the ellipsoid aligned with the ROI axes.",
                 5000,
             )
@@ -8301,7 +8360,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 headers={"Content-Encoding": "gzip"},
             )
             if restore_resp is None:
-                slicer.util.showStatusMessage(
+                _status(
                     "Magic wand could not restore server state; "
                     "the next prompt may resync automatically.",
                     4000,
@@ -8362,7 +8421,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         selection_node.SetActivePlaceNodeID(node.GetID())
         interaction_node.SetPlaceModePersistence(0)
         interaction_node.SetCurrentInteractionMode(interaction_node.Place)
-        slicer.util.showStatusMessage(status_msg, 5000)
+        _status(status_msg, 5000)
 
     def on_place_wand_seed_clicked(self, checked=False):
         """Add another magic wand seed (does NOT clear earlier seeds)."""
@@ -8483,7 +8542,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def on_preview_wand_clicked(self, checked=False):
         """Run a one-shot AI wand call and write the result into the preview."""
         if not self._is_selection_wand_seed_valid():
-            QMessageBox.warning(
+            _mb_warning(
                 slicer.util.mainWindow(),
                 "Selection Operations",
                 "Place a seed before previewing.",
@@ -8624,7 +8683,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 vtk.vtkCommand.AnyEvent, self._on_lasso3d_input_modified
             )
 
-        slicer.util.showStatusMessage(
+        _status(
             "Lasso (3D): drag a closed loop in the 3D view, then click Preview. "
             "Enable volume rendering or show a segment surface to aim at.",
             5000,
@@ -8682,7 +8741,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             return
 
         if self.get_volume_node() is None:
-            QMessageBox.warning(
+            _mb_warning(
                 slicer.util.mainWindow(),
                 "Selection Operations",
                 "Load a volume before drawing a lasso region.",
@@ -8817,7 +8876,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 headers={"Content-Encoding": "gzip"},
             )
             if restore_resp is None:
-                slicer.util.showStatusMessage(
+                _status(
                     "Lasso (3D) could not restore server state; "
                     "the next prompt may resync automatically.",
                     4000,
@@ -8864,7 +8923,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def on_preview_lasso3d_clicked(self, checked=False):
         """Run a one-shot lasso AI call and write the result into the preview."""
         if not self._is_selection_lasso3d_valid():
-            QMessageBox.warning(
+            _mb_warning(
                 slicer.util.mainWindow(),
                 "Selection Operations",
                 "Draw a lasso region in the 3D view before previewing.",
@@ -8921,7 +8980,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             return
         self._sel_op_undo_stack = []
         if reason:
-            slicer.util.showStatusMessage(reason, 4000)
+            _status(reason, 4000)
 
     def on_undo_selection_op_clicked(self, checked=False):
         """
@@ -8930,7 +8989,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         programmatic edits), then resync local state and server.
         """
         if not self._sel_op_undo_stack:
-            slicer.util.showStatusMessage(
+            _status(
                 "No Selection Operations Apply to undo.", 3000
             )
             return
@@ -8939,7 +8998,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         seg_node = self.get_segmentation_node()
         segmentation = seg_node.GetSegmentation() if seg_node is not None else None
         if segmentation is None or not segmentation.GetSegment(segment_id):
-            QMessageBox.warning(
+            _mb_warning(
                 slicer.util.mainWindow(),
                 "Selection Operations",
                 "The target segment of the previous Apply no longer exists.",
@@ -8948,7 +9007,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         expected_shape = self._output_grid_shape()
         if expected_shape is not None and tuple(shape) != tuple(expected_shape):
-            QMessageBox.warning(
+            _mb_warning(
                 slicer.util.mainWindow(),
                 "Selection Operations",
                 "The output grid has changed since this Apply; the snapshot "
@@ -8971,13 +9030,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         result = self.upload_segment_to_server()
         if result is None:
-            QMessageBox.warning(
+            _mb_warning(
                 slicer.util.mainWindow(),
                 "Selection Operations",
                 "The segment was reverted locally, but syncing to the server failed.",
             )
         else:
-            slicer.util.showStatusMessage("Selection Operation undone.", 3000)
+            _status("Selection Operation undone.", 3000)
 
     ###############################################################################
     # Server communication and sync functions
@@ -8997,7 +9056,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         server_text = self.ui.Server.text
         if not server_text.strip():
-            QMessageBox.warning(
+            _mb_warning(
                 slicer.util.mainWindow(),
                 "Test Connection",
                 "Please enter a server URL before testing the connection.",
@@ -9012,7 +9071,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             return
         self._test_server_in_progress = True
 
-        slicer.util.showStatusMessage("Testing nnInteractive server connection...", 2000)
+        _status("Testing nnInteractive server connection...", 2000)
         slicer.app.processEvents()
 
         response = None
@@ -9027,20 +9086,20 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             error_message = str(exc)
         finally:
             self._test_server_in_progress = False
-            slicer.util.showStatusMessage("")
+            _status("")
 
         if response is not None:
             info_message = (
                 f"Server at '{server_url}' is reachable."
             )
-            QMessageBox.information(
+            _mb_information(
                 slicer.util.mainWindow(),
                 "Test Connection",
                 info_message,
             )
             return
         else:
-            QMessageBox.critical(
+            _mb_critical(
                 slicer.util.mainWindow(),
                 "Test Connection",
                 f"Failed to reach '{server_url}'.\n\n{error_message}",

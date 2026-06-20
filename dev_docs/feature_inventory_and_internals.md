@@ -435,6 +435,32 @@
 | 高分辨率内存 | 大视野细间距网格内存消耗大；超预算自动粗化间距 |
 | 闭合曲线裁剪沿视线 | Draw Crop Region 按"绘制结束瞬间"的视线方向拉伸成无限棱柱；该方向冻结后旋转视角不改变结果。透视相机用近似投影，平行相机精确 |
 | 手动旋转仅单序列 | 手动旋转观察平面只对单序列有意义，三平面模式下禁用；滚轮逐层步进依赖 `Snap slices to voxel grid` 勾选（关掉则旋转后滚轮回到 Slicer 默认连续滚动）；非联动时以鼠标所在视图为目标，鼠标不在任一切片视图上时回退红视图 |
+| 内嵌分段编辑器不随插件本地化 | 嵌入的 `qMRMLSegmentEditorWidget`（各 Effect 名、分段表头、Add/Remove 等）与 `qMRMLNodeComboBox` 的 None/节点名由 Slicer 本体提供，**跟随 Slicer 应用语言**，本插件的 `.ui` 直译与 `zh_CN.json` 改不到它们；要它们中文需把 Slicer 应用语言设为中文（见第十九节） |
+
+---
+
+## 十九、界面中文本地化（i18n）
+
+### 能做什么
+
+- 插件自有界面（两个 Tab、各分组框、按钮、标签、下拉项、悬浮提示）以及运行时弹窗（`QMessageBox`）、状态栏消息、动态拼接的按钮文字，**无条件以中文显示**（不依赖 Slicer 应用语言设置）。
+
+### 解决什么问题
+
+- 团队二次开发自用，需要全中文界面；同时受 CI 约束：`check-utf8.yml` 禁止 `.py` 源码出现任何非 ASCII 字符。
+
+### 实现原理
+
+- **两条通路，规避 ASCII 约束**：
+  - **静态界面文本**：全部在 `slicer_plugin/.../Resources/UI/SlicerNNInteractive.ui`（XML/UTF-8，不被 CI 扫描）里**直接写中文**。这是仓库既有做法（早期 `rotateViewGroup` 手动旋转那组即如此）。术语风格：中文为主，保留 `ROI/BBox/SDF/nnInteractive/RAS/DICOM` 等缩写，必要时「中文(英文)」并列。
+  - **Python 运行时文本**：`.py` 不能写中文，改为「出口处统一翻译」。模块级 `_cn(text)` 按英文原文查外置表 `Resources/Strings/zh_CN.json`（UTF-8，不被 CI 扫描），缺条目则回退英文。两组包装函数把英文字面量留在原地、在显示前翻译：`_status(...)` 包 `slicer.util.showStatusMessage`；`_mb_warning/_mb_critical/_mb_information(...)` 包对应 `QMessageBox.*`。调用点由全局替换一次性接入（`slicer.util.showStatusMessage(` → `_status(` 等）；少量动态拼接（`Fuse & apply ({})`、`Submit ({})`、定位面按钮 tooltip、helpText）直接用 `_cn("...").format(...)`/`% ...` 包裹。
+- **不变量**：`.py` 始终纯 ASCII（CI 通过）；中文只存在于 `.ui` 与 `zh_CN.json`。**新增任何 Python 动态用户文本时，必须同步在 `zh_CN.json` 补一条精确匹配英文原文的 key**，否则显示英文。
+
+### 关键入口/跳转
+
+- `_cn` / `_status` / `_mb_warning` / `_mb_critical` / `_mb_information`（`SlicerNNInteractive.py` 模块级，class 之前）
+- 字符串表：`slicer_plugin/SlicerNNInteractive/Resources/Strings/zh_CN.json`
+- 设计稿：[[chinese_localization]]
 
 ---
 

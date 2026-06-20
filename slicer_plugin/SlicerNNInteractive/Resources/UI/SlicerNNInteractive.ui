@@ -35,7 +35,7 @@
        </property>
        <widget class="QWidget" name="tabPrompts">
         <attribute name="title">
-         <string>nnInteractive Prompts</string>
+         <string>nnInteractive 交互提示</string>
         </attribute>
         <layout class="QVBoxLayout" name="verticalLayout_11">
          <item>
@@ -53,7 +53,7 @@
                </size>
               </property>
               <property name="text">
-               <string>&amp;Reset segment</string>
+               <string>重置分段(&amp;R)</string>
               </property>
              </widget>
             </item>
@@ -66,7 +66,7 @@
                </size>
               </property>
               <property name="text">
-               <string>N&amp;ext segment</string>
+               <string>下一分段(&amp;E)</string>
               </property>
              </widget>
             </item>
@@ -79,10 +79,10 @@
                </size>
               </property>
               <property name="toolTip">
-               <string>Push the current segment's mask to the nnInteractive server.</string>
+               <string>将当前分段的掩膜推送到 nnInteractive 服务器。</string>
               </property>
               <property name="text">
-               <string>&amp;Sync to server</string>
+               <string>同步到服务器(&amp;S)</string>
               </property>
              </widget>
             </item>
@@ -92,7 +92,7 @@
          <item>
           <widget class="QGroupBox" name="promptTypeGroup">
            <property name="title">
-            <string>Prompt &amp;Type:</string>
+            <string>提示类型(&amp;T)：</string>
            </property>
            <layout class="QVBoxLayout" name="verticalLayout_14">
             <item>
@@ -106,10 +106,10 @@
                  </size>
                 </property>
                 <property name="toolTip">
-                 <string>Set prompt type to positive. Hit [T] to toggle.</string>
+                 <string>将提示类型设为正向。按 [T] 切换。</string>
                 </property>
                 <property name="text">
-                 <string>Positive</string>
+                 <string>正向</string>
                 </property>
                 <property name="checkable">
                  <bool>true</bool>
@@ -128,10 +128,10 @@
                  </size>
                 </property>
                 <property name="toolTip">
-                 <string>Set prompt type to negative. Hit [T] to toggle.</string>
+                 <string>将提示类型设为负向。按 [T] 切换。</string>
                 </property>
                 <property name="text">
-                 <string>Negative</string>
+                 <string>负向</string>
                 </property>
                 <property name="checkable">
                  <bool>true</bool>
@@ -146,7 +146,7 @@
          <item>
           <widget class="QGroupBox" name="pointPromptsGroup">
            <property name="title">
-            <string>Interaction Tools:</string>
+            <string>交互工具：</string>
            </property>
            <layout class="QVBoxLayout" name="verticalLayout_12">
             <item>
@@ -166,10 +166,10 @@
                  <bool>true</bool>
                 </property>
                 <property name="toolTip">
-                 <string>Place point prompt</string>
+                 <string>放置点提示</string>
                 </property>
                 <property name="text">
-                 <string> P&amp;oint</string>
+                 <string> 点(&amp;O)</string>
                 </property>
                 <property name="checkable">
                  <bool>true</bool>
@@ -191,10 +191,10 @@
                  <bool>true</bool>
                 </property>
                 <property name="toolTip">
-                 <string>Place BBox prompt</string>
+                 <string>放置边界框(BBox)提示</string>
                 </property>
                 <property name="text">
-                 <string> &amp;Bounding Box</string>
+                 <string> 边界框 BBox(&amp;B)</string>
                 </property>
                 <property name="checkable">
                  <bool>true</bool>
@@ -216,10 +216,10 @@
                  <bool>true</bool>
                 </property>
                 <property name="toolTip">
-                 <string>Place a scribble prompt</string>
+                 <string>放置涂鸦(Scribble)提示</string>
                 </property>
                 <property name="text">
-                 <string> &amp;Scribble</string>
+                 <string> 涂鸦 Scribble(&amp;S)</string>
                 </property>
                 <property name="checkable">
                  <bool>true</bool>
@@ -249,10 +249,10 @@
                    <bool>true</bool>
                   </property>
                   <property name="toolTip">
-                   <string>Place lasso prompt. Double-click to finish.</string>
+                   <string>放置套索(Lasso)提示。双击结束。</string>
                   </property>
                   <property name="text">
-                   <string> &amp;Lasso</string>
+                   <string> 套索 Lasso(&amp;L)</string>
                   </property>
                   <property name="checkable">
                    <bool>true</bool>
@@ -274,10 +274,10 @@
                    <bool>true</bool>
                   </property>
                   <property name="toolTip">
-                   <string>Remove all placed points.</string>
+                   <string>移除所有已放置的点。</string>
                   </property>
                   <property name="text">
-                   <string>Clear</string>
+                   <string>清除</string>
                   </property>
                  </widget>
                 </item>
@@ -288,10 +288,10 @@
                 <item>
                  <widget class="QCheckBox" name="cbLassoMultiView">
                   <property name="toolTip">
-                   <string>Accumulate lasso drawings from multiple views before submitting. Draw in each slice plane, then click Submit.</string>
+                   <string>提交前累积多个视图的套索绘制。在每个切片平面上绘制，然后点击「提交」。</string>
                   </property>
                   <property name="text">
-                   <string>Multi-view</string>
+                   <string>多视图</string>
                   </property>
                  </widget>
                 </item>
@@ -304,10 +304,10 @@
                    <bool>false</bool>
                   </property>
                   <property name="toolTip">
-                   <string>Submit all accumulated multi-view lasso masks at once.</string>
+                   <string>一次性提交所有累积的多视图套索掩膜。</string>
                   </property>
                   <property name="text">
-                   <string>Submit (0)</string>
+                   <string>提交 (0)</string>
                   </property>
                  </widget>
                 </item>
@@ -320,10 +320,10 @@
                    <bool>false</bool>
                   </property>
                   <property name="toolTip">
-                   <string>Discard all accumulated multi-view lasso masks.</string>
+                   <string>丢弃所有累积的多视图套索掩膜。</string>
                   </property>
                   <property name="text">
-                   <string>Discard</string>
+                   <string>丢弃</string>
                   </property>
                  </widget>
                 </item>
@@ -337,7 +337,7 @@
          <item>
           <widget class="QGroupBox" name="selectionOpsGroup">
            <property name="title">
-            <string>Selection Operations:</string>
+            <string>选择运算：</string>
            </property>
            <layout class="QVBoxLayout" name="verticalLayout_selops">
             <item>
@@ -345,28 +345,28 @@
               <item>
                <widget class="QLabel" name="lblSelectionOp">
                 <property name="text">
-                 <string>Operation:</string>
+                 <string>运算：</string>
                 </property>
                </widget>
               </item>
               <item>
                <widget class="QComboBox" name="cbSelectionOperation">
                 <property name="toolTip">
-                 <string>Boolean operation between the current segment and the operand segment.</string>
+                 <string>当前分段与操作数分段之间的布尔运算。</string>
                 </property>
                 <item>
                  <property name="text">
-                  <string>Add (S OR M)</string>
+                  <string>相加 (S OR M)</string>
                  </property>
                 </item>
                 <item>
                  <property name="text">
-                  <string>Subtract (S AND NOT M)</string>
+                  <string>相减 (S AND NOT M)</string>
                  </property>
                 </item>
                 <item>
                  <property name="text">
-                  <string>Intersect (S AND M)</string>
+                  <string>相交 (S AND M)</string>
                  </property>
                 </item>
                </widget>
@@ -378,33 +378,33 @@
               <item>
                <widget class="QLabel" name="lblOperandSource">
                 <property name="text">
-                 <string>Operand source:</string>
+                 <string>操作数来源：</string>
                 </property>
                </widget>
               </item>
               <item>
                <widget class="QComboBox" name="cbOperandSource">
                 <property name="toolTip">
-                 <string>Where the operand mask comes from.</string>
+                 <string>操作数掩膜的来源。</string>
                 </property>
                 <item>
                  <property name="text">
-                  <string>ROI box</string>
+                  <string>ROI 盒</string>
                  </property>
                 </item>
                 <item>
                  <property name="text">
-                  <string>Magic wand</string>
+                  <string>魔棒</string>
                  </property>
                 </item>
                 <item>
                  <property name="text">
-                  <string>Segment</string>
+                  <string>分段</string>
                  </property>
                 </item>
                 <item>
                  <property name="text">
-                  <string>Lasso (3D)</string>
+                  <string>套索 (3D)</string>
                  </property>
                 </item>
                </widget>
@@ -429,14 +429,14 @@
                <item>
                 <widget class="QLabel" name="lblSelectionOperand">
                  <property name="text">
-                  <string>Operand segment:</string>
+                  <string>操作数分段：</string>
                  </property>
                 </widget>
                </item>
                <item>
                 <widget class="QComboBox" name="cbSelectionOperand">
                  <property name="toolTip">
-                  <string>Another segment to combine with the current segment.</string>
+                  <string>用于与当前分段组合的另一个分段。</string>
                  </property>
                 </widget>
                </item>
@@ -469,10 +469,10 @@
                     </size>
                    </property>
                    <property name="toolTip">
-                    <string>Create or show the operation ROI in the 3D view; drag its handles to position it.</string>
+                    <string>在 3D 视图中创建或显示运算 ROI；拖动其手柄进行定位。</string>
                    </property>
                    <property name="text">
-                    <string>Place / Show ROI</string>
+                    <string>放置 / 显示 ROI</string>
                    </property>
                   </widget>
                  </item>
@@ -485,10 +485,10 @@
                     </size>
                    </property>
                    <property name="toolTip">
-                    <string>Remove the operation ROI from the scene.</string>
+                    <string>从场景中移除运算 ROI。</string>
                    </property>
                    <property name="text">
-                    <string>Clear ROI</string>
+                    <string>清除 ROI</string>
                    </property>
                   </widget>
                  </item>
@@ -499,28 +499,28 @@
                  <item>
                   <widget class="QLabel" name="lblRoiShape">
                    <property name="text">
-                    <string>ROI shape:</string>
+                    <string>ROI 形状：</string>
                    </property>
                   </widget>
                  </item>
                  <item>
                   <widget class="QComboBox" name="cbRoiShape">
                    <property name="toolTip">
-                    <string>Shape of the ROI operand: an oriented box, an inscribed sphere, or an ellipsoid aligned with the ROI axes.</string>
+                    <string>ROI 操作数的形状：有向盒、内切球，或与 ROI 轴对齐的椭球。</string>
                    </property>
                    <item>
                     <property name="text">
-                     <string>Box</string>
+                     <string>盒</string>
                     </property>
                    </item>
                    <item>
                     <property name="text">
-                     <string>Sphere</string>
+                     <string>球</string>
                     </property>
                    </item>
                    <item>
                     <property name="text">
-                     <string>Ellipsoid</string>
+                     <string>椭球</string>
                     </property>
                    </item>
                   </widget>
@@ -556,10 +556,10 @@
                     </size>
                    </property>
                    <property name="toolTip">
-                    <string>Click in any view to add a magic wand seed; multiple seeds combine.</string>
+                    <string>在任意视图中点击以添加魔棒种子；多个种子会合并。</string>
                    </property>
                    <property name="text">
-                    <string>&amp;Add Seed</string>
+                    <string>添加种子(&amp;A)</string>
                    </property>
                   </widget>
                  </item>
@@ -572,10 +572,10 @@
                     </size>
                    </property>
                    <property name="toolTip">
-                    <string>Remove all magic wand seeds.</string>
+                    <string>移除所有魔棒种子。</string>
                    </property>
                    <property name="text">
-                    <string>Clear Seeds</string>
+                    <string>清除种子</string>
                    </property>
                   </widget>
                  </item>
@@ -592,10 +592,10 @@
                     </size>
                    </property>
                    <property name="toolTip">
-                    <string>Run nnInteractive on the current seeds and preview the operand mask before Apply.</string>
+                    <string>对当前种子运行 nnInteractive，并在应用前预览操作数掩膜。</string>
                    </property>
                    <property name="text">
-                    <string>&amp;Preview</string>
+                    <string>预览(&amp;P)</string>
                    </property>
                   </widget>
                  </item>
@@ -608,10 +608,10 @@
                     </size>
                    </property>
                    <property name="toolTip">
-                    <string>Hide the magic wand preview overlay; seeds are kept.</string>
+                    <string>隐藏魔棒预览叠加层；保留种子。</string>
                    </property>
                    <property name="text">
-                    <string>Clear Preview</string>
+                    <string>清除预览</string>
                    </property>
                   </widget>
                  </item>
@@ -622,14 +622,14 @@
                  <item>
                   <widget class="QLabel" name="lblGrowShrinkWand">
                    <property name="text">
-                    <string>Grow / Shrink (voxels):</string>
+                    <string>膨胀 / 收缩（体素）：</string>
                    </property>
                   </widget>
                  </item>
                  <item>
                   <widget class="QSpinBox" name="sbGrowShrinkWand">
                    <property name="toolTip">
-                    <string>Morphological dilate (positive) or erode (negative) of the AI mask, in voxels.</string>
+                    <string>对 AI 掩膜进行形态学膨胀（正值）或腐蚀（负值），单位为体素。</string>
                    </property>
                    <property name="minimum">
                     <number>-20</number>
@@ -673,10 +673,10 @@
                     </size>
                    </property>
                    <property name="toolTip">
-                    <string>Toggle on, then drag a closed loop in the 3D view to carve a 3D region; extruded along the camera direction.</string>
+                    <string>开启后，在 3D 视图中拖出一个闭合回路以切出 3D 区域；沿相机方向拉伸。</string>
                    </property>
                    <property name="text">
-                    <string>&amp;Draw lasso (3D)</string>
+                    <string>绘制套索 3D(&amp;D)</string>
                    </property>
                    <property name="checkable">
                     <bool>true</bool>
@@ -692,10 +692,10 @@
                     </size>
                    </property>
                    <property name="toolTip">
-                    <string>Clear the drawn region (and any preview).</string>
+                    <string>清除已绘制的区域（及任何预览）。</string>
                    </property>
                    <property name="text">
-                    <string>Clear Region</string>
+                    <string>清除区域</string>
                    </property>
                   </widget>
                  </item>
@@ -712,10 +712,10 @@
                     </size>
                    </property>
                    <property name="toolTip">
-                    <string>Run nnInteractive on the drawn region and preview the AI result before Apply.</string>
+                    <string>对绘制的区域运行 nnInteractive，并在应用前预览 AI 结果。</string>
                    </property>
                    <property name="text">
-                    <string>&amp;Preview</string>
+                    <string>预览(&amp;P)</string>
                    </property>
                   </widget>
                  </item>
@@ -728,10 +728,10 @@
                     </size>
                    </property>
                    <property name="toolTip">
-                    <string>Hide the AI preview overlay; the drawn region is kept.</string>
+                    <string>隐藏 AI 预览叠加层；保留已绘制的区域。</string>
                    </property>
                    <property name="text">
-                    <string>Clear Preview</string>
+                    <string>清除预览</string>
                    </property>
                   </widget>
                  </item>
@@ -740,7 +740,7 @@
                <item>
                 <widget class="QLabel" name="lblLasso3dHint">
                  <property name="text">
-                  <string>Draw in the 3D view. Enable volume rendering or show a segment surface first so there is something to aim at.</string>
+                  <string>在 3D 视图中绘制。请先启用体绘制或显示分段表面，以便有可瞄准的目标。</string>
                  </property>
                  <property name="wordWrap">
                   <bool>true</bool>
@@ -761,10 +761,10 @@
                  </size>
                 </property>
                 <property name="toolTip">
-                 <string>Apply the boolean operation to the current segment and sync to server.</string>
+                 <string>对当前分段应用布尔运算并同步到服务器。</string>
                 </property>
                 <property name="text">
-                 <string>&amp;Apply Operation</string>
+                 <string>应用运算(&amp;A)</string>
                 </property>
                </widget>
               </item>
@@ -777,10 +777,10 @@
                  </size>
                 </property>
                 <property name="toolTip">
-                 <string>Undo the last segment edit made by this panel (or any Segment Editor effect).</string>
+                 <string>撤销此面板（或任意分段编辑器效果）所做的上一次分段编辑。</string>
                 </property>
                 <property name="text">
-                 <string>&amp;Undo</string>
+                 <string>撤销(&amp;U)</string>
                 </property>
                </widget>
               </item>
@@ -797,10 +797,10 @@
                  </size>
                 </property>
                 <property name="toolTip">
-                 <string>Create or show a box ROI sized to the current segment; rotate the view and drag it to frame the region to keep.</string>
+                 <string>创建或显示一个与当前分段尺寸匹配的盒状 ROI；旋转视图并拖动它以框定要保留的区域。</string>
                 </property>
                 <property name="text">
-                 <string>Place Crop ROI</string>
+                 <string>放置裁剪 ROI</string>
                 </property>
                </widget>
               </item>
@@ -813,10 +813,10 @@
                  </size>
                 </property>
                 <property name="toolTip">
-                 <string>Clear the current segment's voxels outside the crop box (keep only what is inside the box). Undoable; synced to the server.</string>
+                 <string>清除裁剪盒之外的当前分段体素（仅保留盒内部分）。可撤销；会同步到服务器。</string>
                 </property>
                 <property name="text">
-                 <string>Crop Segment by Box</string>
+                 <string>按盒裁剪分段</string>
                 </property>
                </widget>
               </item>
@@ -825,20 +825,20 @@
             <item>
              <widget class="QCheckBox" name="cbKeepCropRoi">
               <property name="toolTip">
-               <string>Keep the crop box after cropping so you can adjust it and crop again. When off, the box is removed after each crop.</string>
+               <string>裁剪后保留裁剪盒，以便调整后再次裁剪。关闭时，每次裁剪后移除该盒。</string>
               </property>
               <property name="text">
-               <string>Keep crop box after cropping</string>
+               <string>裁剪后保留裁剪盒</string>
               </property>
              </widget>
             </item>
             <item>
              <widget class="QLabel" name="lblCropRegionHint">
               <property name="toolTip">
-               <string>Draw Crop Region: place control points on the model in the 3D view to outline a closed loop, double-click or right-click to close, then crop the current segment to the inside or outside of the loop (extruded along the view direction at the moment you finish drawing).</string>
+               <string>绘制裁剪区域：在 3D 视图的模型上放置控制点以勾勒一个闭合回路，双击或右键点击以闭合，然后将当前分段裁剪到回路的内部或外部（在你完成绘制的那一刻沿视图方向拉伸）。</string>
               </property>
               <property name="text">
-               <string>Or draw a closed loop in the 3D view, then crop inside/outside:</string>
+               <string>或在 3D 视图中绘制一个闭合回路，然后裁剪内部/外部：</string>
               </property>
               <property name="wordWrap">
                <bool>true</bool>
@@ -856,10 +856,10 @@
                  </size>
                 </property>
                 <property name="toolTip">
-                 <string>Enter drawing mode: left-click on the model in the 3D view to place control points of a closed loop; double-click or right-click to close it. The loop is extruded along the current view direction.</string>
+                 <string>进入绘制模式：在 3D 视图的模型上左键点击放置闭合回路的控制点；双击或右键点击以闭合。该回路沿当前视图方向拉伸。</string>
                 </property>
                 <property name="text">
-                 <string>Draw Crop Region</string>
+                 <string>绘制裁剪区域</string>
                 </property>
                 <property name="checkable">
                  <bool>true</bool>
@@ -875,10 +875,10 @@
                  </size>
                 </property>
                 <property name="toolTip">
-                 <string>Discard the loop being drawn and leave drawing mode.</string>
+                 <string>丢弃正在绘制的回路并退出绘制模式。</string>
                 </property>
                 <property name="text">
-                 <string>Cancel Drawing</string>
+                 <string>取消绘制</string>
                 </property>
                </widget>
               </item>
@@ -898,10 +898,10 @@
                  </size>
                 </property>
                 <property name="toolTip">
-                 <string>Keep only the current segment voxels inside the drawn loop (extruded along the view direction). Undoable; synced to the server.</string>
+                 <string>仅保留绘制回路内部的当前分段体素（沿视图方向拉伸）。可撤销；会同步到服务器。</string>
                 </property>
                 <property name="text">
-                 <string>Crop Inside</string>
+                 <string>裁剪内部</string>
                 </property>
                </widget>
               </item>
@@ -917,10 +917,10 @@
                  </size>
                 </property>
                 <property name="toolTip">
-                 <string>Keep only the current segment voxels outside the drawn loop (extruded along the view direction). Undoable; synced to the server.</string>
+                 <string>仅保留绘制回路外部的当前分段体素（沿视图方向拉伸）。可撤销；会同步到服务器。</string>
                 </property>
                 <property name="text">
-                 <string>Crop Outside</string>
+                 <string>裁剪外部</string>
                 </property>
                </widget>
               </item>
@@ -932,7 +932,7 @@
          <item>
           <widget class="QGroupBox" name="uploadProgressGroup">
            <property name="title">
-            <string>Upload progress:</string>
+            <string>上传进度：</string>
            </property>
            <layout class="QVBoxLayout" name="verticalLayout_12b">
             <item>
@@ -956,13 +956,13 @@
        </widget>
        <widget class="QWidget" name="tabConfig">
         <attribute name="title">
-         <string>Configuration</string>
+         <string>配置</string>
         </attribute>
         <layout class="QVBoxLayout" name="verticalLayout_10">
          <item>
           <widget class="QGroupBox" name="serverGroup">
            <property name="title">
-            <string>Server Settings</string>
+            <string>服务器设置</string>
            </property>
            <layout class="QVBoxLayout" name="verticalLayout_5">
             <item>
@@ -970,7 +970,7 @@
               <item>
                <widget class="QLabel" name="label">
                 <property name="text">
-                 <string>Server URL:</string>
+                 <string>服务器 URL：</string>
                 </property>
                </widget>
               </item>
@@ -995,10 +995,10 @@
             </size>
            </property>
            <property name="toolTip">
-            <string>Test if the the server is reachable.</string>
+            <string>测试服务器是否可达。</string>
            </property>
            <property name="text">
-            <string>Test Connection</string>
+            <string>测试连接</string>
            </property>
           </widget>
          </item>
@@ -1024,19 +1024,19 @@
    <item>
     <widget class="QGroupBox" name="segmentationGroup">
      <property name="title">
-      <string>Segment Editor</string>
+      <string>分段编辑器</string>
      </property>
      <layout class="QVBoxLayout" name="segmentEditorLayout">
       <item>
        <widget class="QGroupBox" name="planeDisplayGroup">
         <property name="title">
-         <string>Multi-plane display (optional)</string>
+         <string>多平面显示（可选）</string>
         </property>
         <layout class="QVBoxLayout" name="verticalLayout_planeDisplay">
          <item>
           <widget class="QLabel" name="lblPlaneDisplayHelp">
            <property name="text">
-            <string>Choose registered volumes for clearer 2D views. Segmentation still uses the Segment Editor source volume.</string>
+            <string>为更清晰的 2D 视图选择已配准的体数据。分割仍使用分段编辑器的源体数据。</string>
            </property>
            <property name="wordWrap">
             <bool>true</bool>
@@ -1048,7 +1048,7 @@
            <item row="0" column="0">
             <widget class="QLabel" name="lblRedDisplayVolume">
              <property name="text">
-              <string>Red (Axial):</string>
+              <string>红(轴位 Axial)：</string>
              </property>
             </widget>
            </item>
@@ -1076,7 +1076,7 @@
            <item row="1" column="0">
             <widget class="QLabel" name="lblYellowDisplayVolume">
              <property name="text">
-              <string>Yellow (Sagittal):</string>
+              <string>黄(矢状 Sagittal)：</string>
              </property>
             </widget>
            </item>
@@ -1104,7 +1104,7 @@
            <item row="2" column="0">
             <widget class="QLabel" name="lblGreenDisplayVolume">
              <property name="text">
-              <string>Green (Coronal):</string>
+              <string>绿(冠状 Coronal)：</string>
              </property>
             </widget>
            </item>
@@ -1136,20 +1136,20 @@
            <item>
             <widget class="QPushButton" name="pbApplyPlaneDisplayVolumes">
              <property name="toolTip">
-              <string>Use the selected registered volumes as the Red, Yellow, and Green slice-view backgrounds. Empty selections fall back to the current Segment Editor source volume.</string>
+              <string>将所选的已配准体数据用作红、黄、绿切片视图的背景。未选择则回退到当前分段编辑器源体数据。</string>
              </property>
              <property name="text">
-              <string>Apply view volumes</string>
+              <string>应用视图体数据</string>
              </property>
             </widget>
            </item>
            <item>
             <widget class="QPushButton" name="pbResetPlaneDisplayVolumes">
              <property name="toolTip">
-              <string>Restore the current Segment Editor source volume as the background in all three slice views.</string>
+              <string>在全部三个切片视图中恢复使用当前分段编辑器源体数据作为背景。</string>
              </property>
              <property name="text">
-              <string>Use source volume for all</string>
+              <string>全部使用源体数据</string>
              </property>
             </widget>
           </item>
@@ -1158,10 +1158,10 @@
         <item>
          <widget class="QCheckBox" name="cbSnapSlicesToGrid">
           <property name="toolTip">
-           <string>For obliquely acquired series, the standard axial/sagittal/coronal views reslice the volume at an angle, so scrolling never lands on the real acquired slices. Enable this to rotate the slice views to the series' own acquisition planes: the image is straightened, the slice-intersection cross follows the real series axes, and one view scrolls through the original slices. Axis-aligned series are left unchanged.</string>
+           <string>对于斜向采集的序列，标准的轴位/矢状/冠状视图会以一定角度对体数据重新切片，因此滚动时永远落不到真实采集的切片上。启用此项可将切片视图旋转到序列自身的采集平面：图像被摆正，切片相交十字跟随真实的序列轴，且有一个视图可滚动浏览原始切片。轴对齐的序列保持不变。</string>
           </property>
           <property name="text">
-           <string>Align views to the acquisition plane for oblique series</string>
+           <string>将斜向序列的视图对齐到采集平面</string>
           </property>
           <property name="checked">
            <bool>true</bool>
@@ -1171,7 +1171,7 @@
         <item>
          <widget class="ctkCollapsibleButton" name="rotateViewGroup">
           <property name="toolTip">
-           <string>For isotropic single-series data, manually rotate the slice views around the world R/A/S axes to find the best oblique anatomical plane. This only changes the view display (SliceToRAS matrix); image data, the output grid, and segmentation masks are never modified. Disabled in tri-planar multi-series mode.</string>
+           <string>对于各向同性的单序列数据，绕世界 R/A/S 轴手动旋转切片视图，以找到最佳的斜向解剖平面。此操作仅改变视图显示（SliceToRAS 矩阵）；图像数据、输出网格与分割掩膜均不会被修改。在三平面多序列模式下禁用。</string>
           </property>
           <property name="text">
            <string>手动旋转观察平面（单序列）</string>
@@ -1192,7 +1192,7 @@
              <item row="0" column="1">
               <widget class="QComboBox" name="cbRotateAxis">
                <property name="toolTip">
-                <string>World RAS axis the slice views rotate around.</string>
+                <string>切片视图绕其旋转的世界 RAS 轴。</string>
                </property>
                <item>
                 <property name="text">
@@ -1218,7 +1218,7 @@
              <item>
               <widget class="QSlider" name="sldRotateAngle">
                <property name="toolTip">
-                <string>Absolute rotation angle around the selected axis, measured from the current axis baseline. 0 returns to the baseline.</string>
+                <string>绕所选轴的绝对旋转角度，从当前轴基线开始测量。0 返回基线。</string>
                </property>
                <property name="minimum">
                 <number>-180</number>
@@ -1240,7 +1240,7 @@
              <item>
               <widget class="QSpinBox" name="sbRotateAngle">
                <property name="toolTip">
-                <string>Rotation angle in degrees (linked to the slider).</string>
+                <string>旋转角度（度，与滑块联动）。</string>
                </property>
                <property name="minimum">
                 <number>-180</number>
@@ -1258,7 +1258,7 @@
            <item>
             <widget class="QCheckBox" name="chkLinkViews">
              <property name="toolTip">
-              <string>Rotate the Red, Yellow and Green views together. When off, only the view under the mouse rotates.</string>
+              <string>同时旋转红、黄、绿视图。关闭时，只旋转鼠标所在的视图。</string>
              </property>
              <property name="text">
               <string>联动旋转（红→黄/绿）</string>
@@ -1271,7 +1271,7 @@
            <item>
             <widget class="QPushButton" name="btnResetView">
              <property name="toolTip">
-              <string>Reset the slice views to their standard axial/sagittal/coronal orientation.</string>
+              <string>将切片视图重置为标准的轴位/矢状/冠状方向。</string>
              </property>
              <property name="text">
               <string>复位标准正位</string>
@@ -1284,16 +1284,16 @@
         <item>
          <widget class="QGroupBox" name="highResOutputGroup">
           <property name="title">
-           <string>High-resolution output (optional)</string>
+           <string>高分辨率输出（可选）</string>
           </property>
           <layout class="QVBoxLayout" name="verticalLayout_highResOutput">
            <item>
             <widget class="QCheckBox" name="cbEnableHighResOutput">
              <property name="toolTip">
-              <string>Store the segment on a high-resolution isotropic grid instead of the coarse source volume, so results stay sharp in all three planes. A larger field of view at fine spacing uses more memory.</string>
+              <string>将分段存储在高分辨率各向同性网格上，而非粗糙的源体数据上，使结果在三个平面上都保持清晰。在精细间距下更大的视野会占用更多内存。</string>
              </property>
              <property name="text">
-              <string>Store masks on a high-resolution isotropic grid</string>
+              <string>将掩膜存储在高分辨率各向同性网格上</string>
              </property>
             </widget>
            </item>
@@ -1302,7 +1302,7 @@
              <item row="0" column="0">
               <widget class="QLabel" name="lblOutputSpacing">
                <property name="text">
-                <string>Isotropic spacing (mm, 0 = auto):</string>
+                <string>各向同性间距（mm，0 = 自动）：</string>
                </property>
               </widget>
              </item>
@@ -1330,27 +1330,27 @@
            <item>
             <widget class="QCheckBox" name="cbSmoothInterpolate">
              <property name="toolTip">
-              <string>Interpolate each coarse segmentation result onto the high-resolution grid using shape-based (signed-distance) interpolation, so the boundary is smooth in all three planes instead of stair-stepped. Requires the high-resolution output grid; enabling this turns it on automatically.</string>
+              <string>使用基于形状的（有符号距离）插值，把每个粗糙分割结果插值到高分辨率网格上，使边界在三个平面上都平滑而非呈阶梯状。需要高分辨率输出网格；启用此项会自动开启它。</string>
              </property>
              <property name="text">
-              <string>Smooth (interpolate) result between slices</string>
+              <string>在切片间平滑（插值）结果</string>
              </property>
             </widget>
            </item>
            <item>
             <widget class="QPushButton" name="pbSmoothCurrentSegment">
              <property name="toolTip">
-              <string>Re-run shape-based smoothing on the whole current segment, e.g. after erasing or other manual edits. Requires the high-resolution output grid; clicking enables it if needed. Undoable from the Segment Editor.</string>
+              <string>对整个当前分段重新运行基于形状的平滑，例如在擦除或其他手动编辑之后。需要高分辨率输出网格；点击时会按需启用它。可从分段编辑器撤销。</string>
              </property>
              <property name="text">
-              <string>Smooth current segment</string>
+              <string>平滑当前分段</string>
              </property>
             </widget>
            </item>
            <item>
             <widget class="QLabel" name="lblHighResOutputHelp">
              <property name="text">
-              <string>Note: a single inference on the coarse source volume stays coarse. Enable smoothing above to interpolate it, or run native-series inference on each high-resolution series and merge.</string>
+              <string>注意：在粗糙源体数据上的单次推理仍然是粗糙的。请启用上方的平滑以插值，或对每个高分辨率序列运行原生序列推理后合并。</string>
              </property>
              <property name="wordWrap">
               <bool>true</bool>
@@ -1363,39 +1363,39 @@
         <item>
          <widget class="QGroupBox" name="nativeSeriesInferenceGroup">
           <property name="title">
-           <string>Native-series inference (optional)</string>
+           <string>原生序列推理（可选）</string>
           </property>
           <layout class="QVBoxLayout" name="verticalLayout_nativeSeriesInference">
            <item>
             <widget class="QCheckBox" name="cbTriPlanarMode">
              <property name="toolTip">
-              <string>Tri-planar multi-series mode: route each interaction to the series shown in the view you click, auto-assign axial/sagittal/coronal series to the Red/Yellow/Green views, and direction-weighted-fuse the three directions after every interaction to reduce through-plane staircase artifacts. Requires three co-registered series.</string>
+              <string>三平面多序列模式：把每次交互路由到你点击的视图所显示的序列，自动将轴位/矢状/冠状序列分配到红/黄/绿视图，并在每次交互后对三个方向做方向加权融合，以减少穿层阶梯伪影。需要三个已共配准的序列。</string>
              </property>
              <property name="text">
-              <string>Tri-planar multi-series mode</string>
+              <string>三平面多序列模式</string>
              </property>
             </widget>
            </item>
            <item>
             <widget class="QCheckBox" name="cbAllSeriesFusion">
              <property name="toolTip">
-              <string>All-Series Fusion: when on (and in tri-planar mode), every prompt is run against ALL assigned series (not just the clicked view's series) and the results are direction-weighted SDF-fused into the segment in one step. This uses the high-resolution information from every series along its own sharp axis, improving through-plane accuracy at roughly 2.5-3x the time of a single inference. Turn off to fall back to per-view routing (one series per prompt). Points and bounding boxes are sent unchanged to every series; a lasso/scribble is sent as-is to its own view's series and as derived point seeds to the orthogonal series (a planar prompt is degenerate off its own plane).</string>
+              <string>全序列融合：开启时（且处于三平面模式下），每个提示都会对所有已分配的序列运行（而不只是点击视图的序列），并把结果一步做方向加权 SDF 融合进分段。这会沿每个序列自身的清晰轴利用其高分辨率信息，以约单次推理 2.5-3 倍的时间提升穿层精度。关闭则回退到按视图路由（每个提示一个序列）。点和边界框会原样发送到每个序列；套索/涂鸦会原样发送到其自身视图的序列，并作为派生的点种子发送到正交序列（平面提示在其自身平面之外是退化的）。</string>
              </property>
              <property name="text">
-              <string>    All-Series Fusion (auto-fuse per prompt)</string>
+              <string>    全序列融合（每个提示自动融合）</string>
              </property>
             </widget>
            </item>
            <item>
             <widget class="QCheckBox" name="cbDirectionalFusion">
              <property name="toolTip">
-              <string>Directional Fusion: weight each series' contribution to the fused boundary by how well the local surface normal lies in that series' sharp (in-plane) acquisition plane. A series votes at full weight where the boundary runs in its clear plane and is suppressed toward zero where the boundary crosses its blurry through-plane (slice-stacking) direction, so its low-resolution axis no longer pulls the fused edge. Equal weighting and adaptation to the number of present series emerge automatically (no fixed priorities; a missing series simply yields its share to the others in the directions they share). Turn off to fall back to the legacy anisotropic-blur plus equal-weight SDF average.</string>
+              <string>方向融合：按局部表面法线落在某序列清晰（面内）采集平面内的程度，对该序列在融合边界中的贡献加权。在边界沿其清晰平面延伸处，序列以全权重投票；在边界穿过其模糊穿层（切片堆叠）方向处，权重被压向零，使其低分辨率轴不再拉扯融合边缘。等权重以及对存在序列数量的自适应会自动产生（无固定优先级；缺失的序列只是在共享方向上把份额让给其他序列）。关闭则回退到旧版各向异性模糊加等权 SDF 平均。</string>
              </property>
              <property name="checked">
               <bool>true</bool>
              </property>
              <property name="text">
-              <string>    Directional Fusion (normal-aligned equal weight)</string>
+              <string>    方向融合（法线对齐等权）</string>
              </property>
             </widget>
            </item>
@@ -1404,14 +1404,14 @@
              <item>
               <widget class="QLabel" name="lblPlaneOpacity">
                <property name="text">
-                <string>Locator plane opacity:</string>
+                <string>定位平面不透明度：</string>
                </property>
               </widget>
              </item>
              <item>
               <widget class="QSlider" name="sldPlaneOpacity">
                <property name="toolTip">
-                <string>Opacity of the filled tri-planar locator planes shown in the 3D view.</string>
+                <string>3D 视图中显示的三平面填充定位平面的不透明度。</string>
                </property>
                <property name="minimum">
                 <number>0</number>
@@ -1448,30 +1448,30 @@
            <item>
             <widget class="QCheckBox" name="cbAutoRotateCamera">
              <property name="toolTip">
-              <string>When enabled, the 3D camera automatically rotates to face the series of the view you interact in (place a point/box/lasso/scribble).</string>
+              <string>启用后，3D 相机会自动旋转以正对你所交互视图（放置点/框/套索/涂鸦）的序列。</string>
              </property>
              <property name="text">
-              <string>Auto-rotate 3D to the active series</string>
+              <string>3D 自动旋转到活动序列</string>
              </property>
             </widget>
            </item>
            <item>
             <widget class="QCheckBox" name="cbObliqueCameraAlign">
              <property name="toolTip">
-              <string>When enabled, align the 3D camera to the series' acquisition frame (its direction matrix and registration transform), so an obliquely acquired or obliquely registered series faces the camera squarely. When off, the camera uses the standard 2D slice orientation.</string>
+              <string>启用后，将 3D 相机对齐到序列的采集坐标系（其方向矩阵与配准变换），使斜向采集或斜向配准的序列正对相机。关闭时，相机使用标准的 2D 切片方向。</string>
              </property>
              <property name="text">
-              <string>Align 3D camera to oblique series</string>
+              <string>将 3D 相机对齐到斜向序列</string>
              </property>
             </widget>
            </item>
            <item>
             <widget class="QCheckBox" name="cbShow3DTriPlanar">
              <property name="toolTip">
-              <string>When enabled, the segmentation's 3D surface is shown in tri-planar mode. It is rebuilt once after you pause interacting (a heavy operation on the large fused grid), not on every interaction.</string>
+              <string>启用后，在三平面模式下显示分割的 3D 表面。它会在你暂停交互后重建一次（在大型融合网格上是重操作），而非每次交互都重建。</string>
              </property>
              <property name="text">
-              <string>Show segmentation in 3D (tri-planar)</string>
+              <string>在 3D 中显示分割（三平面）</string>
              </property>
             </widget>
            </item>
@@ -1480,37 +1480,37 @@
              <item>
               <widget class="QLabel" name="lblFaceSeries">
                <property name="text">
-                <string>Face series in 3D:</string>
+                <string>3D 正对序列：</string>
                </property>
               </widget>
              </item>
              <item>
               <widget class="QPushButton" name="pbFaceRed">
                <property name="toolTip">
-                <string>Rotate the 3D camera to face the Red view's series.</string>
+                <string>旋转 3D 相机以正对红视图的序列。</string>
                </property>
                <property name="text">
-                <string>Red</string>
+                <string>红</string>
                </property>
               </widget>
              </item>
              <item>
               <widget class="QPushButton" name="pbFaceYellow">
                <property name="toolTip">
-                <string>Rotate the 3D camera to face the Yellow view's series.</string>
+                <string>旋转 3D 相机以正对黄视图的序列。</string>
                </property>
                <property name="text">
-                <string>Yellow</string>
+                <string>黄</string>
                </property>
               </widget>
              </item>
              <item>
               <widget class="QPushButton" name="pbFaceGreen">
                <property name="toolTip">
-                <string>Rotate the 3D camera to face the Green view's series.</string>
+                <string>旋转 3D 相机以正对绿视图的序列。</string>
                </property>
                <property name="text">
-                <string>Green</string>
+                <string>绿</string>
                </property>
               </widget>
              </item>
@@ -1519,10 +1519,10 @@
            <item>
             <widget class="QCheckBox" name="cbEnableNativeSeriesInference">
              <property name="toolTip">
-              <string>Run nnInteractive on a registered supplemental series. Results are previewed first and synchronized back to the Segment Editor source volume only when confirmed.</string>
+              <string>在已配准的补充序列上运行 nnInteractive。结果先预览，仅在确认后才同步回分段编辑器源体数据。</string>
              </property>
              <property name="text">
-              <string>Analyze a supplemental series</string>
+              <string>分析一个补充序列</string>
              </property>
             </widget>
            </item>
@@ -1531,7 +1531,7 @@
              <item row="0" column="0">
               <widget class="QLabel" name="lblInferenceWorkingVolume">
                <property name="text">
-                <string>Working volume:</string>
+                <string>工作体数据：</string>
                </property>
               </widget>
              </item>
@@ -1559,7 +1559,7 @@
              <item row="1" column="0">
               <widget class="QLabel" name="lblInferenceSyncMode">
                <property name="text">
-                <string>Sync mode:</string>
+                <string>同步模式：</string>
                </property>
               </widget>
              </item>
@@ -1567,22 +1567,22 @@
               <widget class="QComboBox" name="cbInferenceSyncMode">
                <item>
                 <property name="text">
-                 <string>Add to source</string>
+                 <string>加到源</string>
                 </property>
                </item>
                <item>
                 <property name="text">
-                 <string>Replace source</string>
+                 <string>替换源</string>
                 </property>
                </item>
                <item>
                 <property name="text">
-                 <string>Subtract from source</string>
+                 <string>从源减去</string>
                 </property>
                </item>
                <item>
                 <property name="text">
-                 <string>Intersect source</string>
+                 <string>与源相交</string>
                 </property>
                </item>
               </widget>
@@ -1594,20 +1594,20 @@
              <item>
               <widget class="QPushButton" name="pbSyncInferenceResult">
                <property name="toolTip">
-                <string>Merge the current supplemental-series preview into the Segment Editor source volume using the selected sync mode.</string>
+                <string>使用所选同步模式，将当前补充序列预览合并到分段编辑器源体数据中。</string>
                </property>
                <property name="text">
-                <string>Sync preview to source</string>
+                <string>将预览同步到源</string>
                </property>
               </widget>
              </item>
              <item>
               <widget class="QPushButton" name="pbClearInferencePreview">
                <property name="toolTip">
-                <string>Discard the supplemental-series preview without changing the source segment.</string>
+                <string>丢弃补充序列预览，不改变源分段。</string>
                </property>
                <property name="text">
-                <string>Clear preview</string>
+                <string>清除预览</string>
                </property>
               </widget>
              </item>
@@ -1616,10 +1616,10 @@
            <item>
             <widget class="QCheckBox" name="cbEnableSeriesFusion">
              <property name="toolTip">
-              <string>Fuse the segmentation results of several registered series (e.g. axial, coronal, sagittal acquisitions) into one smooth mask using signed-distance averaging. Each series constrains the boundary in its own high-resolution plane, reducing through-plane staircase artifacts. Enable High-res output and run a lasso prompt on each series (via native-series inference), then click Fuse &amp; apply. Works best with the High-resolution output grid enabled.</string>
+              <string>使用有符号距离平均，将多个已配准序列（如轴位、冠状、矢状采集）的分割结果融合为一个平滑掩膜。每个序列在其自身高分辨率平面内约束边界，减少穿层阶梯伪影。启用高分辨率输出并在每个序列上运行套索提示（通过原生序列推理），然后点击「融合并应用」。在启用高分辨率输出网格时效果最佳。</string>
              </property>
              <property name="text">
-              <string>Fuse multi-series results (SDF average)</string>
+              <string>融合多序列结果（SDF 平均）</string>
              </property>
             </widget>
            </item>
@@ -1629,30 +1629,30 @@
               <bool>false</bool>
              </property>
              <property name="toolTip">
-              <string>SDF-average all collected per-series results into one smooth mask and write it into the current segment (undoable).</string>
+              <string>将所有已收集的各序列结果做 SDF 平均，合成一个平滑掩膜并写入当前分段（可撤销）。</string>
              </property>
              <property name="text">
-              <string>Fuse &amp; apply (0)</string>
+              <string>融合并应用 (0)</string>
              </property>
             </widget>
            </item>
            <item>
             <widget class="QPushButton" name="pbFuseThreeSeriesRoi">
              <property name="toolTip">
-              <string>One click: draw a single lasso, then fuse three co-registered series into one smooth, high-resolution segment. The series shown in the lasso's own view is segmented with the real lasso; the two orthogonal series are segmented from positive point seeds derived from the lasso interior. Results are fused by field-of-view-weighted signed-distance averaging inside the lasso ROI (only series that actually image a voxel vote there), written into the current segment, and a smoothed 3D model is built. Assign a series to each of the Red/Yellow/Green views in the Multi-plane display panel first.</string>
+              <string>一键操作：绘制单个套索，然后将三个已共配准的序列融合为一个平滑的高分辨率分段。套索自身视图所显示的序列用真实套索分割；两个正交序列用从套索内部派生的正向点种子分割。结果在套索 ROI 内部用视野加权的有符号距离平均进行融合（只有真正成像到某体素的序列才在该处投票），写入当前分段，并构建平滑的 3D 模型。请先在「多平面显示」面板中为红/黄/绿视图各分配一个序列。</string>
              </property>
              <property name="text">
-              <string>Fuse from 3 Series (Masked by ROI)</string>
+              <string>从 3 个序列融合（按 ROI 掩蔽）</string>
              </property>
             </widget>
            </item>
            <item>
             <widget class="QCheckBox" name="cbAutoRegisterSupplemental">
              <property name="toolTip">
-              <string>When the supplemental series uses a different DICOM frame of reference than the source volume (for example after a mid-exam localizer or repositioning), automatically run a rigid registration so prompts and masks land in the correct place.</string>
+              <string>当补充序列与源体数据使用不同的 DICOM 参考坐标系时（例如检查中途的定位像或重新摆位之后），自动运行刚性配准，使提示与掩膜落在正确位置。</string>
              </property>
              <property name="text">
-              <string>Auto-register supplemental series to source</string>
+              <string>自动将补充序列配准到源</string>
              </property>
              <property name="checked">
               <bool>true</bool>
@@ -1662,10 +1662,10 @@
            <item>
             <widget class="QCheckBox" name="cbConfirmSeriesAligned">
              <property name="toolTip">
-              <string>Skip registration when the DICOM frame of reference cannot be read. Only check this if you are certain the supplemental series is already aligned with the source volume.</string>
+              <string>当无法读取 DICOM 参考坐标系时跳过配准。仅在你确定补充序列已与源体数据对齐时才勾选此项。</string>
              </property>
              <property name="text">
-              <string>I confirm these series are already aligned (skip registration)</string>
+              <string>我确认这些序列已对齐（跳过配准）</string>
              </property>
             </widget>
            </item>
@@ -1674,23 +1674,23 @@
              <item>
               <widget class="QLabel" name="lblRegistrationMode">
                <property name="text">
-                <string>Registration:</string>
+                <string>配准：</string>
                </property>
               </widget>
              </item>
              <item>
               <widget class="QComboBox" name="cbRegistrationMode">
                <property name="toolTip">
-                <string>Rigid handles patient motion and repositioning. Use Affine only when a rigid fit leaves a large residual.</string>
+                <string>刚性可处理患者移动与重新摆位。仅当刚性拟合残差较大时才使用仿射。</string>
                </property>
                <item>
                 <property name="text">
-                 <string>Rigid</string>
+                 <string>刚性</string>
                 </property>
                </item>
                <item>
                 <property name="text">
-                 <string>Affine</string>
+                 <string>仿射</string>
                 </property>
                </item>
               </widget>
@@ -1702,20 +1702,20 @@
              <item>
               <widget class="QPushButton" name="pbRegisterSupplemental">
                <property name="toolTip">
-                <string>Manually register the current working volume to the source volume now, regardless of frame-of-reference detection.</string>
+                <string>立即手动将当前工作体数据配准到源体数据，无论参考坐标系检测结果如何。</string>
                </property>
                <property name="text">
-                <string>Register now</string>
+                <string>立即配准</string>
                </property>
               </widget>
              </item>
              <item>
               <widget class="QPushButton" name="pbClearAlignment">
                <property name="toolTip">
-                <string>Remove any registration transforms and return the supplemental series to its original position.</string>
+                <string>移除所有配准变换，将补充序列恢复到其原始位置。</string>
                </property>
                <property name="text">
-                <string>Clear alignment</string>
+                <string>清除配准</string>
                </property>
               </widget>
              </item>
@@ -1734,7 +1734,7 @@
            <item>
             <widget class="QLabel" name="lblNativeSeriesInferenceHelp">
              <property name="text">
-              <string>Prompts run on the working volume. The result remains a preview until synchronized to the source volume.</string>
+              <string>提示在工作体数据上运行。在同步到源体数据之前，结果始终是预览。</string>
              </property>
              <property name="wordWrap">
               <bool>true</bool>
@@ -1752,14 +1752,14 @@
         <item>
          <widget class="QLabel" name="lblSegOpacity">
           <property name="text">
-           <string>Opacity:</string>
+           <string>不透明度：</string>
           </property>
          </widget>
         </item>
         <item>
          <widget class="QSlider" name="sldSegmentOpacity">
           <property name="toolTip">
-           <string>Display opacity of the currently selected segment (2D fill, outline, and 3D combined).</string>
+           <string>当前所选分段的显示不透明度（2D 填充、轮廓与 3D 合并）。</string>
           </property>
           <property name="minimum">
            <number>0</number>
@@ -1798,24 +1798,24 @@
         <item>
          <widget class="QCheckBox" name="cbEnableLassoClip">
           <property name="text">
-           <string>Limit lasso result to +/- N slices</string>
+           <string>将套索结果限制在 ±N 层切片内</string>
           </property>
           <property name="toolTip">
-           <string>When checked, a lasso result is cropped to the lasso slice plus/minus N slices along the lasso plane axis. Only affects the Lasso tool.</string>
+           <string>勾选后，套索结果会沿套索平面轴裁剪到套索所在切片加减 N 层。仅影响套索工具。</string>
           </property>
          </widget>
         </item>
         <item>
          <widget class="QLabel" name="lblLassoClipN">
           <property name="text">
-           <string>+/- slices:</string>
+           <string>±切片数：</string>
           </property>
          </widget>
         </item>
         <item>
          <widget class="QSpinBox" name="sbLassoClipN">
           <property name="toolTip">
-           <string>0 keeps only the lasso slice.</string>
+           <string>0 表示只保留套索所在的切片。</string>
           </property>
           <property name="minimum">
            <number>0</number>
@@ -1833,16 +1833,16 @@
       <item>
        <widget class="QGroupBox" name="displaySmoothGroup">
         <property name="title">
-         <string>Display smoothing (non-destructive)</string>
+         <string>显示平滑（非破坏性）</string>
         </property>
         <layout class="QVBoxLayout" name="verticalLayout_displaySmooth">
          <item>
           <widget class="QCheckBox" name="cbDisplaySmooth">
            <property name="toolTip">
-            <string>Smooth only the display: both the 2D slice outlines and the 3D surface are rendered from a smoothed closed surface, while the stored segment labelmap is left unchanged. Independent of the Smooth (interpolate) data option above. Use Bake to make the smoothed shape the stored data (for export).</string>
+            <string>仅平滑显示：2D 切片轮廓与 3D 表面均由平滑后的闭合表面渲染，而存储的分段标签图保持不变。与上方的「平滑（插值）」数据选项相互独立。使用「烘焙」可将平滑形状变为存储数据（用于导出）。</string>
            </property>
            <property name="text">
-            <string>Smooth display only (2D + 3D, non-destructive)</string>
+            <string>仅平滑显示（2D + 3D，非破坏性）</string>
            </property>
           </widget>
          </item>
@@ -1851,14 +1851,14 @@
            <item row="0" column="0">
             <widget class="QLabel" name="lblDisplaySmoothStrength">
              <property name="text">
-              <string>Strength:</string>
+              <string>强度：</string>
              </property>
             </widget>
            </item>
            <item row="0" column="1">
             <widget class="QDoubleSpinBox" name="sbDisplaySmoothStrength">
              <property name="toolTip">
-              <string>Surface smoothing strength (0 = none, 1 = maximal).</string>
+              <string>表面平滑强度（0 = 无，1 = 最大）。</string>
              </property>
              <property name="minimum">
               <double>0.000000000000000</double>
@@ -1879,17 +1879,17 @@
          <item>
           <widget class="QPushButton" name="pbBakeDisplaySmooth">
            <property name="toolTip">
-            <string>Bake the currently displayed smooth surface into the segment labelmap (destructive, on demand). After baking, what is stored matches what is shown, so the smoothed result can be exported. The original is restored if the conversion fails.</string>
+            <string>将当前显示的平滑表面烘焙进分段标签图（破坏性，按需）。烘焙后，存储内容与显示内容一致，因此可导出平滑结果。若转换失败则恢复原始数据。</string>
            </property>
            <property name="text">
-            <string>Bake smoothed surface into segment</string>
+            <string>将平滑表面烘焙进分段</string>
            </property>
           </widget>
          </item>
          <item>
           <widget class="QLabel" name="lblDisplaySmoothHelp">
            <property name="text">
-            <string>Display only: the stored mask stays as-is until you click Bake.</string>
+            <string>仅显示：在你点击「烘焙」之前，存储的掩膜保持不变。</string>
            </property>
            <property name="wordWrap">
             <bool>true</bool>
