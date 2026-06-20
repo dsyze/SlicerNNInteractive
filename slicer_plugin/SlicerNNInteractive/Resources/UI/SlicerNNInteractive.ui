@@ -1169,6 +1169,119 @@
          </widget>
         </item>
         <item>
+         <widget class="ctkCollapsibleButton" name="rotateViewGroup">
+          <property name="toolTip">
+           <string>For isotropic single-series data, manually rotate the slice views around the world R/A/S axes to find the best oblique anatomical plane. This only changes the view display (SliceToRAS matrix); image data, the output grid, and segmentation masks are never modified. Disabled in tri-planar multi-series mode.</string>
+          </property>
+          <property name="text">
+           <string>手动旋转观察平面（单序列）</string>
+          </property>
+          <property name="collapsed">
+           <bool>true</bool>
+          </property>
+          <layout class="QVBoxLayout" name="verticalLayout_rotateView">
+           <item>
+            <layout class="QFormLayout" name="formLayout_rotateView">
+             <item row="0" column="0">
+              <widget class="QLabel" name="lblRotateAxis">
+               <property name="text">
+                <string>旋转轴</string>
+               </property>
+              </widget>
+             </item>
+             <item row="0" column="1">
+              <widget class="QComboBox" name="cbRotateAxis">
+               <property name="toolTip">
+                <string>World RAS axis the slice views rotate around.</string>
+               </property>
+               <item>
+                <property name="text">
+                 <string>绕 R 轴</string>
+                </property>
+               </item>
+               <item>
+                <property name="text">
+                 <string>绕 A 轴</string>
+                </property>
+               </item>
+               <item>
+                <property name="text">
+                 <string>绕 S 轴</string>
+                </property>
+               </item>
+              </widget>
+             </item>
+            </layout>
+           </item>
+           <item>
+            <layout class="QHBoxLayout" name="horizontalLayout_rotateAngle">
+             <item>
+              <widget class="QSlider" name="sldRotateAngle">
+               <property name="toolTip">
+                <string>Absolute rotation angle around the selected axis, measured from the current axis baseline. 0 returns to the baseline.</string>
+               </property>
+               <property name="minimum">
+                <number>-180</number>
+               </property>
+               <property name="maximum">
+                <number>180</number>
+               </property>
+               <property name="singleStep">
+                <number>1</number>
+               </property>
+               <property name="value">
+                <number>0</number>
+               </property>
+               <property name="orientation">
+                <enum>Qt::Horizontal</enum>
+               </property>
+              </widget>
+             </item>
+             <item>
+              <widget class="QSpinBox" name="sbRotateAngle">
+               <property name="toolTip">
+                <string>Rotation angle in degrees (linked to the slider).</string>
+               </property>
+               <property name="minimum">
+                <number>-180</number>
+               </property>
+               <property name="maximum">
+                <number>180</number>
+               </property>
+               <property name="value">
+                <number>0</number>
+               </property>
+              </widget>
+             </item>
+            </layout>
+           </item>
+           <item>
+            <widget class="QCheckBox" name="chkLinkViews">
+             <property name="toolTip">
+              <string>Rotate the Red, Yellow and Green views together. When off, only the view under the mouse rotates.</string>
+             </property>
+             <property name="text">
+              <string>联动旋转（红→黄/绿）</string>
+             </property>
+             <property name="checked">
+              <bool>true</bool>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QPushButton" name="btnResetView">
+             <property name="toolTip">
+              <string>Reset the slice views to their standard axial/sagittal/coronal orientation.</string>
+             </property>
+             <property name="text">
+              <string>复位标准正位</string>
+             </property>
+            </widget>
+           </item>
+          </layout>
+         </widget>
+        </item>
+        <item>
          <widget class="QGroupBox" name="highResOutputGroup">
           <property name="title">
            <string>High-resolution output (optional)</string>
@@ -1814,6 +1927,12 @@
    <class>qMRMLNodeComboBox</class>
    <extends>QComboBox</extends>
    <header>qMRMLNodeComboBox.h</header>
+  </customwidget>
+  <customwidget>
+   <class>ctkCollapsibleButton</class>
+   <extends>QWidget</extends>
+   <header>ctkCollapsibleButton.h</header>
+   <container>1</container>
   </customwidget>
  </customwidgets>
  <resources/>

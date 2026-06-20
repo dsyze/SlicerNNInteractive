@@ -72,6 +72,15 @@ PLANE_DISPLAY_SELECTOR_NAMES = {
     "Green": "cbGreenDisplayVolume",
 }
 
+# Standard (non-oblique) orientation each slice view resets to. Matches Slicer's
+# default Red=Axial, Yellow=Sagittal, Green=Coronal layout. Used by the manual
+# oblique rotation feature to restore a view to its upright orientation.
+STANDARD_VIEW_ORIENTATION = {
+    "Red": "Axial",
+    "Yellow": "Sagittal",
+    "Green": "Coronal",
+}
+
 # Tri-planar 3D locator frames: one hidden line-only model per standard view,
 # drawn in the 3D view to mark where each slice plane currently sits (the 3D
 # counterpart of the 2D slice intersection lines). Names end with the usual
@@ -378,6 +387,19 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # hiding each locator plane individually, plus their container.
         self._triplanar_frame_buttons = {}
         self._triplanar_frame_button_bar = None
+        # Manual oblique rotation (single-series only): the user rotates slice
+        # views around the world R/A/S axes to view an arbitrary anatomical
+        # plane. This only edits the views' SliceToRAS matrices; image data, the
+        # output grid, and segmentation masks are untouched. State is transient
+        # (no QSettings) so a fresh scene starts at standard orientation.
+        # _manual_oblique_flag: True while any view is manually rotated.
+        # _manual_rotated_views: view names currently rotated; drives the wheel
+        #   step branch in _on_slice_node_modified (constant step, no IJK snap).
+        # _rotate_base_matrices: {view_name: vtkMatrix4x4} baseline the absolute
+        #   slider angle is measured from; re-baked when the axis/link changes.
+        self._manual_oblique_flag = False
+        self._manual_rotated_views = set()
+        self._rotate_base_matrices = {}
         # Applying per-plane display volumes enables a sticky view override.
         # Hidden Segment Editor widgets may reset slice backgrounds while
         # activating effects, so restore the user's selections afterward.
@@ -704,8 +726,30 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         spacing (e.g. 5 mm), so a naive nearest-voxel snap bounces back to the
         same slice every tick. When that happens we detect the scroll direction and
         force exactly one voxel step so every wheel event advances one real slice.
+
+        Manually rotated views (see the manual oblique rotation feature) take a
+        separate path: their plane is at an arbitrary world angle where an IJK
+        snap would land on uneven through-plane steps, so instead we advance the
+        offset by exactly one slice spacing along the tilted normal per tick.
         """
         if self._snapping_in_progress:
+            return
+        if view_name in self._manual_rotated_views:
+            # Constant-step scrolling along the tilted normal; skip IJK snapping.
+            before = slice_logic.GetSliceOffset()
+            last = self._snap_last_offset.get(view_name)
+            if last is not None and abs(before - last) < 1e-4:
+                return
+            direction = 1.0 if (last is None or before > last) else -1.0
+            spacing = slice_logic.GetLowestVolumeSliceSpacing()
+            step = spacing[2] if spacing and len(spacing) > 2 else 0.0
+            self._snapping_in_progress = True
+            try:
+                if last is not None and step > 1e-4:
+                    slice_logic.SetSliceOffset(last + direction * step)
+            finally:
+                self._snapping_in_progress = False
+            self._snap_last_offset[view_name] = slice_logic.GetSliceOffset()
             return
         before = slice_logic.GetSliceOffset()
         last = self._snap_last_offset.get(view_name)
@@ -781,6 +825,161 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             slicer.util.showStatusMessage(
                 "Slice scrolling restored to Slicer default.", 4000
             )
+
+    # ---- Manual oblique rotation (single-series view-only feature) ----------
+
+    def rotate_slice_view(self, slice_node, axis_ras, angle_deg, base_matrix=None):
+        """Rotate one slice view's plane by angle_deg around a world RAS axis.
+
+        Display-only: edits the node's SliceToRAS matrix in place and commits
+        with UpdateMatrices(); image data, the output grid, and segmentation are
+        never touched. The rotation is anchored at the view center (SliceToRAS
+        column 4) so the plane spins in place. When base_matrix is given the
+        rotation is absolute (measured from that baseline); otherwise it is
+        applied incrementally to the current matrix.
+        """
+        if slice_node is None:
+            return
+        src = base_matrix if base_matrix is not None else slice_node.GetSliceToRAS()
+        cx = src.GetElement(0, 3)
+        cy = src.GetElement(1, 3)
+        cz = src.GetElement(2, 3)
+        transform = vtk.vtkTransform()
+        transform.Translate(cx, cy, cz)
+        transform.RotateWXYZ(angle_deg, axis_ras[0], axis_ras[1], axis_ras[2])
+        transform.Translate(-cx, -cy, -cz)
+        result = vtk.vtkMatrix4x4()
+        vtk.vtkMatrix4x4.Multiply4x4(transform.GetMatrix(), src, result)
+        slice_to_ras = slice_node.GetSliceToRAS()
+        slice_to_ras.DeepCopy(result)
+        slice_node.UpdateMatrices()
+
+    def _active_slice_view_name(self):
+        """Name of the standard slice view under the mouse, or 'Red' as fallback.
+
+        Used when link-views is off so a single-view rotation targets the view
+        the user is actually looking at.
+        """
+        layout_manager = slicer.app.layoutManager()
+        if layout_manager is not None:
+            for view_name in PLANE_DISPLAY_SELECTOR_NAMES:
+                slice_widget = layout_manager.sliceWidget(view_name)
+                if slice_widget is None:
+                    continue
+                slice_view = slice_widget.sliceView()
+                if slice_view is not None and slice_view.underMouse():
+                    return view_name
+        return "Red"
+
+    def _rotate_target_views(self):
+        """Slice views the rotation controls act on (linked -> all three)."""
+        if self.ui.chkLinkViews.isChecked():
+            return list(PLANE_DISPLAY_SELECTOR_NAMES.keys())
+        return [self._active_slice_view_name()]
+
+    def on_rotate_slider_changed(self, value=None):
+        """Apply the absolute rotation angle to the target views.
+
+        Slider and spin box share this slot; we mirror the value to the other
+        widget (signals blocked) so they stay in sync. The angle is absolute:
+        each target view is rotated from its stored baseline, so dragging back
+        to 0 returns to the baseline instead of accumulating.
+        """
+        axis_index = self.ui.cbRotateAxis.currentIndex
+        axes = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        axis_ras = axes[axis_index] if 0 <= axis_index < 3 else axes[0]
+        # The triggering widget passes the new value; fall back to the slider
+        # for programmatic calls. This keeps slider- and spin-box-driven edits
+        # consistent (the non-sender widget is mirrored below).
+        angle = int(value) if value is not None else self.ui.sldRotateAngle.value
+        # Keep slider and spin box mirrored.
+        for widget in (self.ui.sldRotateAngle, self.ui.sbRotateAngle):
+            if widget.value != angle:
+                blocked = widget.blockSignals(True)
+                widget.value = angle
+                widget.blockSignals(blocked)
+        targets = self._rotate_target_views()
+        self._snapping_in_progress = True
+        try:
+            for view_name, slice_logic, slice_node in (
+                self._iter_standard_slice_logics()
+            ):
+                if view_name not in targets:
+                    continue
+                base = self._rotate_base_matrices.get(view_name)
+                if base is None:
+                    base = vtk.vtkMatrix4x4()
+                    base.DeepCopy(slice_node.GetSliceToRAS())
+                    self._rotate_base_matrices[view_name] = base
+                self.rotate_slice_view(slice_node, axis_ras, angle, base_matrix=base)
+                self._manual_rotated_views.add(view_name)
+                self._snap_last_offset[view_name] = slice_logic.GetSliceOffset()
+        finally:
+            self._snapping_in_progress = False
+        self._manual_oblique_flag = bool(self._manual_rotated_views)
+
+    def _on_rotate_axis_changed(self, *args):
+        """Bake the current pose as the new baseline and zero the angle.
+
+        Switching the rotation axis (or toggling link views) makes the currently
+        displayed orientation the baseline for subsequent absolute rotations, so
+        the slider always starts fresh for the new axis/target set.
+        """
+        for view_name, slice_logic, slice_node in (
+            self._iter_standard_slice_logics()
+        ):
+            if view_name in self._manual_rotated_views:
+                base = vtk.vtkMatrix4x4()
+                base.DeepCopy(slice_node.GetSliceToRAS())
+                self._rotate_base_matrices[view_name] = base
+        for widget in (self.ui.sldRotateAngle, self.ui.sbRotateAngle):
+            blocked = widget.blockSignals(True)
+            widget.value = 0
+            widget.blockSignals(blocked)
+
+    def reset_view_to_standard(self, *args, target_views=None):
+        """Restore views to their standard axial/sagittal/coronal orientation.
+
+        Display-only reset of the manual oblique rotation. target_views lets
+        internal callers (e.g. entering tri-planar mode) force every rotated
+        view back; UI clicks (whose 'checked' bool lands in *args, ignored)
+        reset whatever _rotate_target_views() selects.
+        """
+        if target_views is None:
+            target_views = self._rotate_target_views()
+        snap_on = self._get_snap_slices_setting()
+        self._snapping_in_progress = True
+        try:
+            for view_name, slice_logic, slice_node in (
+                self._iter_standard_slice_logics()
+            ):
+                if view_name not in target_views:
+                    continue
+                orientation = STANDARD_VIEW_ORIENTATION.get(view_name, "Axial")
+                slice_node.SetOrientation(orientation)
+                self._manual_rotated_views.discard(view_name)
+                self._rotate_base_matrices.pop(view_name, None)
+                if snap_on:
+                    slice_logic.SnapSliceOffsetToIJK()
+                self._snap_last_offset[view_name] = slice_logic.GetSliceOffset()
+        finally:
+            self._snapping_in_progress = False
+        for widget in (self.ui.sldRotateAngle, self.ui.sbRotateAngle):
+            blocked = widget.blockSignals(True)
+            widget.value = 0
+            widget.blockSignals(blocked)
+        self._manual_oblique_flag = bool(self._manual_rotated_views)
+
+    def _on_scene_closed_reset_rotation(self, caller=None, event=None):
+        """Drop manual oblique rotation state when the scene closes."""
+        self._manual_rotated_views = set()
+        self._rotate_base_matrices = {}
+        self._manual_oblique_flag = False
+        if hasattr(self, "ui"):
+            for widget in (self.ui.sldRotateAngle, self.ui.sbRotateAngle):
+                blocked = widget.blockSignals(True)
+                widget.value = 0
+                widget.blockSignals(blocked)
 
     def _apply_plane_display_volumes(self, show_status=False):
         """Apply the configured supplemental backgrounds to standard slice views."""
@@ -3789,6 +3988,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._set_qsetting(SETTING_TRIPLANAR_ENABLED, bool(checked))
         self._triplanar_mode = bool(checked)
         self._active_inference_volume_override = None
+        # Manual oblique rotation is single-series only; entering tri-planar mode
+        # undoes any manual rotation (so it does not fight the auto-assigned
+        # acquisition-plane views) and greys out the rotation panel.
+        if hasattr(self, "ui"):
+            self.ui.rotateViewGroup.setEnabled(not self._triplanar_mode)
+        if checked and self._manual_rotated_views:
+            self.reset_view_to_standard(
+                target_views=list(self._manual_rotated_views))
         if checked:
             ok = self._setup_triplanar_views()
             print("[DEBUG triplanar.mode] view setup returned {}".format(ok))
@@ -4361,6 +4568,26 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.cbSnapSlicesToGrid.setChecked(self._get_snap_slices_setting())
         self.ui.cbSnapSlicesToGrid.blockSignals(blocked)
 
+        # Manual oblique rotation (single-series). Display-only; disabled while
+        # tri-planar mode owns the view orientation. State is transient (no
+        # persisted setting), so nothing is restored here at startup.
+        self.ui.sldRotateAngle.valueChanged.connect(self.on_rotate_slider_changed)
+        self.ui.sbRotateAngle.valueChanged.connect(self.on_rotate_slider_changed)
+        self.ui.cbRotateAxis.currentIndexChanged.connect(
+            self._on_rotate_axis_changed
+        )
+        self.ui.chkLinkViews.toggled.connect(self._on_rotate_axis_changed)
+        self.ui.btnResetView.clicked.connect(self.reset_view_to_standard)
+        self.ui.rotateViewGroup.setEnabled(not self._triplanar_mode)
+        # Closing the scene drops the manual rotation state so the next scene
+        # starts at standard orientation (the views are reset by Slicer too).
+        # Registered via VTKObservationMixin so removeObservers() tears it down.
+        self.addObserver(
+            slicer.mrmlScene,
+            slicer.vtkMRMLScene.EndCloseEvent,
+            self._on_scene_closed_reset_rotation,
+        )
+
         # Smooth (interpolated) results. Only honor the persisted preference when
         # the high-resolution output it depends on is actually enabled; otherwise
         # start unchecked rather than silently building a fine grid at startup.
@@ -4611,6 +4838,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.removeObservers()
         self._remove_slice_snap_observers()
         self._teardown_scribble_observer()
+        # Manual oblique rotation is transient view state; drop it so a reload
+        # or new scene starts at standard orientation (no QSettings to clear).
+        self._manual_rotated_views = set()
+        self._rotate_base_matrices = {}
+        self._manual_oblique_flag = False
         # Tri-planar 3D locator frames (model nodes + slice-node observers).
         self._disable_triplanar_slice_frames()
 
