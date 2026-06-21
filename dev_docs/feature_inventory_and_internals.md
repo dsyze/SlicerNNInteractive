@@ -133,6 +133,17 @@
 - **滚轮兼容**：旋转过的视图记入 `_manual_rotated_views`，`_on_slice_node_modified` 对其改走「沿当前倾斜法线等距步进一个层间距、跳过 `SnapSliceOffsetToIJK`」分支（任意斜面上 IJK 吸附会产生不均匀跳动）；该分支复用现有滚轮吸附观察者，仅在 `Snap slices to voxel grid` 勾选时生效。
 - **不持久化**：无 QSettings；`cleanup` 与场景 `EndCloseEvent`（`_on_scene_closed_reset_rotation`）清空状态，下次为干净正位。进入三平面模式前自动 `reset_view_to_standard` 还原，避免与自动配准冲突。
 
+#### 3.x.1 定位线拖拽旋转 + 视角锁定（新 v2，单序列）
+
+**能做什么**：滑块/轴下拉之外，新增可勾选按钮「🔁 定位线旋转模式」（`pbLocatorRotateMode`）。开启后在 2D 切片面板（红/黄/绿）里**抓住一条彩色交叉线左右拖动**即可旋转该线对应的切片：在某操作面里看到的两条交叉线分别属于另外两个面（红视图里的黄线＝黄切片、绿线＝绿切片），抓黄线拖 → 黄切片绕「红操作面法线」转动，**操作面本身不动**（等同 Slicer 原生「旋转切片交线」）；敏感度 1px≈0.5°；抓哪条线只转哪个面。滑块/轴下拉保留为备选。
+
+**解决什么问题**：①滑块调角不直观，直接抓线拖更自然；②手动摆好斜面后，套索/点/框等交互会触发 `_rotate_camera_to_view`/`_align_views_to_volume_planes` 把视图打回正——需要"锁死视角"。
+
+**实现原理**：
+- **2D 拾取**：模式开启时在三个 2D 切片视图的 `sliceView().interactor()` 上以**高优先级**挂 `LeftButtonPress/MouseMove/LeftButtonRelease` 观察者（`_install_locator_rotation_observers`）。按下时用操作面 `GetXYToRAS()` 把像素 (x,y) 映射到 RAS 点 P；对另两个面取面原点+法线，用「P 到候选面的垂距」`|dot(P-Oc, N̂c)|`（=操作面上到该交叉线的距离）选最近且 ≤ `LOCATOR_PICK_TOL_MM`(3mm) 的面为目标；命中则 `SetAbortFlag(1)` 拦截默认平移并武装拖拽，未命中放行默认导航。
+- **旋转**：拖拽中 `angle=(x-start_x)*LOCATOR_ROTATE_DEG_PER_PX`，复用扩展后的 `rotate_slice_view(target, axis=操作面法线, angle, base_matrix=按下时姿态, center_ras=三面公共交点)`——新增 `center_ras` 锚点让定位线绕十字交点转而非绕切片自身中心；写矩阵后 `SetOrientationToOblique()` 防 Slicer 自动回正。目标视图记入 `_manual_rotated_views` → 自动复用 §3.x 的滚轮逐层分支。base 只存于 `_locator_drag`、不污染滑块的 `_rotate_base_matrices`。三面公共交点由三平面方程组（Cramer）解出（`_three_plane_intersection`），退化时回退到 P。
+- **视角锁定 `_view_rotation_locked`**：任何手动旋转（滑块或定位线拖拽）后置 True；`_rotate_camera_to_view` 与 `_align_views_to_volume_planes` **函数开头**早退 → 套索/点/框、装吸附观察者、应用平面背景都不再重定向视图。`reset_view_to_standard` 把视图还原标准 Ax/Cor/Sag 并 `JumpSliceByCentering` 居中、按剩余旋转视图重算锁标志（全复位即解锁）。进入三平面模式：自动取消勾选并禁用按钮（`pbLocatorRotateMode`）、清锁、复位。`cleanup`/场景关闭移除观察者并清锁。
+
 ---
 
 ## 四、3D 相机斜位对齐（新） — [[oblique_camera_alignment]]
@@ -394,8 +405,10 @@
   └─ 产出：覆盖当前段 + 平滑 VR 模型
 
 手动旋转观察平面（单序列，纯显示）
-  ├─ 复用：滚轮吸附观察者（旋转视图走等距步进、跳过 IJK 吸附）
-  ├─ 互斥：三平面模式激活时灰显禁用，并先复位手动旋转
+  ├─ 入口：滑块/轴下拉 或 定位线拖拽模式（pbLocatorRotateMode，2D 面板抓交叉线）
+  ├─ 复用：滚轮吸附观察者（旋转视图走等距步进、跳过 IJK 吸附）+ rotate_slice_view（加 center_ras 锚点）
+  ├─ 锁定：手动旋转后 _view_rotation_locked=True → _rotate_camera_to_view / _align_views_to_volume_planes 早退（套索/点/框不再回正）；复位解锁
+  ├─ 互斥：三平面模式激活时灰显禁用（含定位线按钮）、清锁，并先复位手动旋转
   └─ 解耦：只改 SliceToRAS，不碰图像/输出网格/掩码；不持久化（场景关闭即复位）
 
 3D 相机斜位对齐
@@ -435,6 +448,8 @@
 | 高分辨率内存 | 大视野细间距网格内存消耗大；超预算自动粗化间距 |
 | 闭合曲线裁剪沿视线 | Draw Crop Region 按"绘制结束瞬间"的视线方向拉伸成无限棱柱；该方向冻结后旋转视角不改变结果。透视相机用近似投影，平行相机精确 |
 | 手动旋转仅单序列 | 手动旋转观察平面只对单序列有意义，三平面模式下禁用；滚轮逐层步进依赖 `Snap slices to voxel grid` 勾选（关掉则旋转后滚轮回到 Slicer 默认连续滚动）；非联动时以鼠标所在视图为目标，鼠标不在任一切片视图上时回退红视图 |
+| 视角锁定后自动回正/Face 失效 | 手动旋转（滑块或定位线拖拽）后 `_view_rotation_locked=True`，`_rotate_camera_to_view`/`_align_views_to_volume_planes` 一律早退——副作用是锁定期间「Face 红/黄/绿」按钮与三平面自动相机旋转也不生效；点「复位标准正位」解锁后恢复（设计取舍：彻底锁死视角优先） |
+| 定位线拾取为近似 | 拾取用「点到候选面的垂距」近似「点到交叉线距离」，强斜面下二者有 1/sin(二面角) 的偏差（容差实际略放宽，不影响命中最近线）；阈值 `LOCATOR_PICK_TOL_MM`(3mm) 可调 |
 | 内嵌分段编辑器不随插件本地化 | 嵌入的 `qMRMLSegmentEditorWidget`（各 Effect 名、分段表头、Add/Remove 等）与 `qMRMLNodeComboBox` 的 None/节点名由 Slicer 本体提供，**跟随 Slicer 应用语言**，本插件的 `.ui` 直译与 `zh_CN.json` 改不到它们；要它们中文需把 Slicer 应用语言设为中文（见第十九节） |
 
 ---

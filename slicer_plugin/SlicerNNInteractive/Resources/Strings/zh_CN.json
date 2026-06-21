@@ -134,5 +134,6 @@
   "Multi-view lasso: {} view(s) accumulated. Click Submit to run.": "多视图套索：已累积 {} 个视图。点击「提交」以运行。",
   "Segment cropped ({}).": "分段已裁剪（{}）。",
   "Crop failed: {}": "裁剪失败：{}",
-  "Slice views unavailable: ": "切片视图不可用："
+  "Slice views unavailable: ": "切片视图不可用：",
+  "Locator-line rotation: grab a colored intersection line in a 2D panel and drag left/right.": "定位线旋转：在 2D 面板里抓住一条彩色交叉线左右拖动。"
 }

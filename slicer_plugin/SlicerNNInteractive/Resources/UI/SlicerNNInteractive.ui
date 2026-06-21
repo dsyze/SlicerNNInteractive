@@ -1181,6 +1181,25 @@
           </property>
           <layout class="QVBoxLayout" name="verticalLayout_rotateView">
            <item>
+            <widget class="QPushButton" name="pbLocatorRotateMode">
+             <property name="minimumSize">
+              <size>
+               <width>0</width>
+               <height>30</height>
+              </size>
+             </property>
+             <property name="toolTip">
+              <string>开启后，在 2D 切片面板（红/黄/绿）中抓住一条彩色交叉线左右拖动，即可旋转该线对应的切片（操作面本身不动，鼠标水平移动 1 像素约 0.5 度）。手动旋转后视角会被锁定，套索/点/框等交互不再使视图回正；点「复位标准正位」解除锁定。滑块与轴下拉作为备选保留。</string>
+             </property>
+             <property name="text">
+              <string>🔁 定位线旋转模式</string>
+             </property>
+             <property name="checkable">
+              <bool>true</bool>
+             </property>
+            </widget>
+           </item>
+           <item>
             <layout class="QFormLayout" name="formLayout_rotateView">
              <item row="0" column="0">
               <widget class="QLabel" name="lblRotateAxis">

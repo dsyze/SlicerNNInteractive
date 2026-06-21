@@ -82,6 +82,15 @@ STANDARD_VIEW_ORIENTATION = {
     "Green": "Coronal",
 }
 
+# Locator-line drag rotation (single-series): dragging a colored slice-
+# intersection line in a 2D panel rotates the slice that line belongs to.
+# Sensitivity: 1 px of horizontal mouse motion -> this many degrees.
+LOCATOR_ROTATE_DEG_PER_PX = 0.5
+# Click tolerance for picking a line: the perpendicular RAS distance (mm) from
+# the click to the other plane. The user asked for ~2 mm; kept a touch looser
+# so the thin line is still easy to grab.
+LOCATOR_PICK_TOL_MM = 3.0
+
 # Tri-planar 3D locator frames: one hidden line-only model per standard view,
 # drawn in the 3D view to mark where each slice plane currently sits (the 3D
 # counterpart of the 2D slice intersection lines). Names end with the usual
@@ -459,6 +468,17 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._manual_oblique_flag = False
         self._manual_rotated_views = set()
         self._rotate_base_matrices = {}
+        # Locator-line drag rotation (single-series). _view_rotation_locked
+        # freezes the auto re-centering (_rotate_camera_to_view /
+        # _align_views_to_volume_planes) once the user has rotated by hand (via
+        # the slider or by dragging a locator line), so a prompt/lasso never
+        # snaps the view back; it is cleared by reset_view_to_standard.
+        # _locator_rotation_observers: (interactor, tag) pairs installed on the
+        # three 2D slice views while the mode is on. _locator_drag holds the
+        # in-flight drag state (target view, rotation axis, baseline, anchor).
+        self._view_rotation_locked = False
+        self._locator_rotation_observers = []
+        self._locator_drag = None
         # Applying per-plane display volumes enables a sticky view override.
         # Hidden Segment Editor widgets may reset slice backgrounds while
         # activating effects, so restore the user's selections afterward.
@@ -748,6 +768,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         (rotating would be a no-op and could override a manual orientation). After
         rotating, snap the offset onto the nearest slice center.
         """
+        if getattr(self, "_view_rotation_locked", False):
+            return  # user pinned the orientation by hand; never re-align
         if getattr(self, "_snapping_in_progress", False):
             return
         _perf_log("[DEBUG triplanar.perf] align_views start")
@@ -887,22 +909,28 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     # ---- Manual oblique rotation (single-series view-only feature) ----------
 
-    def rotate_slice_view(self, slice_node, axis_ras, angle_deg, base_matrix=None):
+    def rotate_slice_view(self, slice_node, axis_ras, angle_deg, base_matrix=None,
+                          center_ras=None):
         """Rotate one slice view's plane by angle_deg around a world RAS axis.
 
         Display-only: edits the node's SliceToRAS matrix in place and commits
         with UpdateMatrices(); image data, the output grid, and segmentation are
-        never touched. The rotation is anchored at the view center (SliceToRAS
-        column 4) so the plane spins in place. When base_matrix is given the
-        rotation is absolute (measured from that baseline); otherwise it is
-        applied incrementally to the current matrix.
+        never touched. The rotation is anchored at center_ras when given, else at
+        the view center (SliceToRAS column 4) so the plane spins in place. The
+        locator-line drag passes the three-plane intersection point so the line
+        pivots about the crosshair. When base_matrix is given the rotation is
+        absolute (measured from that baseline); otherwise it is applied
+        incrementally to the current matrix.
         """
         if slice_node is None:
             return
         src = base_matrix if base_matrix is not None else slice_node.GetSliceToRAS()
-        cx = src.GetElement(0, 3)
-        cy = src.GetElement(1, 3)
-        cz = src.GetElement(2, 3)
+        if center_ras is not None:
+            cx, cy, cz = center_ras[0], center_ras[1], center_ras[2]
+        else:
+            cx = src.GetElement(0, 3)
+            cy = src.GetElement(1, 3)
+            cz = src.GetElement(2, 3)
         transform = vtk.vtkTransform()
         transform.Translate(cx, cy, cz)
         transform.RotateWXYZ(angle_deg, axis_ras[0], axis_ras[1], axis_ras[2])
@@ -976,6 +1004,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         finally:
             self._snapping_in_progress = False
         self._manual_oblique_flag = bool(self._manual_rotated_views)
+        if self._manual_rotated_views:
+            # Pin the orientation so prompts/lasso never auto-recenter it.
+            self._view_rotation_locked = True
 
     def _on_rotate_axis_changed(self, *args):
         """Bake the current pose as the new baseline and zero the angle.
@@ -1015,7 +1046,22 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 if view_name not in target_views:
                     continue
                 orientation = STANDARD_VIEW_ORIENTATION.get(view_name, "Axial")
+                # Standard axial/sagittal/coronal orientation (SetOrientation is
+                # equivalent to the SetOrientationToAxial/Sagittal/Coronal
+                # helpers) plus a re-center on the volume.
                 slice_node.SetOrientation(orientation)
+                volume = (self._view_background_volume(view_name)
+                          or self.get_volume_node())
+                if volume is not None:
+                    bounds = [0.0] * 6
+                    volume.GetRASBounds(bounds)
+                    try:
+                        slice_node.JumpSliceByCentering(
+                            0.5 * (bounds[0] + bounds[1]),
+                            0.5 * (bounds[2] + bounds[3]),
+                            0.5 * (bounds[4] + bounds[5]))
+                    except Exception:  # noqa: BLE001 - centering is best-effort
+                        pass
                 self._manual_rotated_views.discard(view_name)
                 self._rotate_base_matrices.pop(view_name, None)
                 if snap_on:
@@ -1028,17 +1074,218 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             widget.value = 0
             widget.blockSignals(blocked)
         self._manual_oblique_flag = bool(self._manual_rotated_views)
+        # Clicking Reset unlocks the view; if some views are still rotated
+        # (partial, link-off reset) the remaining ones keep the lock.
+        self._view_rotation_locked = bool(self._manual_rotated_views)
 
     def _on_scene_closed_reset_rotation(self, caller=None, event=None):
         """Drop manual oblique rotation state when the scene closes."""
         self._manual_rotated_views = set()
         self._rotate_base_matrices = {}
         self._manual_oblique_flag = False
+        self._view_rotation_locked = False
         if hasattr(self, "ui"):
             for widget in (self.ui.sldRotateAngle, self.ui.sbRotateAngle):
                 blocked = widget.blockSignals(True)
                 widget.value = 0
                 widget.blockSignals(blocked)
+
+    # -- Locator-line drag rotation (single-series) --------------------------
+
+    def on_locator_rotate_mode_toggled(self, checked):
+        """Enter/leave the mode where dragging a 2D intersection line rotates
+        the slice that line belongs to."""
+        if checked:
+            self._install_locator_rotation_observers()
+            _status(_cn(
+                "Locator-line rotation: grab a colored intersection line in a "
+                "2D panel and drag left/right."), 5000)
+        else:
+            self._remove_locator_rotation_observers()
+
+    def _install_locator_rotation_observers(self):
+        """Watch the three 2D slice-view interactors for left-drag rotation.
+
+        High observer priority so we can pick a line and SetAbortFlag before the
+        default slice interactor pans/zooms; a click that misses every line is
+        left untouched so normal navigation still works.
+        """
+        self._remove_locator_rotation_observers()
+        layout_manager = slicer.app.layoutManager()
+        if layout_manager is None:
+            return
+        observers = []
+        for view_name in PLANE_DISPLAY_SELECTOR_NAMES:
+            slice_widget = layout_manager.sliceWidget(view_name)
+            slice_view = slice_widget.sliceView() if slice_widget else None
+            interactor = slice_view.interactor() if slice_view is not None else None
+            if interactor is None:
+                continue
+            press = interactor.AddObserver(
+                vtk.vtkCommand.LeftButtonPressEvent,
+                lambda c, e, v=view_name: self._on_locator_press(v, c, e), 10.0)
+            move = interactor.AddObserver(
+                vtk.vtkCommand.MouseMoveEvent,
+                lambda c, e, v=view_name: self._on_locator_drag(v, c, e), 10.0)
+            release = interactor.AddObserver(
+                vtk.vtkCommand.LeftButtonReleaseEvent,
+                lambda c, e, v=view_name: self._on_locator_release(v, c, e), 10.0)
+            observers.append((interactor, press))
+            observers.append((interactor, move))
+            observers.append((interactor, release))
+        self._locator_rotation_observers = observers
+
+    def _remove_locator_rotation_observers(self):
+        """Detach the locator-line interactor observers (no-op if none)."""
+        for interactor, tag in getattr(self, "_locator_rotation_observers", []):
+            try:
+                if interactor is not None:
+                    interactor.RemoveObserver(tag)
+            except Exception:  # noqa: BLE001 - interactor may be gone already
+                pass
+        self._locator_rotation_observers = []
+        self._locator_drag = None
+
+    def _slice_plane_origin_normal(self, slice_node):
+        """(origin, unit normal) of a slice plane from its SliceToRAS, or
+        (origin, None) when the normal is degenerate."""
+        if slice_node is None:
+            return None, None
+        m = slice_node.GetSliceToRAS()
+        origin = [m.GetElement(i, 3) for i in range(3)]
+        normal = [m.GetElement(i, 2) for i in range(3)]
+        length = (normal[0] ** 2 + normal[1] ** 2 + normal[2] ** 2) ** 0.5
+        if length < 1e-9:
+            return origin, None
+        return origin, [normal[i] / length for i in range(3)]
+
+    def _three_plane_intersection(self):
+        """RAS point where the Red/Yellow/Green planes meet, or None.
+
+        Solves the 3x3 system [n_i . x = n_i . o_i] by Cramer's rule; returns
+        None if the planes are (near) linearly dependent.
+        """
+        planes = []
+        for _vn, _logic, node in self._iter_standard_slice_logics():
+            o, n = self._slice_plane_origin_normal(node)
+            if n is None:
+                return None
+            planes.append((o, n))
+        if len(planes) < 3:
+            return None
+        a = [planes[i][1] for i in range(3)]
+        b = [sum(planes[i][1][k] * planes[i][0][k] for k in range(3))
+             for i in range(3)]
+
+        def _det(m):
+            return (m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+                    - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+                    + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]))
+
+        det = _det(a)
+        if abs(det) < 1e-9:
+            return None
+        out = []
+        for col in range(3):
+            mat = [row[:] for row in a]
+            for r in range(3):
+                mat[r][col] = b[r]
+            out.append(_det(mat) / det)
+        return out
+
+    def _on_locator_press(self, op_view_name, caller, event):
+        """Pick the nearest other-view intersection line under the click and
+        arm a drag to rotate that view's slice about the operation plane's
+        normal. A miss leaves default navigation untouched."""
+        self._locator_drag = None
+        layout_manager = slicer.app.layoutManager()
+        if layout_manager is None:
+            return
+        op_widget = layout_manager.sliceWidget(op_view_name)
+        op_node = op_widget.mrmlSliceNode() if op_widget else None
+        if op_node is None:
+            return
+        x, y = caller.GetEventPosition()
+        ras = op_node.GetXYToRAS().MultiplyPoint([float(x), float(y), 0.0, 1.0])
+        p = [ras[0], ras[1], ras[2]]
+        _op_origin, op_normal = self._slice_plane_origin_normal(op_node)
+        if op_normal is None:
+            return
+        best_view, best_dist = None, None
+        for cand_name, _cand_logic, cand_node in self._iter_standard_slice_logics():
+            if cand_name == op_view_name:
+                continue
+            c_origin, c_normal = self._slice_plane_origin_normal(cand_node)
+            if c_normal is None:
+                continue
+            # The cand line in this panel is where the click's distance to the
+            # cand plane is zero; use that perpendicular distance as the metric.
+            d = abs(sum((p[i] - c_origin[i]) * c_normal[i] for i in range(3)))
+            if best_dist is None or d < best_dist:
+                best_view, best_dist = cand_name, d
+        if best_view is None or best_dist is None or best_dist > LOCATOR_PICK_TOL_MM:
+            return  # missed every line; let the default style pan/zoom
+        target_widget = layout_manager.sliceWidget(best_view)
+        target_node = target_widget.mrmlSliceNode() if target_widget else None
+        if target_node is None:
+            return
+        base = vtk.vtkMatrix4x4()
+        base.DeepCopy(target_node.GetSliceToRAS())
+        # Keep the baseline only on the drag; do NOT write _rotate_base_matrices
+        # so the slider, used after a drag, re-bakes from the dragged pose
+        # instead of snapping back to this press orientation.
+        anchor = self._three_plane_intersection() or p
+        self._locator_drag = {
+            "target_view": best_view,
+            "axis_ras": list(op_normal),
+            "base": base,
+            "start_x": float(x),
+            "anchor": list(anchor),
+        }
+        caller.SetAbortFlag(1)
+
+    def _on_locator_drag(self, op_view_name, caller, event):
+        """Rotate the armed target slice by 0.5 deg per px of horizontal drag
+        about the operation plane's normal, pivoting on the crosshair."""
+        drag = self._locator_drag
+        if not drag:
+            return
+        x, _y = caller.GetEventPosition()
+        angle = (float(x) - drag["start_x"]) * LOCATOR_ROTATE_DEG_PER_PX
+        target_view = drag["target_view"]
+        layout_manager = slicer.app.layoutManager()
+        target_widget = (layout_manager.sliceWidget(target_view)
+                         if layout_manager else None)
+        target_node = target_widget.mrmlSliceNode() if target_widget else None
+        target_logic = target_widget.sliceLogic() if target_widget else None
+        if target_node is None:
+            return
+        self._snapping_in_progress = True
+        try:
+            self.rotate_slice_view(
+                target_node, drag["axis_ras"], angle,
+                base_matrix=drag["base"], center_ras=drag["anchor"])
+            # Keep Slicer from relabeling the tilted plane as a standard
+            # orientation and auto-correcting it back.
+            try:
+                target_node.SetOrientationToOblique()
+            except Exception:  # noqa: BLE001 - older API without the helper
+                pass
+        finally:
+            self._snapping_in_progress = False
+        self._manual_rotated_views.add(target_view)
+        if target_logic is not None:
+            self._snap_last_offset[target_view] = target_logic.GetSliceOffset()
+        self._manual_oblique_flag = True
+        self._view_rotation_locked = True
+        caller.SetAbortFlag(1)
+
+    def _on_locator_release(self, op_view_name, caller, event):
+        """End the current drag (target stays in _manual_rotated_views so the
+        wheel keeps stepping one slice along its tilted normal)."""
+        if self._locator_drag is not None:
+            self._locator_drag = None
+            caller.SetAbortFlag(1)
 
     def _apply_plane_display_volumes(self, show_status=False):
         """Apply the configured supplemental backgrounds to standard slice views."""
@@ -3582,6 +3829,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         2D screen-up (its SliceToRAS column 1) rolled about the view axis, so the
         3D up matches what the 2D view shows, re-orthogonalized against the
         forward. No-op without a 3D view/camera or valid plane geometry."""
+        if getattr(self, "_view_rotation_locked", False):
+            return  # user pinned the orientation by hand; do not face/re-aim
         layout_manager = slicer.app.layoutManager()
         if layout_manager is None or layout_manager.threeDViewCount == 0:
             return
@@ -4052,6 +4301,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # acquisition-plane views) and greys out the rotation panel.
         if hasattr(self, "ui"):
             self.ui.rotateViewGroup.setEnabled(not self._triplanar_mode)
+            # Locator-line drag rotation is single-series only: turn it off and
+            # disable it in tri-planar mode (views must stay fixed there).
+            if self._triplanar_mode and self.ui.pbLocatorRotateMode.isChecked():
+                self.ui.pbLocatorRotateMode.setChecked(False)
+            self.ui.pbLocatorRotateMode.setEnabled(not self._triplanar_mode)
+        if checked:
+            self._view_rotation_locked = False
         if checked and self._manual_rotated_views:
             self.reset_view_to_standard(
                 target_views=list(self._manual_rotated_views))
@@ -4637,6 +4893,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         )
         self.ui.chkLinkViews.toggled.connect(self._on_rotate_axis_changed)
         self.ui.btnResetView.clicked.connect(self.reset_view_to_standard)
+        # Locator-line drag rotation: a checkable mode that grabs the colored
+        # intersection lines in the 2D panels (installs/removes interactor
+        # observers on toggle).
+        self.ui.pbLocatorRotateMode.toggled.connect(
+            self.on_locator_rotate_mode_toggled)
+        self.ui.pbLocatorRotateMode.setEnabled(not self._triplanar_mode)
         self.ui.rotateViewGroup.setEnabled(not self._triplanar_mode)
         # Closing the scene drops the manual rotation state so the next scene
         # starts at standard orientation (the views are reset by Slicer too).
@@ -4896,12 +5158,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """
         self.removeObservers()
         self._remove_slice_snap_observers()
+        self._remove_locator_rotation_observers()
         self._teardown_scribble_observer()
         # Manual oblique rotation is transient view state; drop it so a reload
         # or new scene starts at standard orientation (no QSettings to clear).
         self._manual_rotated_views = set()
         self._rotate_base_matrices = {}
         self._manual_oblique_flag = False
+        self._view_rotation_locked = False
         # Tri-planar 3D locator frames (model nodes + slice-node observers).
         self._disable_triplanar_slice_frames()
 
