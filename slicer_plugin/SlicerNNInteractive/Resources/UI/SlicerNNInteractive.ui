@@ -930,6 +930,80 @@
           </widget>
          </item>
          <item>
+          <widget class="QGroupBox" name="sliceEditGroup">
+           <property name="title">
+            <string>逐层编辑（当前段）：</string>
+           </property>
+           <layout class="QVBoxLayout" name="verticalLayout_sliceEdit">
+            <item>
+             <widget class="QLabel" name="lblSliceEditHint">
+              <property name="toolTip">
+               <string>逐层编辑作用于当前分段，沿当前（或最近滚动/交互的）2D 视图所对应的输出网格轴。斜位/手动旋转视图不支持。</string>
+              </property>
+              <property name="text">
+               <string>沿当前/最近交互视图轴：复制相邻层 · 在已画关键层之间插值补齐。</string>
+              </property>
+              <property name="wordWrap">
+               <bool>true</bool>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <layout class="QHBoxLayout" name="horizontalLayout_slice_edit">
+              <item>
+               <widget class="QPushButton" name="pbCopyFromPrevSlice">
+                <property name="minimumSize">
+                 <size>
+                  <width>0</width>
+                  <height>30</height>
+                 </size>
+                </property>
+                <property name="toolTip">
+                 <string>用上一层（索引 -1）的当前分段掩码替换本层。可撤销；会同步到服务器。</string>
+                </property>
+                <property name="text">
+                 <string>从上一层复制</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QPushButton" name="pbCopyFromNextSlice">
+                <property name="minimumSize">
+                 <size>
+                  <width>0</width>
+                  <height>30</height>
+                 </size>
+                </property>
+                <property name="toolTip">
+                 <string>用下一层（索引 +1）的当前分段掩码替换本层。可撤销；会同步到服务器。</string>
+                </property>
+                <property name="text">
+                 <string>从下一层复制</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QPushButton" name="pbFillBetweenSlices">
+                <property name="minimumSize">
+                 <size>
+                  <width>0</width>
+                  <height>30</height>
+                 </size>
+                </property>
+                <property name="toolTip">
+                 <string>沿当前视图轴，在所有已画分段的关键层之间用形状（距离场）插值自动补齐中间的空层。可撤销；会同步到服务器。</string>
+                </property>
+                <property name="text">
+                 <string>层间插值填充</string>
+                </property>
+               </widget>
+              </item>
+             </layout>
+            </item>
+           </layout>
+          </widget>
+         </item>
+         <item>
           <widget class="QGroupBox" name="uploadProgressGroup">
            <property name="title">
             <string>上传进度：</string>

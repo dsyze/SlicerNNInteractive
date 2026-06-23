@@ -340,7 +340,7 @@
 
 ### 14.5 配套
 
-- **3D 定位面**：半透明矩形标出各序列切片范围（`TRIPLANAR_FRAME_NODE_NAMES`），不透明度由 `sldPlaneOpacity` 滑块调（`SETTING_PLANE_OPACITY`），可逐视图显隐（`SETTING_TRIPLANAR_FRAME_VISIBLE_PREFIX` + 红/黄/绿三个 R/Y/G 切换）。
+- **3D 定位面 / 参考面（单+多序列通用）**：半透明矩形标出切片范围（`TRIPLANAR_FRAME_NODE_NAMES`），不透明度由 `sldPlaneOpacity` 滑块调（`SETTING_PLANE_OPACITY`），可逐视图显隐（`SETTING_TRIPLANAR_FRAME_VISIBLE_PREFIX` + 红/黄/绿三个 R/Y/G 切换）。**此功能不再绑定三平面模式**：`_ensure_triplanar_slice_frames` 已去掉 `_triplanar_mode` 门控，任一已实现视图有背景体即建；单序列下三视图同为源体、各方向各画一张，tri-planar 下各面按自身分配序列。单序列触发点：`setup()` 末尾、`get_volume_node` 自动选源体后、上传图像成功后（均经 `_schedule_ensure_slice_frames` 延迟一拍、幂等）。
 - **显示分割 3D 闭合曲面**（`cbShow3DTriPlanar`，`SETTING_SHOW_3D_TRIPLANAR`）：开启后每次交互在 3D 视图重建并显示当前段的封闭曲面。重建是**防抖**的（`_schedule_triplanar_3d_surface` → `QTimer.singleShot(TRIPLANAR_3D_SURFACE_DEBOUNCE_MS=600ms)` + 自增 token 去重）——一连串快速交互只在用户停手后跑**一次**（重的 marching-cubes），避免每点一下都卡顿；若显示平滑开启则把平滑因子并入曲面转换参数。
 - **交互后相机自动旋转**到激活序列采集平面（见第四节）。
 - 此模式下**旁路多视图套索累积**（各视图本就是不同序列，逐视图即时路由提交即可）。
@@ -429,6 +429,11 @@
   ├─ 魔棒 / Lasso(3D)：临时借用 AI（备份/恢复服务端状态）
   ├─ 闭合曲线裁剪：前景体素投到冻结相机屏幕平面 + 点在多边形内（不调用 AI）
   └─ 结果经 show_segmentation -> 立即上传同步
+
+逐层编辑（跨层复制 / 层间插值）
+  ├─ 依赖：输出网格（取整面 / 求层号 / 轴向）+ 当前作用视图轴对齐判定
+  ├─ 复用：选区运算撤销栈 + 写回链（_commit_layer_edit），共用「撤销」按钮
+  └─ 层间插值复用 SDF 范式（distance_transform_edt）
 ```
 
 ---
@@ -451,6 +456,7 @@
 | 视角锁定后自动回正/Face 失效 | 手动旋转（滑块或定位线拖拽）后 `_view_rotation_locked=True`，`_rotate_camera_to_view`/`_align_views_to_volume_planes` 一律早退——副作用是锁定期间「Face 红/黄/绿」按钮与三平面自动相机旋转也不生效；点「复位标准正位」解锁后恢复（设计取舍：彻底锁死视角优先） |
 | 定位线拾取为近似 | 拾取用「点到候选面的垂距」近似「点到交叉线距离」，强斜面下二者有 1/sin(二面角) 的偏差（容差实际略放宽，不影响命中最近线）；阈值 `LOCATOR_PICK_TOL_MM`(3mm) 可调 |
 | 内嵌分段编辑器不随插件本地化 | 嵌入的 `qMRMLSegmentEditorWidget`（各 Effect 名、分段表头、Add/Remove 等）与 `qMRMLNodeComboBox` 的 None/节点名由 Slicer 本体提供，**跟随 Slicer 应用语言**，本插件的 `.ui` 直译与 `zh_CN.json` 改不到它们；要它们中文需把 Slicer 应用语言设为中文（见第十九节） |
+| 逐层编辑仅轴对齐视图 | 跨层复制/层间插值把「层」当作输出网格上的一个 numpy 整面，故只在作用视图的切片法向贴近某输出轴（`OBLIQUE_COS_THRESHOLD`）且非手动旋转时可用，否则提示并拒绝；三平面下若序列采集面与输出网格斜交多半判为未对齐；作用视图取「鼠标所在视图→最近滚动视图→红」，滚轮吸附关闭时无滚动观察者，回退红视图（见第二十节） |
 
 ---
 
@@ -476,6 +482,33 @@
 - `_cn` / `_status` / `_mb_warning` / `_mb_critical` / `_mb_information`（`SlicerNNInteractive.py` 模块级，class 之前）
 - 字符串表：`slicer_plugin/SlicerNNInteractive/Resources/Strings/zh_CN.json`
 - 设计稿：[[chinese_localization]]
+
+---
+
+## 二十、逐层编辑：跨层复制 + 层间插值（新） — [[slice_by_slice_editing]]
+
+### 能做什么
+
+- **跨层复制**：「从上一层复制 / 从下一层复制」两个按钮，把当前段在相邻切片层的掩码**整面替换**到当前层（移植自 label_client 的「从上一张/下一张」继承）。
+- **层间插值填充**：「层间插值填充」按钮，沿当前视图轴在所有「已画分段的关键层」之间，用形状（距离场）插值一键补齐中间的空层。
+
+### 解决什么问题
+
+- 插件已有 Paint/Scribble 逐层手绘，但缺「把相邻层标注拷来当起点再微调」和「只画几张关键层、中间自动补齐」这两类逐层标注的常见提速操作。
+
+### 实现原理
+
+- **作用视图/层/轴解析**：`_active_layer_axis()` 取作用视图（鼠标所在 `_active_slice_view_name` → 最近滚动的 `_last_active_slice_view` → 红），由 `GetSliceToRAS` 取切片法向，投影到**输出网格** IJK-to-RAS 三列（idiom 同 `_series_anisotropic_sigma`）求最近 numpy 轴 `np_axis`；切片原点经 `ras_to_xyz(..., get_output_volume_node())` 得整数层号 `layer_index`；`best_dot ≥ OBLIQUE_COS_THRESHOLD` 且非手动旋转才 `aligned`。
+- **跨层复制**：读 `get_segment_data()`（输出网格 `(z,y,x)`），`new[当前层面] = pre[相邻层面]`（`_slice_plane_index` 构造沿 `np_axis` 的整面索引），替换语义。
+- **层间插值**：`_fill_between_key_slices` 把轴 `np_axis` 搬到 0 轴，找出有前景的关键层，对每对相邻关键层各做 2D 有符号距离场（`scipy.ndimage.distance_transform_edt` 内-外，范式同 `_interpolate_mask_to_output_grid`），按位置 `alpha` 线性混合后阈值 `≥0` 填满中间空层。
+- **统一写回**：`_commit_layer_edit` 复用选区运算同一条链路 `_record_selection_op_undo`（写前 bit-packed 整段快照）→ `show_segmentation` → `setup_prompts` → `upload_segment_to_server`，因此**共用「撤销」按钮** `on_undo_selection_op_clicked`（含输出网格形状校验），且自动满足「一切以输出网格为基准」。不新增隐藏节点、不新增服务端端点。
+- **作用视图跟踪**：`_on_slice_node_modified` 在偏移真正变化时记录 `_last_active_slice_view`（普通与手动旋转两分支都记）。
+
+### 关键入口/跳转
+
+- `_active_layer_axis` / `_slice_plane_index` / `_commit_layer_edit` / `_copy_adjacent_layer` / `on_copy_from_prev_slice_clicked` / `on_copy_from_next_slice_clicked` / `_fill_between_key_slices` / `on_fill_between_slices_clicked`（`SlicerNNInteractive.py`）
+- UI：`pbCopyFromPrevSlice` / `pbCopyFromNextSlice` / `pbFillBetweenSlices`（`Resources/UI/SlicerNNInteractive.ui`，独立的「逐层编辑」分组 `sliceEditGroup`，位于选区运算组与上传进度组之间）
+- 设计稿：[[slice_by_slice_editing]]
 
 ---
 

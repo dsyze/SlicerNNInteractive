@@ -172,10 +172,14 @@ prompt)")。设置键 `SETTING_ALLSERIES_FUSION`(默认 True,经 `_get_allseries
 
 ## 3D 视图切片定位面（含左上角 R/Y/G 开关）
 
+> **通用功能（单/多序列均可）**：这些 3D 参考面**不再是 tri-planar 专属**。单序列模式下也会显示——
+> 三视图背景同为源体,每个面按该源体 RAS 包围盒在三个方向各画一张;tri-planar 模式下每个面按其**自身
+> 分配的序列**包围盒绘制。建立逻辑与控件(R/Y/G 开关、不透明度滑块)两种模式共用,无独立开关。
+
 2D 三视图的彩色相交线由 `enable_slice_intersections()`(`SetIntersectingSlicesVisibility`)提供;
-该 API 只作用于 2D 切片视图,不画到 3D。本功能在 **3D 视图**里给出对应物:进入 tri-planar 时,为
+该 API 只作用于 2D 切片视图,不画到 3D。本功能在 **3D 视图**里给出对应物:为
 Red/Yellow/Green 各建一个隐藏 `vtkMRMLModelNode`(`TRIPLANAR_FRAME_NODE_NAMES`,名以 "(do not touch)"
-结尾),画出该切片平面在其**自身序列** RAS 包围盒范围内的**半透明填充面 + 彩色边框**,颜色取
+结尾),画出该切片平面在对应**背景体** RAS 包围盒范围内的**半透明填充面 + 彩色边框**,颜色取
 `slice_node.GetLayoutColor()`(失败回退 `TRIPLANAR_FRAME_FALLBACK_COLORS`),与 2D 相交线一致。
 - 几何 `_make_slice_frame_polydata`:读 `GetSliceToRAS` 取归一化 u/v/n + 原点;半宽用 AABB 在 u/v 上的
   投影 `0.5*sum(|d|*extent)`;矩形中心 = 序列包围盒中心沿 n 投到当前切片平面 → 面随滚动沿法向平移、
@@ -196,13 +200,16 @@ Red/Yellow/Green 各建一个隐藏 `vtkMRMLModelNode`(`TRIPLANAR_FRAME_NODE_NAM
   观察者,回调统一调 update;末尾建按钮)、`_update_triplanar_slice_frames`(刷新 polydata/颜色/可见性;
   **严禁**在此调 `enable_slice_intersections`,否则 `Modified` 死循环)、`_disable_triplanar_slice_frames`
   (移除观察者 + 删节点 + 销毁按钮 + 清容器)。接线:`_setup_triplanar_views` 成功路径 enable / 序列<2 路径
-  disable;`_on_triplanar_mode_toggled` 离开分支 disable;`cleanup` disable。
-- 触发:`_ensure_triplanar_slice_frames(reason)`(模式开 + 未建 + R/Y/G 中 >=2 个不同序列才建,已建则 no-op,
-  几何由观察者实时刷新)。挂三处:`_apply_plane_display_volumes` 成功处(覆盖显式 Apply 与粘性 reapply)、
-  `_handle_triplanar_result` 开头(交互兜底)、`_setup_triplanar_views` 末尾。这样跨会话**恢复勾选**的会话
-  (`blockSignals` 设勾选不触发 toggle)在用户分配序列/Apply 时也能自动建面,无需手动关再开复选框。
+  先 disable 再 `_schedule_ensure_slice_frames`(按单个背景体重建,而非留空);`_on_triplanar_mode_toggled`
+  离开分支 disable 后 `_schedule_ensure_slice_frames("left-triplanar")`(尺寸从联合网格回退到源体后重建);`cleanup` disable。
+- 触发:`_ensure_triplanar_slice_frames(reason)`(**不再判模式**;未建 + 任一已实现视图有背景体即建,已建则
+  no-op,几何由观察者实时刷新)。`_schedule_ensure_slice_frames(reason)` 用 `QTimer.singleShot(0,...)` 延迟一拍
+  再 ensure,等切片背景结算后再建,幂等。挂点:**单序列** —— `setup()` 末尾(开模块即有体)、`get_volume_node`
+  自动选定源体后、`upload_image_to_server` 成功上传后;**tri-planar** —— `_apply_plane_display_volumes` 成功处、
+  `_handle_triplanar_result` 开头、`_setup_triplanar_views` 末尾。这样单序列载入一个体即出现参考面;跨会话
+  **恢复勾选** tri-planar 的会话也能在分配序列/Apply 时自动建面,无需手动关再开复选框。
   需当前布局含 3D 视图(如 Four-Up)才看得到面与按钮。新前缀 `[DEBUG triplanar.frames]`。
-  已知限制:按钮 attach 到进入时的 `threeDWidget(0)`,进入后切布局会丢按钮,重勾选 tri-planar 重建。
+  已知限制:按钮 attach 到进入时的 `threeDWidget(0)`,进入后切布局会丢按钮,需重建(切模式/重选源体)恢复。
 - 不透明度:面板滑块 `sldPlaneOpacity`(0..100)→ `_on_plane_opacity_changed` 统一设三面 display `SetOpacity`
   并持久化 `SETTING_PLANE_OPACITY`;`_enable_triplanar_slice_frames` 建面时用 `_get_plane_opacity()`(默认
   `TRIPLANAR_FRAME_OPACITY`)。

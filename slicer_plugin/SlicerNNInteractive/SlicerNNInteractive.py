@@ -515,6 +515,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Pending (moving_id, source_id) pairs waiting for a free CLI slot. The
         # three multi-plane display volumes can each need their own registration.
         self._alignment_queue = []
+        # Last standard slice view the user scrolled (set in
+        # _on_slice_node_modified). Drives slice-by-slice editing's "active view"
+        # since a panel-button click leaves no view under the mouse.
+        self._last_active_slice_view = "Red"
 
     def setup(self):
         """
@@ -629,6 +633,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Sweep any orphaned magic wand seed nodes left behind by earlier
         # versions / earlier reloads so the scene is clean on module load.
         self._destroy_wand_seed()
+
+        # Show the 3D reference planes if a volume is already loaded when the
+        # module opens (single-series included). Deferred so the slice views and
+        # their backgrounds have settled first; idempotent and a no-op otherwise.
+        self._schedule_ensure_slice_frames("module-setup")
 
     @staticmethod
     def enable_slice_intersections():
@@ -821,6 +830,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             last = self._snap_last_offset.get(view_name)
             if last is not None and abs(before - last) < 1e-4:
                 return
+            self._last_active_slice_view = view_name
             direction = 1.0 if (last is None or before > last) else -1.0
             spacing = slice_logic.GetLowestVolumeSliceSpacing()
             step = spacing[2] if spacing and len(spacing) > 2 else 0.0
@@ -837,6 +847,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if last is not None and abs(before - last) < 1e-4:
             # Offset unchanged; this Modified came from something else. Ignore.
             return
+        self._last_active_slice_view = view_name
         direction = 1.0 if (last is None or before > last) else -1.0
         self._snapping_in_progress = True
         try:
@@ -3994,24 +4005,37 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._force_render_3d_views()
 
     def _ensure_triplanar_slice_frames(self, reason=""):
-        """Build the locator planes if we are in tri-planar mode, they are not
-        built yet, and at least two distinct series are assigned to the views.
+        """Build the 3D reference planes (locator planes) when they are not built
+        yet and at least one realized slice view carries a background volume.
+
+        These planes are a GENERAL 3D reference feature, shown in both
+        single-series and tri-planar multi-series mode (not tri-planar only): in
+        single-series the same source volume backs all three views, so each plane
+        is sized to that one volume; in tri-planar each plane is sized to its own
+        assigned series. The geometry builder falls back to the view field of
+        view when a view has no background, so a single loaded volume is enough.
 
         Covers the lazy-restore gap: when tri-planar is restored as CHECKED at
         startup the toggle->setup path that builds the planes never runs, so the
         planes are created here instead the moment series get applied. Idempotent
         and cheap: a no-op once the planes exist (their geometry is kept current
         by the slice-node observers)."""
-        if not self._triplanar_mode:
-            return
         if self._triplanar_frame_nodes:
             return
         bg = {v: self._view_background_volume(v)
               for v in PLANE_DISPLAY_SELECTOR_NAMES}
-        distinct = {n.GetID() for n in bg.values() if n is not None}
-        if len(distinct) < 2:
+        if not any(n is not None for n in bg.values()):
             return
         self._enable_triplanar_slice_frames()
+
+    def _schedule_ensure_slice_frames(self, reason=""):
+        """Deferred, idempotent build of the 3D reference planes once the slice
+        backgrounds have settled on the next event-loop turn. Safe to call from
+        any volume-establishing path (module setup, source-volume selection,
+        image upload) in both single-series and tri-planar mode -- a no-op when
+        the planes already exist or no view yet carries a volume."""
+        qt.QTimer.singleShot(
+            0, lambda: self._ensure_triplanar_slice_frames(reason))
 
     def _enable_triplanar_slice_frames(self):
         """Create one hidden filled-plane model per realized standard view and
@@ -4073,8 +4097,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
     def _deferred_frame_render(self):
         """Deferred re-render so the locator planes show on first entry without
-        an off/on toggle. No-op if tri-planar was left in the meantime."""
-        if not (self._triplanar_mode and self._triplanar_frame_nodes):
+        an off/on toggle. No-op if the planes were torn down in the meantime."""
+        if not self._triplanar_frame_nodes:
             return
         self._update_triplanar_slice_frames()
         bar = getattr(self, "_triplanar_frame_button_bar", None)
@@ -4270,7 +4294,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         distinct_ids = {n.GetID() for n in bg.values() if n is not None}
         if len(distinct_ids) < 2:
             print("[DEBUG triplanar.setup] WARN: fewer than 2 distinct series in views")
+            # Fewer than 2 distinct series: tri-planar fusion is not set up, but
+            # the 3D reference planes are a general feature, so rebuild them for
+            # whatever single volume backs the views instead of leaving none.
             self._disable_triplanar_slice_frames()
+            self._schedule_ensure_slice_frames("triplanar-setup-single")
             _status(
                 "Tri-planar mode: assign your series to the Red/Yellow/Green views "
                 "in the Multi-plane display panel (and Apply) first.", 6000
@@ -4323,7 +4351,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self._fusion_grid_shape = None
             self._clear_selection_op_undo_stack(
                 "Output grid reverted to source; undo history cleared.")
+            # The planes were sized to the tri-planar union grid; tear them down
+            # and rebuild against the single source volume so the 3D reference
+            # planes persist (now a general feature) instead of vanishing.
             self._disable_triplanar_slice_frames()
+            self._schedule_ensure_slice_frames("left-triplanar")
         # The all-series-fusion sub-option only applies inside tri-planar mode.
         if hasattr(self, "ui"):
             self.ui.cbAllSeriesFusion.setEnabled(self._triplanar_mode)
@@ -4974,6 +5006,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self.on_clear_preview_lasso3d_clicked
         )
         self.ui.pbUndoSelectionOp.clicked.connect(self.on_undo_selection_op_clicked)
+        # Slice-by-slice editing: copy an adjacent slice onto the current one, or
+        # shape-interpolate between drawn key slices. Share the Undo button above.
+        self.ui.pbCopyFromPrevSlice.clicked.connect(
+            self.on_copy_from_prev_slice_clicked)
+        self.ui.pbCopyFromNextSlice.clicked.connect(
+            self.on_copy_from_next_slice_clicked)
+        self.ui.pbFillBetweenSlices.clicked.connect(
+            self.on_fill_between_slices_clicked)
         self.ui.sldSegmentOpacity.valueChanged.connect(self._on_segment_opacity_changed)
         # Non-destructive display smoothing (load persisted prefs with signals
         # blocked so restoring the widgets does not apply smoothing at startup).
@@ -5525,7 +5565,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         # Tri-planar routing: run this prompt against the series shown in the
         # view the point was placed in (no-op outside tri-planar mode).
-        self._route_prompt_to_view(self._last_control_point_ras(caller))
+        point_ras = self._last_control_point_ras(caller)
+        self._route_prompt_to_view(point_ras)
+        # Slice-by-slice editing follows the last interaction's view.
+        self._note_active_view_from_ras(point_ras)
         try:
             xyz = self.xyz_from_caller(
                 caller, volume_node=self.get_inference_volume_node()
@@ -5585,6 +5628,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # the corner was placed in (no-op outside tri-planar mode). Routed before
         # voxel coordinates are computed so both corners land in that series' grid.
         self._route_prompt_to_view(corner_ras)
+        # Slice-by-slice editing follows the last interaction's view.
+        self._note_active_view_from_ras(corner_ras)
         try:
             xyz = self.xyz_from_caller(
                 caller, volume_node=self.get_inference_volume_node()
@@ -5718,6 +5763,9 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # button can reuse this lasso after the live node is consumed/cleared.
         if len(_ras_pts) >= 3:
             self._last_lasso_world_points = np.array(_ras_pts)
+            # Track the view this lasso was drawn in so slice-by-slice editing's
+            # active axis follows the draw without needing a scroll first.
+            self._note_active_view_from_ras(list(np.mean(_ras_pts, axis=0)))
 
         # Tri-planar routing: a lasso is drawn on one view's plane, so route it to
         # that view's series BEFORE computing voxel coords / rasterizing. In
@@ -9303,6 +9351,272 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             _status("Selection Operation undone.", 3000)
 
     ###############################################################################
+    # Slice-by-slice editing (cross-slice copy + shape interpolation)
+    ###############################################################################
+
+    def _note_active_view_from_ras(self, ras):
+        """Record the standard slice view a prompt was drawn in as the active
+        view for slice-by-slice editing, so the edit axis follows the last
+        interaction even without a scroll first. No-op when the point lies on no
+        view's plane (within _view_for_ras_point's tolerance)."""
+        if ras is None:
+            return
+        view = self._view_for_ras_point(ras)
+        if view is not None:
+            self._last_active_slice_view = view
+
+    def _active_layer_axis(self):
+        """Resolve (view_name, np_axis, layer_index, aligned, best_dot) for
+        slice-by-slice edits on the canonical output grid.
+
+        view_name: the slice view the edit acts on -- the one under the mouse,
+        else the last view the user scrolled, else "Red". np_axis: the output
+        grid numpy axis (0=z, 1=y, 2=x) whose index planes are parallel to that
+        view's slice plane. layer_index: the integer plane along np_axis at the
+        view's current offset. aligned: True only when the view's slice normal is
+        within OBLIQUE_COS_THRESHOLD of that output axis and the view is not
+        manually rotated -- taking a flat numpy plane is correct only then.
+        Returns None when the geometry is unavailable."""
+        output_vol = self.get_output_volume_node()
+        out_shape = self._output_grid_shape()
+        if output_vol is None or out_shape is None:
+            return None
+        layout_manager = slicer.app.layoutManager()
+        if layout_manager is None:
+            return None
+        # Active view: under the mouse, else the last scrolled view, else Red.
+        view_name = self._active_slice_view_name()
+        if view_name == "Red":
+            # _active_slice_view_name returns "Red" both for a real Red hover and
+            # as the no-hover fallback (true when clicking a panel button). When
+            # nothing is under the mouse, prefer the last view the user scrolled.
+            red_widget = layout_manager.sliceWidget("Red")
+            red_view = (red_widget.sliceView()
+                        if red_widget is not None else None)
+            if red_view is None or not red_view.underMouse():
+                view_name = getattr(self, "_last_active_slice_view", "Red")
+        slice_widget = layout_manager.sliceWidget(view_name)
+        if slice_widget is None:
+            return None
+        slice_node = slice_widget.mrmlSliceNode()
+        if slice_node is None:
+            return None
+        m = slice_node.GetSliceToRAS()
+        normal = [m.GetElement(i, 2) for i in range(3)]
+        nlen = (normal[0] ** 2 + normal[1] ** 2 + normal[2] ** 2) ** 0.5
+        if nlen < 1e-9:
+            return None
+        normal = [c / nlen for c in normal]
+        # Slice origin (SliceToRAS translation) is a point on the current slice
+        # plane; its voxel index gives the integer layer along the chosen axis.
+        origin = [m.GetElement(i, 3) for i in range(3)]
+        get_o = getattr(output_vol, "GetIJKToRASDirectionMatrix", None)
+        if get_o is None:
+            return None
+        om = vtk.vtkMatrix4x4()
+        get_o(om)
+        # Project the view normal onto the output grid's IJK-to-RAS columns and
+        # pick the nearest numpy axis (idiom shared with
+        # _series_anisotropic_sigma): numpy z,y,x -> IJK columns K,J,I.
+        out_col_for_np_axis = (2, 1, 0)
+        best_np_axis, best_dot = 0, -1.0
+        for np_axis, col in enumerate(out_col_for_np_axis):
+            d = [om.GetElement(r, col) for r in range(3)]
+            dn = (d[0] ** 2 + d[1] ** 2 + d[2] ** 2) ** 0.5
+            if dn == 0:
+                continue
+            dot = abs(sum(normal[i] * d[i] / dn for i in range(3)))
+            if dot > best_dot:
+                best_dot, best_np_axis = dot, np_axis
+        aligned = (best_dot >= OBLIQUE_COS_THRESHOLD
+                   and view_name not in self._manual_rotated_views)
+        xyz = self.ras_to_xyz(list(origin), volume_node=output_vol)  # [i, j, k]
+        layer_index = xyz[2 - best_np_axis]
+        print("[nni][slice-edit] active view={} np_axis={} layer={} aligned={} "
+              "best_dot={:.4f} out_shape={} manual_rotated={}".format(
+                  view_name, best_np_axis, layer_index, aligned, best_dot,
+                  tuple(out_shape), view_name in self._manual_rotated_views))
+        return (view_name, best_np_axis, layer_index, aligned, best_dot)
+
+    @staticmethod
+    def _slice_plane_index(np_axis, layer_index):
+        """numpy index tuple selecting one plane (layer_index) along np_axis of a
+        (z, y, x) array."""
+        idx = [slice(None), slice(None), slice(None)]
+        idx[np_axis] = layer_index
+        return tuple(idx)
+
+    def _commit_layer_edit(self, target_id, pre_state_uint8, new_mask, ok_msg):
+        """Shared write-back for slice-by-slice edits: record an undo snapshot,
+        push the new mask onto the current segment, rebuild prompts, and sync to
+        the server. Mirrors the tail of on_apply_selection_op_clicked so the same
+        Undo button reverts these edits too."""
+        self._record_selection_op_undo(target_id, pre_state_uint8)
+        self.show_segmentation(new_mask)
+        # setup_prompts rebuilds the hidden scribble editor (resets slice
+        # backgrounds) and schedules a sticky per-plane reapply on its own.
+        self.setup_prompts()
+        sync_result = self.upload_segment_to_server()
+        if sync_result is None:
+            _mb_warning(
+                slicer.util.mainWindow(),
+                "Slice-by-slice editing",
+                "The edit was applied locally, but syncing to the server "
+                "failed. You can retry with the 'Sync to server' button.",
+            )
+        else:
+            _status(ok_msg, 3000)
+
+    def _copy_adjacent_layer(self, direction):
+        """Replace the current segment's layer in the active view with the layer
+        `direction` (+1 next / -1 previous) away along that view's output axis."""
+        win = slicer.util.mainWindow()
+        target_id = self.get_current_segment_id()
+        if not target_id:
+            _mb_information(win, "Slice-by-slice editing",
+                            "Please select a target segment first.")
+            return
+        info = self._active_layer_axis()
+        if info is None:
+            _mb_information(
+                win, "Slice-by-slice editing",
+                "Could not resolve the active slice view. Hover or scroll the "
+                "2D view you want to edit, then try again.")
+            return
+        view_name, np_axis, layer_index, aligned, _best_dot = info
+        if not aligned:
+            _mb_information(
+                win, "Slice-by-slice editing",
+                "This view is oblique or manually rotated, so slice-by-slice "
+                "editing is disabled here. Use a standard Red/Yellow/Green "
+                "view.")
+            return
+        out_shape = self._output_grid_shape()
+        if layer_index < 0 or layer_index >= out_shape[np_axis]:
+            _mb_information(win, "Slice-by-slice editing",
+                            "The current slice is outside the segment grid.")
+            return
+        src = layer_index + direction
+        if src < 0 or src >= out_shape[np_axis]:
+            _mb_information(win, "Slice-by-slice editing",
+                            "No adjacent slice in that direction.")
+            return
+        mask = self.get_segment_data()
+        if mask is None:
+            _mb_information(win, "Slice-by-slice editing",
+                            "Could not read the current segment.")
+            return
+        pre_state = mask.astype(np.uint8).copy()
+        src_plane = pre_state[self._slice_plane_index(np_axis, src)]
+        dst_plane = pre_state[self._slice_plane_index(np_axis, layer_index)]
+        src_fg = int(src_plane.sum())
+        print("[nni][slice-edit] copy view={} dir={} src_layer={} dst_layer={} "
+              "src_fg={} dst_fg={} total_fg={}".format(
+                  view_name, direction, src, layer_index, src_fg,
+                  int(dst_plane.sum()), int(pre_state.sum())))
+        new_mask = pre_state.copy()
+        # Replace semantics: the current layer becomes an exact copy of the
+        # adjacent one (the prior content is recoverable via Undo).
+        new_mask[self._slice_plane_index(np_axis, layer_index)] = src_plane
+        if src_fg == 0:
+            # Make the "replace with empty = clear" outcome explicit so it never
+            # looks like a silent no-op.
+            ok_msg = ("Adjacent slice was empty; the current slice was cleared "
+                      "(use Undo to revert).")
+        else:
+            ok_msg = "Copied the adjacent slice onto the current slice."
+        self._commit_layer_edit(target_id, pre_state, new_mask, ok_msg)
+
+    def on_copy_from_prev_slice_clicked(self, checked=False):
+        """Copy the lower-index adjacent slice onto the current slice."""
+        self._copy_adjacent_layer(-1)
+
+    def on_copy_from_next_slice_clicked(self, checked=False):
+        """Copy the higher-index adjacent slice onto the current slice."""
+        self._copy_adjacent_layer(1)
+
+    def _fill_between_key_slices(self, mask_uint8, np_axis):
+        """Fill empty gaps between consecutive non-empty slices (along np_axis)
+        with per-pair 2D signed-distance interpolation. Returns
+        (out_uint8, key_indices, filled_count): out_uint8 is the result (a copy,
+        unchanged when nothing was filled), key_indices lists the slices that
+        carry the segment, filled_count is how many in-between slices were
+        filled. Shape-based (distance-field) blending reconstructs a smooth
+        contour between key slices instead of a hard step."""
+        from scipy import ndimage
+        work = np.moveaxis(np.asarray(mask_uint8).astype(bool), np_axis, 0)
+        n = work.shape[0]
+        key = [k for k in range(n) if work[k].any()]
+        out = work.copy()
+        filled = 0
+        if len(key) >= 2:
+            for a, b in zip(key[:-1], key[1:]):
+                if b - a <= 1:
+                    continue
+                sdf_a = (ndimage.distance_transform_edt(work[a])
+                         - ndimage.distance_transform_edt(~work[a]))
+                sdf_b = (ndimage.distance_transform_edt(work[b])
+                         - ndimage.distance_transform_edt(~work[b]))
+                for t in range(a + 1, b):
+                    alpha = float(t - a) / float(b - a)
+                    blended = (1.0 - alpha) * sdf_a + alpha * sdf_b
+                    out[t] = blended >= 0.0
+                    filled += 1
+        out_u8 = np.moveaxis(out, 0, np_axis).astype(np.uint8)
+        return out_u8, key, filled
+
+    def on_fill_between_slices_clicked(self, checked=False):
+        """Shape-interpolate the current segment between drawn key slices along
+        the active view's output axis, filling every empty gap in one pass."""
+        win = slicer.util.mainWindow()
+        target_id = self.get_current_segment_id()
+        if not target_id:
+            _mb_information(win, "Slice-by-slice editing",
+                            "Please select a target segment first.")
+            return
+        info = self._active_layer_axis()
+        if info is None:
+            _mb_information(
+                win, "Slice-by-slice editing",
+                "Could not resolve the active slice view. Hover or scroll the "
+                "2D view you want to edit, then try again.")
+            return
+        view_name, np_axis, _layer_index, aligned, _best_dot = info
+        if not aligned:
+            _mb_information(
+                win, "Slice-by-slice editing",
+                "This view is oblique or manually rotated, so slice-by-slice "
+                "editing is disabled here. Use a standard Red/Yellow/Green "
+                "view.")
+            return
+        mask = self.get_segment_data()
+        if mask is None:
+            _mb_information(win, "Slice-by-slice editing",
+                            "Could not read the current segment.")
+            return
+        pre_state = mask.astype(np.uint8).copy()
+        new_mask, key, filled = self._fill_between_key_slices(pre_state, np_axis)
+        print("[nni][slice-edit] fill view={} np_axis={} key_count={} keys={} "
+              "filled={} total_fg={}".format(
+                  view_name, np_axis, len(key), key[:20], filled,
+                  int(pre_state.sum())))
+        if len(key) < 2:
+            _mb_information(
+                win, "Slice-by-slice editing",
+                "Interpolation needs the segment drawn on at least two separate "
+                "slices along this view's axis. Draw it on two slices "
+                "(scroll between them), then fill.")
+            return
+        if filled == 0:
+            _mb_information(
+                win, "Slice-by-slice editing",
+                "The segment is already continuous along this axis (no empty "
+                "slices between drawn slices), so there was nothing to fill.")
+            return
+        self._commit_layer_edit(
+            target_id, pre_state, new_mask, "Filled between drawn slices.")
+
+    ###############################################################################
     # Server communication and sync functions
     ###############################################################################
 
@@ -9497,6 +9811,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
             if result is not None:
                 self._remember_inference_image_state(image_data)
+                # Ensure the 3D reference planes exist once we are actively
+                # working on a volume (covers single-series sessions where no
+                # auto source-volume selection fired). Deferred + idempotent.
+                self._schedule_ensure_slice_frames("image-upload")
             return result
         except Exception as e:
             debug_print(f"Error in upload_image_to_server: {e}")
@@ -9575,6 +9893,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 volumeNode = volumeNodes[-1]
             # Show this volume node in the segment editor widget
             self.ui.editor_widget.setSourceVolumeNode(volumeNode)
+            # A source volume just became available: build the 3D reference
+            # planes (single-series included). Deferred so setSourceVolumeNode's
+            # background reset has settled; idempotent.
+            if volumeNode is not None:
+                self._schedule_ensure_slice_frames("source-volume")
 
         return volumeNode
 

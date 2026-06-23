@@ -135,5 +135,20 @@
   "Segment cropped ({}).": "分段已裁剪（{}）。",
   "Crop failed: {}": "裁剪失败：{}",
   "Slice views unavailable: ": "切片视图不可用：",
-  "Locator-line rotation: grab a colored intersection line in a 2D panel and drag left/right.": "定位线旋转：在 2D 面板里抓住一条彩色交叉线左右拖动。"
+  "Locator-line rotation: grab a colored intersection line in a 2D panel and drag left/right.": "定位线旋转：在 2D 面板里抓住一条彩色交叉线左右拖动。",
+  "Slice-by-slice editing": "逐层编辑",
+  "The edit was applied locally, but syncing to the server failed. You can retry with the 'Sync to server' button.": "编辑已在本地应用，但同步到服务器失败。你可以用「同步到服务器」按钮重试。",
+  "Could not resolve the active slice view.": "无法确定当前作用的切片视图。",
+  "Slice-by-slice editing needs an axis-aligned view; the active view is oblique or manually rotated.": "逐层编辑需要轴对齐的视图；当前视图为斜位或已手动旋转。",
+  "The current slice is outside the segment grid.": "当前切片超出了分段网格范围。",
+  "No adjacent slice in that direction.": "该方向没有相邻切片。",
+  "Could not read the current segment.": "无法读取当前分段。",
+  "Copied the adjacent slice onto the current slice.": "已将相邻切片复制到当前切片。",
+  "Draw the segment on at least two slices before filling between them.": "请先在至少两层切片上绘制分段，再进行层间插值填充。",
+  "Filled between drawn slices.": "已在已绘切片之间完成插值填充。",
+  "Could not resolve the active slice view. Hover or scroll the 2D view you want to edit, then try again.": "无法确定当前作用的切片视图。请把鼠标移到（或滚动一下）你想编辑的那个 2D 视图，再试一次。",
+  "This view is oblique or manually rotated, so slice-by-slice editing is disabled here. Use a standard Red/Yellow/Green view.": "该视图为斜位或已手动旋转，逐层编辑在此不可用。请改用标准的红/黄/绿视图。",
+  "Adjacent slice was empty; the current slice was cleared (use Undo to revert).": "相邻切片为空；当前切片已被清空（可用「撤销」还原）。",
+  "Interpolation needs the segment drawn on at least two separate slices along this view's axis. Draw it on two slices (scroll between them), then fill.": "层间插值需要沿当前视图轴在至少两张不同的切片上画出分段。请在两层上各画一次（中间滚动切换），再点填充。",
+  "The segment is already continuous along this axis (no empty slices between drawn slices), so there was nothing to fill.": "分段沿当前轴已是连续的（已绘切片之间没有空层），没有可填充的内容。"
 }
