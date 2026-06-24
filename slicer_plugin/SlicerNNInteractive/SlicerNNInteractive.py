@@ -188,6 +188,11 @@ SETTING_LASSO_MULTIVIEW_ENABLED = "SlicerNNInteractive/lasso_multiview_enabled"
 # Scribble direct-write (no-inference) mode: paint strokes go straight into the
 # current segment (positive = add, negative = erase) without calling the server.
 SETTING_SCRIBBLE_DIRECT_WRITE = "SlicerNNInteractive/scribble_direct_write_enabled"
+# Scribble brush diameter in mm (absolute), applied to every scribble.
+SETTING_SCRIBBLE_BRUSH_MM = "SlicerNNInteractive/scribble_brush_mm"
+# Scribble slab thickness in slices (through-plane). 1 = single layer. Only used
+# by single-layer direct-write mode.
+SETTING_SCRIBBLE_THICKNESS = "SlicerNNInteractive/scribble_thickness"
 SETTING_HIGH_RES_ENABLED = "SlicerNNInteractive/high_res_output_enabled"
 SETTING_SMOOTH_INTERPOLATE_ENABLED = "SlicerNNInteractive/smooth_interpolate_enabled"
 SETTING_TRIPLANAR_ENABLED = "SlicerNNInteractive/triplanar_mode_enabled"
@@ -218,6 +223,9 @@ SETTING_OBLIQUE_CAMERA_ALIGN = "SlicerNNInteractive/oblique_camera_align"
 # Debounce (ms) for rebuilding the tri-planar 3D surface so rapid interactions
 # trigger a single (heavy) marching-cubes pass after the user pauses.
 TRIPLANAR_3D_SURFACE_DEBOUNCE_MS = 600
+# Debounce (ms) for re-applying display smoothing (rebuilds the smoothed closed
+# surface) so rapid segment edits coalesce into one rebuild after a pause.
+DISPLAY_SMOOTH_REAPPLY_DEBOUNCE_MS = 400
 
 
 def debug_print(*args):
@@ -5164,6 +5172,20 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self._get_scribble_direct_write_enabled()
         )
         self.ui.cbScribbleDirectWrite.blockSignals(blocked)
+        # Scribble brush size (mm, all scribble) and slab thickness (slices,
+        # single-layer mode only).
+        self.ui.sbScribbleBrushMm.valueChanged.connect(
+            self._on_scribble_brush_mm_changed
+        )
+        self.ui.sbScribbleThickness.valueChanged.connect(
+            self._on_scribble_thickness_changed
+        )
+        blocked = self.ui.sbScribbleBrushMm.blockSignals(True)
+        self.ui.sbScribbleBrushMm.setValue(self._get_scribble_brush_mm())
+        self.ui.sbScribbleBrushMm.blockSignals(blocked)
+        blocked = self.ui.sbScribbleThickness.blockSignals(True)
+        self.ui.sbScribbleThickness.setValue(self._get_scribble_thickness())
+        self.ui.sbScribbleThickness.blockSignals(blocked)
         # Multi-view lasso controls
         self.ui.cbLassoMultiView.toggled.connect(self._on_lasso_multiview_toggled)
         self.ui.pbLassoMultiViewSubmit.clicked.connect(
@@ -6048,7 +6070,23 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
             # Optionally clear or reset the segmentation node
             self._teardown_scribble_observer()
+            # If direct-write retargeted the hidden editor at the real segment,
+            # point it back at the scratch node so normal (server) scribble works.
+            self._restore_scribble_editor_target()
 
+            return
+
+        # Direct-write (no-inference), single layer: paint straight into the REAL
+        # current segment via the native Paint/Erase effect -- no hidden node, no
+        # diff, no per-stroke full-grid export/boolean/show_segmentation. Instant.
+        # A slab thickness > 1 instead needs the stroke extruded through-plane, so
+        # it falls through to the hidden-node path and is merged in
+        # on_scribble_finished's direct-write branch.
+        if (
+            self._get_scribble_direct_write_enabled()
+            and self._get_scribble_thickness() <= 1
+        ):
+            self._begin_direct_write_paint()
             return
 
         segment_id = "fg" if self.is_positive else "bg"
@@ -6070,9 +6108,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         paint_effect = self.scribble_editor_widget.activeEffect()
         if paint_effect:
-            paint_effect.setParameter("BrushUseAbsoluteSize", "0")  # Use relative mode
-            paint_effect.setParameter("BrushSphere", "0")  # 2D brush
-            paint_effect.setParameter("BrushRelativeDiameter", ".75")
+            self._apply_scribble_brush_params(paint_effect)
             self._scribble_labelmap_callback_tag = {
                 "tag": self.scribble_segment_node.AddObserver(
                     vtk.vtkCommand.AnyEvent, self.on_scribble_finished
@@ -6080,6 +6116,66 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 "label_name": segment_id,
             }
         debug_print(f"Scribble mode (hidden editor) activated on '{segment_id}'")
+
+    def _begin_direct_write_paint(self):
+        """Single-layer (no-inference) scribble: drive the native Paint (positive)
+        or Erase (negative) effect directly on the REAL current segment.
+
+        Unlike the server path, nothing is diffed/uploaded and there is no
+        per-stroke full-grid export -- the effect edits only the brushed voxels,
+        so it is instant. previous_states is invalidated once so the next AI
+        prompt's @ensure_synched re-uploads the manually edited segment.
+        """
+        seg_node = self.get_segmentation_node()
+        seg_id = self.get_current_segment_id()
+        if seg_node is None or not seg_id:
+            _status(_cn("Select a segment before direct-write scribbling."), 4000)
+            blocked = self.ui.pbInteractionScribble.blockSignals(True)
+            self.ui.pbInteractionScribble.setChecked(False)
+            self.ui.pbInteractionScribble.blockSignals(blocked)
+            return
+
+        # Point the hidden editor at the real segmentation + segment.
+        self.scribble_editor_widget.setSegmentationNode(seg_node)
+        self.scribble_editor_node.SetSelectedSegmentID(seg_id)
+        # Edit only the current segment; never carve other segments.
+        self.scribble_editor_node.SetOverwriteMode(
+            slicer.vtkMRMLSegmentEditorNode.OverwriteNone
+        )
+
+        volume_node = self.get_volume_node()
+        self.scribble_editor_widget.setSourceVolumeNode(volume_node)
+        # setSourceVolumeNode resets every slice background to the source volume,
+        # so restore the sticky per-plane display selections afterward.
+        self._schedule_plane_display_reapply()
+
+        effect_name = "Paint" if self.is_positive else "Erase"
+        self.scribble_editor_widget.setActiveEffectByName(effect_name)
+        self.scribble_editor_widget.updateWidgetFromMRML()
+        self._apply_scribble_brush_params(
+            self.scribble_editor_widget.activeEffect())
+
+        # The server does not know about manual edits made here; force the next
+        # prompt to detect the change and re-sync the segment.
+        self.previous_states["segment_data"] = None
+        debug_print(
+            "Direct-write scribble: native {} on real segment '{}'".format(
+                effect_name, seg_id))
+
+    def _restore_scribble_editor_target(self):
+        """Re-point the hidden scribble editor at its scratch node after a
+        direct-write session (no-op if it is already there or not set up)."""
+        widget = getattr(self, "scribble_editor_widget", None)
+        scratch = getattr(self, "scribble_segment_node", None)
+        if widget is None or scratch is None:
+            return
+        try:
+            current = widget.segmentationNode()
+            if current is not None and current.GetID() == scratch.GetID():
+                return  # already on the scratch node (normal scribble) -- no-op
+            widget.setSegmentationNode(scratch)
+        except Exception:  # noqa: BLE001 - node may be gone during teardown
+            pass
 
     #
     #  -- Lasso/scribble
@@ -6195,12 +6291,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         source_volume = self.get_volume_node()
 
-        # Direct-write (no-inference) mode: write the painted strokes straight
-        # into the current segment (positive = add, negative = erase) without
-        # calling the server. Bypasses tri-planar routing / all-series fusion --
-        # this is a plain manual 2D brush edit of the selected segment.
+        # Single-layer direct-write with slab thickness > 1: extrude this stroke
+        # through-plane to N slices and merge straight into the current segment,
+        # skipping the server. (Thickness == 1 uses the native instant path and
+        # never reaches here.)
         if self._get_scribble_direct_write_enabled():
-            self._apply_scribble_direct_write(diff_mask, source_volume)
+            self._apply_thick_direct_write(diff_mask, source_volume)
             self.ui.pbInteractionScribble.click()  # turn it off
             self.ui.pbInteractionScribble.click()  # turn it on
             return
@@ -6259,35 +6355,72 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.pbInteractionScribble.click()  # turn it off
         self.ui.pbInteractionScribble.click()  # turn it on
 
-    def _apply_scribble_direct_write(self, diff_mask, source_volume):
-        """Merge a scribble stroke straight into the current segment, skipping
-        server inference.
+    @staticmethod
+    def _extrude_through_plane(diff_mask, thickness):
+        """Thicken a thin (~1 slice) stroke mask into an N-slice slab.
 
-        `diff_mask` is the new-stroke increment on the source-volume grid
-        (z, y, x). Positive scribbles add (OR) the strokes; negative scribbles
-        erase (AND NOT) them. The result is written via `show_segmentation`,
-        then `previous_states["segment_data"]` is invalidated so the next AI
-        prompt's `@ensure_synched` re-uploads the manually edited segment.
+        The stroke's through-plane axis is the grid axis along which the painted
+        voxels span the least (a flat 2D brush stroke is ~1 voxel thick there).
+        The mask is OR-extruded by floor((N-1)/2) slices below and ceil((N-1)/2)
+        above along that axis, clamped at the volume borders. Returns a uint8
+        mask; thickness <= 1 (or an empty stroke) returns the input unchanged.
+
+        Note: the axis is approximated to the nearest grid axis, so on strongly
+        oblique / manually-rotated views the slab follows the grid, not the
+        tilted acquisition plane.
         """
+        base = np.asarray(diff_mask).astype(bool)
+        n = int(thickness)
+        if n <= 1 or not base.any():
+            return np.asarray(diff_mask).astype(np.uint8)
+        coords = np.argwhere(base)
+        extent = coords.max(axis=0) - coords.min(axis=0) + 1
+        axis = int(np.argmin(extent))
+        below = (n - 1) // 2
+        above = n // 2
+        dim = base.shape[axis]
+        result = base.copy()
+        for off in range(-below, above + 1):
+            if off == 0:
+                continue
+            src = [slice(None)] * base.ndim
+            dst = [slice(None)] * base.ndim
+            if off > 0:
+                src[axis] = slice(0, dim - off)
+                dst[axis] = slice(off, dim)
+            else:
+                src[axis] = slice(-off, dim)
+                dst[axis] = slice(0, dim + off)
+            result[tuple(dst)] |= base[tuple(src)]
+        return result.astype(np.uint8)
+
+    def _apply_thick_direct_write(self, diff_mask, source_volume):
+        """Direct-write a slab-thickened scribble stroke into the current segment
+        without calling the server (single-layer mode with thickness > 1).
+
+        Extrudes the stroke through-plane, resamples to the output grid when the
+        high-res output feature is on, then OR-adds (positive) / subtracts
+        (negative) it into the current segment and invalidates previous_states so
+        the next AI prompt re-syncs.
+        """
+        thick = self._extrude_through_plane(
+            diff_mask, self._get_scribble_thickness())
         output_volume = self.get_output_volume_node()
-        diff_out = diff_mask
+        diff_out = thick
         if (
             output_volume is not None
             and source_volume is not None
             and output_volume.GetID() != source_volume.GetID()
         ):
             diff_out = self._resample_mask_between_volumes(
-                diff_mask, source_volume, output_volume
-            )
+                thick, source_volume, output_volume)
+            if diff_out is None:
+                return
 
         current = self.get_segment_data()
         if current is None:
-            # Reference geometry unavailable: fall back to writing the strokes
-            # as-is for a positive scribble; nothing to erase for a negative one.
             if self.is_positive:
-                self.show_segmentation(
-                    np.asarray(diff_out).astype(np.uint8)
-                )
+                self.show_segmentation(np.asarray(diff_out).astype(np.uint8))
                 self.previous_states["segment_data"] = None
             return
 
@@ -6774,6 +6907,31 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if hasattr(self, "ui") and self.ui.cbDisplaySmooth.isChecked():
             self._apply_display_smoothing()
 
+    def _schedule_display_smoothing_reapply(self):
+        """Debounce the (heavy) smoothed closed-surface rebuild so a burst of
+        rapid segment modifications (e.g. interactive Paint/Erase strokes, or a
+        run of AI results) coalesces into a single rebuild after the user pauses.
+
+        Rebuilding the smoothed surface synchronously on every SegmentModified
+        was the main cause of the per-stroke lag and the flood of VTK
+        "scalar type is not a valid integer type" conversion warnings.
+        """
+        if not (hasattr(self, "ui") and self.ui.cbDisplaySmooth.isChecked()):
+            return
+        self._display_smooth_token = getattr(
+            self, "_display_smooth_token", 0) + 1
+        token = self._display_smooth_token
+        qt.QTimer.singleShot(
+            DISPLAY_SMOOTH_REAPPLY_DEBOUNCE_MS,
+            lambda t=token: self._reapply_display_smoothing_debounced(t))
+
+    def _reapply_display_smoothing_debounced(self, token):
+        """Run the debounced reapply only if no newer modification superseded it
+        and display smoothing is still on."""
+        if token != getattr(self, "_display_smooth_token", 0):
+            return
+        self._reapply_display_smoothing_if_active()
+
     def on_bake_display_smooth_clicked(self, checked=False):
         """Bake the currently displayed smooth surface back into the segment.
 
@@ -6882,8 +7040,53 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         )
 
     def _on_scribble_direct_write_changed(self, checked):
-        """Persist the scribble direct-write toggle."""
+        """Persist the scribble direct-write toggle. If scribble is active, re-arm
+        it so the paint target switches between the real segment (direct-write)
+        and the hidden scratch node (server path) immediately."""
         self._set_qsetting(SETTING_SCRIBBLE_DIRECT_WRITE, bool(checked))
+        self._rearm_scribble_if_active()
+
+    def _get_scribble_brush_mm(self):
+        """Scribble brush diameter in mm (absolute). Default 3.0, clamped > 0."""
+        return max(0.1, self._get_qsetting(
+            SETTING_SCRIBBLE_BRUSH_MM, 3.0, cast=float))
+
+    def _get_scribble_thickness(self):
+        """Scribble slab thickness in slices. Default 1, clamped >= 1."""
+        return max(1, self._get_qsetting(
+            SETTING_SCRIBBLE_THICKNESS, 1, cast=int))
+
+    def _on_scribble_brush_mm_changed(self, value):
+        """Persist the brush size and apply it live to the active scribble brush."""
+        self._set_qsetting(SETTING_SCRIBBLE_BRUSH_MM, float(value))
+        widget = getattr(self, "scribble_editor_widget", None)
+        if widget is not None:
+            try:
+                self._apply_scribble_brush_params(widget.activeEffect())
+            except Exception:  # noqa: BLE001 - effect may be inactive
+                pass
+
+    def _on_scribble_thickness_changed(self, value):
+        """Persist the slab thickness. Re-arm scribble so a 1 <-> N change swaps
+        between the native instant path and the slab (extrude+merge) path."""
+        self._set_qsetting(SETTING_SCRIBBLE_THICKNESS, int(value))
+        self._rearm_scribble_if_active()
+
+    def _rearm_scribble_if_active(self):
+        """Toggle the scribble button off then on so a mode/param change that
+        affects how the brush is wired takes effect immediately."""
+        if hasattr(self, "ui") and self.ui.pbInteractionScribble.isChecked():
+            self.ui.pbInteractionScribble.click()  # off (tears down current mode)
+            self.ui.pbInteractionScribble.click()  # on (re-arms in the new mode)
+
+    def _apply_scribble_brush_params(self, effect):
+        """Configure a Paint/Erase effect with the persisted absolute brush size
+        (a 2D, flat brush -- through-plane thickness is handled separately)."""
+        if not effect:
+            return
+        effect.setParameter("BrushUseAbsoluteSize", "1")
+        effect.setParameter("BrushAbsoluteDiameter", str(self._get_scribble_brush_mm()))
+        effect.setParameter("BrushSphere", "0")  # 2D brush
 
     # -- Multi-view lasso accumulation --
 
@@ -7502,14 +7705,16 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """Refresh the operand selector when segments are added/removed/renamed."""
         self.populate_operand_selector()
         self._sync_opacity_slider_from_segment()
-        self._reapply_display_smoothing_if_active()
+        # Debounced: rapid edits (Paint/Erase strokes) coalesce into one rebuild.
+        self._schedule_display_smoothing_reapply()
 
     def on_segment_editor_node_modified(self, caller, event):
         """Refresh observers and operand list when the node/segment selection changes."""
         self._observe_active_segmentation()
         self.populate_operand_selector()
         self._sync_opacity_slider_from_segment()
-        self._reapply_display_smoothing_if_active()
+        # Debounced: editor-node bursts (effect/param changes) coalesce.
+        self._schedule_display_smoothing_reapply()
 
     # -- ROI operand --
 

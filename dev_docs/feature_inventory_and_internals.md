@@ -107,10 +107,13 @@
 
 #### 单层不计算模式（涂鸦直接写入）
 
-- **能做什么**：涂鸦按钮下方的复选框 `cbScribbleDirectWrite`。勾选后涂鸦**不调用模型**，笔迹直接写进当前分段——正向涂鸦把笔迹**并入**（OR）当前段、负向涂鸦把笔迹从当前段**擦除**（AND NOT）；"涂多少算多少"。
-- **解决什么问题**：手动精修时不希望 AI 把几笔笔迹"扩散"成它推断的整片结构；需要逐体素可控的快速增删。
-- **实现原理**：复用现有差分管线——`on_scribble_finished` 算出本次笔画增量 `diff_mask`（源体积网格）后，若该模式开启就走 `_apply_scribble_direct_write`：必要时用 `_resample_mask_between_volumes` 把增量重采样到输出网格（兼容高分辨率输出），取当前段 `get_segment_data()`，用 `compute_boolean_mask`（正向=0 加 / 负向=1 减）合并，再经 `show_segmentation` 写回。完全**跳过** `lasso_or_scribble_prompt` / `@ensure_synched` / 服务端。写回后把 `previous_states["segment_data"]` 置 None，使下一次 AI 交互的 `@ensure_synched` 检测到手动改动并重新上传分段。该模式下不参与 tri-planar 路由与全序列融合（它就是对当前选中段的一次手动 2D 笔刷编辑）。勾选状态持久化于 `SETTING_SCRIBBLE_DIRECT_WRITE`。
-- **关键入口/跳转**：`cbScribbleDirectWrite`（.ui）→ `_get_scribble_direct_write_enabled` / `_on_scribble_direct_write_changed` → `on_scribble_finished` 内的直接写入分支 → `_apply_scribble_direct_write`。
+- **能做什么**：涂鸦按钮下方的复选框 `cbScribbleDirectWrite`。勾选后涂鸦**不调用模型**，笔迹直接写进当前分段——正向涂鸦把笔迹**并入**当前段、负向涂鸦把笔迹从当前段**擦除**；"涂多少算多少"，即时、不卡顿。
+- **解决什么问题**：手动精修时不希望 AI 把几笔笔迹"扩散"成它推断的整片结构；需要逐体素可控、低延迟的快速增删。
+- **实现原理（原生 Paint，非差分）**：勾选后点涂鸦，`on_scribble_clicked` 走 `_begin_direct_write_paint`——把隐藏的 `scribble_editor_widget` 直接指向**真实分段节点 + 当前选中段**，正向用原生 **Paint**、负向用原生 **Erase** 效果，并设 `OverwriteMode=OverwriteNone`（只改当前段、不碰其他段），**不安装** `on_scribble_finished` 差分观察者。因此每一笔只改画笔扫到的体素（O(笔刷)），不再有"隐藏节点+差分+整卷 `get_segment_data` 导出+布尔+`show_segmentation` 写回+每笔 `CreateClosedSurfaceRepresentation`"那条 O(整卷) 的重链路——这正是早期差分实现"明明跳过服务端却很慢、且刷 VTK `scalar type is not a valid integer type` 警告"的根因。完全**跳过** `lasso_or_scribble_prompt` / `@ensure_synched` / 服务端 / tri-planar 路由 / 全序列融合。进入时把 `previous_states["segment_data"]` 置 None，使下一次 AI 交互的 `@ensure_synched` 检测到手动改动并重新上传分段。退出涂鸦时 `_restore_scribble_editor_target` 把隐藏编辑器指回 scratch 节点，正常（服务端）涂鸦不受影响；勾选状态变化时若涂鸦正激活会自动重挂（`_on_scribble_direct_write_changed` 里 off→on）。勾选状态持久化于 `SETTING_SCRIBBLE_DIRECT_WRITE`。
+- **配套：显示平滑重应用防抖**：`on_segmentation_modified` / `on_segment_editor_node_modified` 原本每次 `SegmentModified` 都同步 `_apply_display_smoothing()` 重建平滑 closed surface（开启 `cbDisplaySmooth` 时，原生 Paint 每一笔也会触发，是警告刷屏与卡顿的另一主因）。改为 `_schedule_display_smoothing_reapply`（token + `QTimer.singleShot`，`DISPLAY_SMOOTH_REAPPLY_DEBOUNCE_MS`=400ms 防抖），连续编辑合并为暂停后一次重建。
+- **笔刷大小（mm，所有涂鸦）**：`sbScribbleBrushMm`（绝对直径毫米，默认 3mm，`SETTING_SCRIBBLE_BRUSH_MM`）。`_apply_scribble_brush_params` 统一对正常涂鸦与单层 Paint/Erase 设 `BrushUseAbsoluteSize=1 / BrushAbsoluteDiameter=<mm> / BrushSphere=0`（平的 2D 笔刷）；拖动时若涂鸦激活，`_on_scribble_brush_mm_changed` 立即对当前 effect 生效。
+- **板层厚度（层，仅单层模式）**：`sbScribbleThickness`（贯穿切片方向层数，默认 1，`SETTING_SCRIBBLE_THICKNESS`）。N=1 走上面的原生即时路径；**N>1** 时 `on_scribble_clicked` 改走隐藏节点+差分路径，`on_scribble_finished` 的单层分支调用 `_apply_thick_direct_write`：`_extrude_through_plane` 把本笔增量（取其最薄的栅格轴为穿层轴）沿穿层方向 OR 扩展为 N 层板坯，必要时重采样到输出网格，再 OR/擦除合并进当前段（经 `show_segmentation`）。厚度改变若涂鸦激活会自动重挂（在原生即时路径与板坯路径间切换）。
+- **关键入口/跳转**：`cbScribbleDirectWrite` / `sbScribbleBrushMm` / `sbScribbleThickness`（.ui）→ `_on_scribble_direct_write_changed` / `_on_scribble_brush_mm_changed` / `_on_scribble_thickness_changed` → `on_scribble_clicked`（厚度≤1 走 `_begin_direct_write_paint`，否则隐藏节点路径 + `on_scribble_finished` 单层分支 `_apply_thick_direct_write` / `_extrude_through_plane`）；笔刷参数 `_apply_scribble_brush_params`；退出复原 `_restore_scribble_editor_target`；显示平滑防抖 `_schedule_display_smoothing_reapply` → `_reapply_display_smoothing_debounced`。
 
 ---
 
@@ -437,11 +440,16 @@
   ├─ 闭合曲线裁剪：前景体素投到冻结相机屏幕平面 + 点在多边形内（不调用 AI）
   └─ 结果经 show_segmentation -> 立即上传同步
 
-涂鸦「单层不计算模式」（cbScribbleDirectWrite，默认关）
-  ├─ 复用：涂鸦差分管线（on_scribble_finished 的 diff_mask）
-  ├─ 复用：_resample_mask_between_volumes + compute_boolean_mask（正向 OR / 负向 ANDNOT）+ show_segmentation
+涂鸦「单层不计算模式」（cbScribbleDirectWrite，默认关，原生 Paint）
+  ├─ 直接：隐藏编辑器指向真实分段+当前段，正向 Paint / 负向 Erase，OverwriteNone
+  ├─ 不装差分观察者：每笔只改画笔体素（O(笔刷)），无整卷导出/布尔/show_segmentation
   ├─ 跳过：服务端 / @ensure_synched / tri-planar 路由 / 全序列融合
-  └─ 同步：写回后置 previous_states["segment_data"]=None → 下次 AI 交互重传分段
+  ├─ 退出复原：_restore_scribble_editor_target 指回 scratch 节点
+  └─ 同步：进入时 previous_states["segment_data"]=None → 下次 AI 交互重传分段
+
+显示平滑重应用防抖（DISPLAY_SMOOTH_REAPPLY_DEBOUNCE_MS=400ms）
+  ├─ on_segmentation_modified / on_segment_editor_node_modified 不再每笔同步重建
+  └─ token + QTimer 合并连续编辑为暂停后一次 _apply_display_smoothing
 
 逐层编辑（跨层复制 / 层间插值）
   ├─ 依赖：输出网格（取整面 / 求层号 / 轴向）+ 当前作用视图轴对齐判定
@@ -460,6 +468,7 @@
 | 全序列融合耗时 | 每次交互对全部序列串行推理（各自重传图像+分割），约单次 2.5-3x；套索/涂鸦在正交序列退化为点种子，细节略逊于来源序列 |
 | Scribble 分辨率 | 涂鸦在源体积分辨率绘制，再重采样到路由序列 |
 | 涂鸦直接写入不参与融合 | 「单层不计算模式」是对当前选中段的纯手动 2D 笔刷编辑，跳过服务端与 tri-planar 路由/全序列融合；仅作用于当前选中段，且依赖正/负极性区分加/擦 |
+| 板层厚度按栅格轴近似 | 厚度 N>1 时把笔迹沿「最薄的栅格轴」扩展为 N 层；强斜位/手动旋转视图下该轴只是真实穿层方向的最近栅格轴近似，板坯会贴栅格而非贴倾斜采集面。且 N>1 走差分+`show_segmentation` 整卷合并，比 N=1 的原生即时路径慢（仅在用厚板时） |
 | 斜采集融合近似 | 方向性融合的穿层方向 `t_s` 由最厚 IJK 轴投影到输出三轴 RAS 基（连续向量，优于旧法 snap 单轴），但强成角下仍是近似 |
 | 方向性融合法向估计 | 边界法向取各序列等权 SDF 均值的梯度；平坦区（远离边界）法向不稳，此处由 `w_floor` 兜底退化为等权，不影响内外 sign |
 | BRAINSFit 依赖 | 自动配准需 Slicer 内置 BRAINSFit；非 DICOM 导入无 Frame-of-Reference UID，需手动确认对齐 |
