@@ -6070,6 +6070,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
             # Optionally clear or reset the segmentation node
             self._teardown_scribble_observer()
+            # If direct-write drove the visible editor's Paint/Erase, turn it off.
+            if getattr(self, "_direct_write_paint_active", False):
+                self.ui.editor_widget.setActiveEffectByName("")
+                self._direct_write_paint_active = False
             # If direct-write retargeted the hidden editor at the real segment,
             # point it back at the scratch node so normal (server) scribble works.
             self._restore_scribble_editor_target()
@@ -6118,48 +6122,43 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         debug_print(f"Scribble mode (hidden editor) activated on '{segment_id}'")
 
     def _begin_direct_write_paint(self):
-        """Single-layer (no-inference) scribble: drive the native Paint (positive)
-        or Erase (negative) effect directly on the REAL current segment.
+        """Single-layer (no-inference) scribble: drive the VISIBLE embedded
+        Segment Editor's native Paint (positive) / Erase (negative) effect on the
+        current segment.
 
-        Unlike the server path, nothing is diffed/uploaded and there is no
-        per-stroke full-grid export -- the effect edits only the brushed voxels,
-        so it is instant. previous_states is invalidated once so the next AI
-        prompt's @ensure_synched re-uploads the manually edited segment.
+        We use self.ui.editor_widget (already bound to the real segmentation and
+        the global SegmentEditor node -- the same editor the user paints with
+        manually) rather than the hidden scribble editor: pointing a second
+        editor widget at the real node, plus a bogus OverwriteMode call, was why
+        the earlier attempt silently did nothing. Editing is instant (only the
+        brushed voxels change); previous_states is invalidated once so the next
+        AI prompt's @ensure_synched re-uploads the manually edited segment.
         """
-        seg_node = self.get_segmentation_node()
-        seg_id = self.get_current_segment_id()
+        # Auto-create/select a segment when none is selected (same idiom the
+        # rest of the module uses), so the scribble button always lights up and
+        # has somewhere to paint instead of refusing.
+        seg_node, seg_id = self.get_selected_segmentation_node_and_segment_id()
         if seg_node is None or not seg_id:
-            _status(_cn("Select a segment before direct-write scribbling."), 4000)
+            _status(_cn("Load a volume and select a segment before scribbling."), 4000)
             blocked = self.ui.pbInteractionScribble.blockSignals(True)
             self.ui.pbInteractionScribble.setChecked(False)
             self.ui.pbInteractionScribble.blockSignals(blocked)
             return
 
-        # Point the hidden editor at the real segmentation + segment.
-        self.scribble_editor_widget.setSegmentationNode(seg_node)
-        self.scribble_editor_node.SetSelectedSegmentID(seg_id)
-        # Edit only the current segment; never carve other segments.
-        self.scribble_editor_node.SetOverwriteMode(
-            slicer.vtkMRMLSegmentEditorNode.OverwriteNone
-        )
-
-        volume_node = self.get_volume_node()
-        self.scribble_editor_widget.setSourceVolumeNode(volume_node)
-        # setSourceVolumeNode resets every slice background to the source volume,
-        # so restore the sticky per-plane display selections afterward.
-        self._schedule_plane_display_reapply()
-
+        # get_selected_... already selected seg_id in the editor; (re)assert it,
+        # then turn on the brush. Paint by default only edits the selected segment.
+        self.segment_editor_node.SetSelectedSegmentID(seg_id)
         effect_name = "Paint" if self.is_positive else "Erase"
-        self.scribble_editor_widget.setActiveEffectByName(effect_name)
-        self.scribble_editor_widget.updateWidgetFromMRML()
-        self._apply_scribble_brush_params(
-            self.scribble_editor_widget.activeEffect())
+        self.ui.editor_widget.setActiveEffectByName(effect_name)
+        self.ui.editor_widget.updateWidgetFromMRML()
+        self._apply_scribble_brush_params(self.ui.editor_widget.activeEffect())
+        self._direct_write_paint_active = True
 
         # The server does not know about manual edits made here; force the next
         # prompt to detect the change and re-sync the segment.
         self.previous_states["segment_data"] = None
         debug_print(
-            "Direct-write scribble: native {} on real segment '{}'".format(
+            "Direct-write scribble: visible-editor {} on segment '{}'".format(
                 effect_name, seg_id))
 
     def _restore_scribble_editor_target(self):
@@ -7057,10 +7056,16 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             SETTING_SCRIBBLE_THICKNESS, 1, cast=int))
 
     def _on_scribble_brush_mm_changed(self, value):
-        """Persist the brush size and apply it live to the active scribble brush."""
+        """Persist the brush size and apply it live to whichever editor currently
+        owns the scribble brush (visible editor for single-layer direct-write,
+        hidden editor for the server / slab paths)."""
         self._set_qsetting(SETTING_SCRIBBLE_BRUSH_MM, float(value))
-        widget = getattr(self, "scribble_editor_widget", None)
-        if widget is not None:
+        for widget in (
+            self.ui.editor_widget if hasattr(self, "ui") else None,
+            getattr(self, "scribble_editor_widget", None),
+        ):
+            if widget is None:
+                continue
             try:
                 self._apply_scribble_brush_params(widget.activeEffect())
             except Exception:  # noqa: BLE001 - effect may be inactive
