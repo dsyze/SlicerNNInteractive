@@ -84,8 +84,11 @@ STANDARD_VIEW_ORIENTATION = {
 
 # Locator-line drag rotation (single-series): dragging a colored slice-
 # intersection line in a 2D panel rotates the slice that line belongs to.
-# Sensitivity: 1 px of horizontal mouse motion -> this many degrees.
-LOCATOR_ROTATE_DEG_PER_PX = 0.5
+# The drag angle is the azimuth of the cursor about the crosshair (in the
+# operation plane), so the dragged line tracks the cursor 1:1. Below this
+# cursor-to-crosshair distance (mm) the azimuth is unstable, so we skip the
+# frame to avoid jitter near the pivot.
+LOCATOR_AZIMUTH_MIN_MM = 1.5
 # Click tolerance for picking a line: the perpendicular RAS distance (mm) from
 # the click to the other plane. The user asked for ~2 mm; kept a touch looser
 # so the thin line is still easy to grab.
@@ -182,6 +185,9 @@ SETTING_DISPLAY_SMOOTH_STRENGTH = "SlicerNNInteractive/display_smooth_strength"
 SETTING_LASSO_CLIP_ENABLED = "SlicerNNInteractive/lasso_clip_enabled"
 SETTING_LASSO_CLIP_N = "SlicerNNInteractive/lasso_clip_n"
 SETTING_LASSO_MULTIVIEW_ENABLED = "SlicerNNInteractive/lasso_multiview_enabled"
+# Scribble direct-write (no-inference) mode: paint strokes go straight into the
+# current segment (positive = add, negative = erase) without calling the server.
+SETTING_SCRIBBLE_DIRECT_WRITE = "SlicerNNInteractive/scribble_direct_write_enabled"
 SETTING_HIGH_RES_ENABLED = "SlicerNNInteractive/high_res_output_enabled"
 SETTING_SMOOTH_INTERPOLATE_ENABLED = "SlicerNNInteractive/smooth_interpolate_enabled"
 SETTING_TRIPLANAR_ENABLED = "SlicerNNInteractive/triplanar_mode_enabled"
@@ -1132,15 +1138,27 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             interactor = slice_view.interactor() if slice_view is not None else None
             if interactor is None:
                 continue
+            # Each handler needs its own observer tag to abort the event (the
+            # interactor has no SetAbortFlag; the abort lives on the observer's
+            # vtkCommand, fetched via GetCommand(tag)). The tag only exists after
+            # AddObserver returns, so fill it into a holder the callback reads
+            # later, when the mouse event actually fires.
+            ph, mh, rh = {}, {}, {}
             press = interactor.AddObserver(
                 vtk.vtkCommand.LeftButtonPressEvent,
-                lambda c, e, v=view_name: self._on_locator_press(v, c, e), 10.0)
+                lambda c, e, v=view_name, h=ph: self._on_locator_press(
+                    v, c, e, h.get("tag")), 10.0)
+            ph["tag"] = press
             move = interactor.AddObserver(
                 vtk.vtkCommand.MouseMoveEvent,
-                lambda c, e, v=view_name: self._on_locator_drag(v, c, e), 10.0)
+                lambda c, e, v=view_name, h=mh: self._on_locator_drag(
+                    v, c, e, h.get("tag")), 10.0)
+            mh["tag"] = move
             release = interactor.AddObserver(
                 vtk.vtkCommand.LeftButtonReleaseEvent,
-                lambda c, e, v=view_name: self._on_locator_release(v, c, e), 10.0)
+                lambda c, e, v=view_name, h=rh: self._on_locator_release(
+                    v, c, e, h.get("tag")), 10.0)
+            rh["tag"] = release
             observers.append((interactor, press))
             observers.append((interactor, move))
             observers.append((interactor, release))
@@ -1156,6 +1174,49 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 pass
         self._locator_rotation_observers = []
         self._locator_drag = None
+
+    @staticmethod
+    def _abort_event(caller, tag):
+        """Abort an interactor event so the default slice pan / window-level
+        does not also fire. The interactor (caller) has no SetAbortFlag; the
+        abort flag lives on the observer's vtkCommand, retrieved by tag."""
+        if tag is None:
+            return
+        try:
+            cmd = caller.GetCommand(tag)
+            if cmd is not None:
+                cmd.SetAbortFlag(1)
+        except Exception:  # noqa: BLE001 - degrade gracefully if API differs
+            pass
+
+    @staticmethod
+    def _dot3(a, b):
+        """Dot product of two 3-vectors."""
+        return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+    @staticmethod
+    def _cross3(a, b):
+        """Cross product a x b of two 3-vectors."""
+        return [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+
+    @staticmethod
+    def _vec_norm(a):
+        """Euclidean length of a 3-vector."""
+        return (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]) ** 0.5
+
+    @staticmethod
+    def _unit_column(matrix4x4, col):
+        """Unit-normalized RAS direction of a 4x4 matrix column (0..2), or None
+        when that column is degenerate."""
+        v = [matrix4x4.GetElement(i, col) for i in range(3)]
+        length = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) ** 0.5
+        if length < 1e-9:
+            return None
+        return [v[i] / length for i in range(3)]
 
     def _slice_plane_origin_normal(self, slice_node):
         """(origin, unit normal) of a slice plane from its SliceToRAS, or
@@ -1204,7 +1265,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             out.append(_det(mat) / det)
         return out
 
-    def _on_locator_press(self, op_view_name, caller, event):
+    def _on_locator_press(self, op_view_name, caller, event, tag=None):
         """Pick the nearest other-view intersection line under the click and
         arm a drag to rotate that view's slice about the operation plane's
         normal. A miss leaves default navigation untouched."""
@@ -1246,25 +1307,76 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # so the slider, used after a drag, re-bakes from the dragged pose
         # instead of snapping back to this press orientation.
         anchor = self._three_plane_intersection() or p
+        # In-plane unit basis of the operation plane (SliceToRAS columns 0/1).
+        # The rotation axis must be the basis's own right-handed normal
+        # (op_xhat x op_yhat), NOT the SliceToRAS column-2 normal: the default
+        # axial/sagittal SliceToRAS is left-handed (column2 = -(col0 x col1)),
+        # so spinning about column2 would turn the dragged line opposite the
+        # cursor. Using op_xhat x op_yhat makes "azimuth CCW in (xhat,yhat)"
+        # equal "rotate_slice_view CCW about op_axis" for every view, including
+        # oblique ones, giving 1:1 cursor tracking.
+        op_to_ras = op_node.GetSliceToRAS()
+        op_xhat = self._unit_column(op_to_ras, 0)
+        op_yhat = self._unit_column(op_to_ras, 1)
+        if op_xhat is None or op_yhat is None:
+            return
+        op_axis = self._cross3(op_xhat, op_yhat)
+        d0 = [p[i] - anchor[i] for i in range(3)]
+        if self._vec_norm(d0) < LOCATOR_AZIMUTH_MIN_MM:
+            # Cursor is on top of the pivot; defer the azimuth baseline to the
+            # first drag frame where the cursor is far enough out.
+            start_angle = None
+        else:
+            start_angle = math.atan2(
+                self._dot3(d0, op_yhat), self._dot3(d0, op_xhat)
+            )
         self._locator_drag = {
             "target_view": best_view,
-            "axis_ras": list(op_normal),
+            "op_view": op_view_name,
+            "axis_ras": op_axis,
             "base": base,
-            "start_x": float(x),
             "anchor": list(anchor),
+            "op_xhat": op_xhat,
+            "op_yhat": op_yhat,
+            "start_angle": start_angle,
         }
-        caller.SetAbortFlag(1)
+        self._abort_event(caller, tag)
 
-    def _on_locator_drag(self, op_view_name, caller, event):
-        """Rotate the armed target slice by 0.5 deg per px of horizontal drag
-        about the operation plane's normal, pivoting on the crosshair."""
+    def _on_locator_drag(self, op_view_name, caller, event, tag=None):
+        """Rotate the armed target slice so its line tracks the cursor: the
+        angle is the cursor's azimuth about the crosshair (in the operation
+        plane), measured from the press orientation, about the op-plane normal."""
         drag = self._locator_drag
         if not drag:
             return
-        x, _y = caller.GetEventPosition()
-        angle = (float(x) - drag["start_x"]) * LOCATOR_ROTATE_DEG_PER_PX
-        target_view = drag["target_view"]
         layout_manager = slicer.app.layoutManager()
+        if layout_manager is None:
+            return
+        # The operation plane does not rotate during the drag, so its XYToRAS is
+        # constant; map the live pixel back to RAS to read the cursor azimuth.
+        op_widget = layout_manager.sliceWidget(drag["op_view"])
+        op_node = op_widget.mrmlSliceNode() if op_widget else None
+        if op_node is None:
+            return
+        x, y = caller.GetEventPosition()
+        ras = op_node.GetXYToRAS().MultiplyPoint([float(x), float(y), 0.0, 1.0])
+        d = [ras[i] - drag["anchor"][i] for i in range(3)]
+        if self._vec_norm(d) < LOCATOR_AZIMUTH_MIN_MM:
+            return  # too close to the pivot; azimuth is unstable, skip frame
+        cur = math.atan2(
+            self._dot3(d, drag["op_yhat"]), self._dot3(d, drag["op_xhat"])
+        )
+        if drag["start_angle"] is None:
+            # Press happened on the pivot; set the baseline now that the cursor
+            # is far enough out, so this frame contributes no rotation.
+            drag["start_angle"] = cur
+            return
+        delta = cur - drag["start_angle"]
+        # Shortest arc into (-pi, pi]; a line through the pivot is 180-deg
+        # symmetric, so this aligns it to the cursor without a half-turn flip.
+        delta = (delta + math.pi) % (2.0 * math.pi) - math.pi
+        angle = math.degrees(delta)
+        target_view = drag["target_view"]
         target_widget = (layout_manager.sliceWidget(target_view)
                          if layout_manager else None)
         target_node = target_widget.mrmlSliceNode() if target_widget else None
@@ -1289,14 +1401,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self._snap_last_offset[target_view] = target_logic.GetSliceOffset()
         self._manual_oblique_flag = True
         self._view_rotation_locked = True
-        caller.SetAbortFlag(1)
+        self._abort_event(caller, tag)
 
-    def _on_locator_release(self, op_view_name, caller, event):
+    def _on_locator_release(self, op_view_name, caller, event, tag=None):
         """End the current drag (target stays in _manual_rotated_views so the
         wheel keeps stepping one slice along its tilted normal)."""
         if self._locator_drag is not None:
             self._locator_drag = None
-            caller.SetAbortFlag(1)
+            self._abort_event(caller, tag)
 
     def _apply_plane_display_volumes(self, show_status=False):
         """Apply the configured supplemental backgrounds to standard slice views."""
@@ -5043,6 +5155,15 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         blocked = self.ui.sbLassoClipN.blockSignals(True)
         self.ui.sbLassoClipN.setValue(self._get_lasso_clip_n())
         self.ui.sbLassoClipN.blockSignals(blocked)
+        # Scribble direct-write (no-inference) toggle
+        self.ui.cbScribbleDirectWrite.toggled.connect(
+            self._on_scribble_direct_write_changed
+        )
+        blocked = self.ui.cbScribbleDirectWrite.blockSignals(True)
+        self.ui.cbScribbleDirectWrite.setChecked(
+            self._get_scribble_direct_write_enabled()
+        )
+        self.ui.cbScribbleDirectWrite.blockSignals(blocked)
         # Multi-view lasso controls
         self.ui.cbLassoMultiView.toggled.connect(self._on_lasso_multiview_toggled)
         self.ui.pbLassoMultiViewSubmit.clicked.connect(
@@ -6074,6 +6195,16 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         source_volume = self.get_volume_node()
 
+        # Direct-write (no-inference) mode: write the painted strokes straight
+        # into the current segment (positive = add, negative = erase) without
+        # calling the server. Bypasses tri-planar routing / all-series fusion --
+        # this is a plain manual 2D brush edit of the selected segment.
+        if self._get_scribble_direct_write_enabled():
+            self._apply_scribble_direct_write(diff_mask, source_volume)
+            self.ui.pbInteractionScribble.click()  # turn it off
+            self.ui.pbInteractionScribble.click()  # turn it on
+            return
+
         # All-series fusion (hybrid): send the real scribble to its own view's
         # series and derived interior point seeds to the orthogonal series (a
         # painted stroke is degenerate off its own plane, like a lasso), then
@@ -6127,6 +6258,49 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
 
         self.ui.pbInteractionScribble.click()  # turn it off
         self.ui.pbInteractionScribble.click()  # turn it on
+
+    def _apply_scribble_direct_write(self, diff_mask, source_volume):
+        """Merge a scribble stroke straight into the current segment, skipping
+        server inference.
+
+        `diff_mask` is the new-stroke increment on the source-volume grid
+        (z, y, x). Positive scribbles add (OR) the strokes; negative scribbles
+        erase (AND NOT) them. The result is written via `show_segmentation`,
+        then `previous_states["segment_data"]` is invalidated so the next AI
+        prompt's `@ensure_synched` re-uploads the manually edited segment.
+        """
+        output_volume = self.get_output_volume_node()
+        diff_out = diff_mask
+        if (
+            output_volume is not None
+            and source_volume is not None
+            and output_volume.GetID() != source_volume.GetID()
+        ):
+            diff_out = self._resample_mask_between_volumes(
+                diff_mask, source_volume, output_volume
+            )
+
+        current = self.get_segment_data()
+        if current is None:
+            # Reference geometry unavailable: fall back to writing the strokes
+            # as-is for a positive scribble; nothing to erase for a negative one.
+            if self.is_positive:
+                self.show_segmentation(
+                    np.asarray(diff_out).astype(np.uint8)
+                )
+                self.previous_states["segment_data"] = None
+            return
+
+        operation = 0 if self.is_positive else 1  # 0 = Add/OR, 1 = Subtract
+        merged = self.compute_boolean_mask(
+            np.asarray(current).astype(np.uint8),
+            np.asarray(diff_out).astype(np.uint8),
+            operation,
+        )
+        self.show_segmentation(merged)
+        # The server does not know about this manual edit; force the next prompt
+        # to detect the change and re-sync the segment.
+        self.previous_states["segment_data"] = None
 
     ###############################################################################
     # Segmentation-related functions
@@ -6696,6 +6870,20 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def _on_lasso_clip_n_changed(self, value):
         """Persist the lasso-clip +/- N slices spin box."""
         self._set_qsetting(SETTING_LASSO_CLIP_N, int(value))
+
+    # -- Scribble direct-write (no-inference) mode --
+
+    def _get_scribble_direct_write_enabled(self):
+        """Read whether scribble direct-write (no-inference) mode is on.
+
+        Default False."""
+        return self._get_qsetting(
+            SETTING_SCRIBBLE_DIRECT_WRITE, False, cast=bool
+        )
+
+    def _on_scribble_direct_write_changed(self, checked):
+        """Persist the scribble direct-write toggle."""
+        self._set_qsetting(SETTING_SCRIBBLE_DIRECT_WRITE, bool(checked))
 
     # -- Multi-view lasso accumulation --
 

@@ -105,6 +105,13 @@
 - **涂鸦是特例**：它不用 Markups，而是一个**隐藏的 `qMRMLSegmentEditorWidget` + Paint 效果**，在隐藏的 `ScribbleSegmentNode` 上绘制（正向画到 fg 段、负向画到 bg 段）。每次笔画结束，插件计算**与上一笔的差分掩码**只把"新增部分"发给服务端的 scribble 接口——服务端会累积笔画。这样既贴合 Paint 的连续涂抹体验，又避免重复发送整片掩码。
 - 正/负极性由 `is_positive`（读正/负按钮状态）统一表达，落到各提示的 `positive_click` 参数。
 
+#### 单层不计算模式（涂鸦直接写入）
+
+- **能做什么**：涂鸦按钮下方的复选框 `cbScribbleDirectWrite`。勾选后涂鸦**不调用模型**，笔迹直接写进当前分段——正向涂鸦把笔迹**并入**（OR）当前段、负向涂鸦把笔迹从当前段**擦除**（AND NOT）；"涂多少算多少"。
+- **解决什么问题**：手动精修时不希望 AI 把几笔笔迹"扩散"成它推断的整片结构；需要逐体素可控的快速增删。
+- **实现原理**：复用现有差分管线——`on_scribble_finished` 算出本次笔画增量 `diff_mask`（源体积网格）后，若该模式开启就走 `_apply_scribble_direct_write`：必要时用 `_resample_mask_between_volumes` 把增量重采样到输出网格（兼容高分辨率输出），取当前段 `get_segment_data()`，用 `compute_boolean_mask`（正向=0 加 / 负向=1 减）合并，再经 `show_segmentation` 写回。完全**跳过** `lasso_or_scribble_prompt` / `@ensure_synched` / 服务端。写回后把 `previous_states["segment_data"]` 置 None，使下一次 AI 交互的 `@ensure_synched` 检测到手动改动并重新上传分段。该模式下不参与 tri-planar 路由与全序列融合（它就是对当前选中段的一次手动 2D 笔刷编辑）。勾选状态持久化于 `SETTING_SCRIBBLE_DIRECT_WRITE`。
+- **关键入口/跳转**：`cbScribbleDirectWrite`（.ui）→ `_get_scribble_direct_write_enabled` / `_on_scribble_direct_write_changed` → `on_scribble_finished` 内的直接写入分支 → `_apply_scribble_direct_write`。
+
 ---
 
 ## 三、切片视图行为 — [[slice_view_behaviors]]
@@ -141,7 +148,7 @@
 
 **实现原理**：
 - **2D 拾取**：模式开启时在三个 2D 切片视图的 `sliceView().interactor()` 上以**高优先级**挂 `LeftButtonPress/MouseMove/LeftButtonRelease` 观察者（`_install_locator_rotation_observers`）。按下时用操作面 `GetXYToRAS()` 把像素 (x,y) 映射到 RAS 点 P；对另两个面取面原点+法线，用「P 到候选面的垂距」`|dot(P-Oc, N̂c)|`（=操作面上到该交叉线的距离）选最近且 ≤ `LOCATOR_PICK_TOL_MM`(3mm) 的面为目标；命中则 `SetAbortFlag(1)` 拦截默认平移并武装拖拽，未命中放行默认导航。
-- **旋转**：拖拽中 `angle=(x-start_x)*LOCATOR_ROTATE_DEG_PER_PX`，复用扩展后的 `rotate_slice_view(target, axis=操作面法线, angle, base_matrix=按下时姿态, center_ras=三面公共交点)`——新增 `center_ras` 锚点让定位线绕十字交点转而非绕切片自身中心；写矩阵后 `SetOrientationToOblique()` 防 Slicer 自动回正。目标视图记入 `_manual_rotated_views` → 自动复用 §3.x 的滚轮逐层分支。base 只存于 `_locator_drag`、不污染滑块的 `_rotate_base_matrices`。三面公共交点由三平面方程组（Cramer）解出（`_three_plane_intersection`），退化时回退到 P。
+- **旋转（精确跟手）**：角度＝**光标相对十字交点的方位角增量**，而非旧的水平像素增量。按下时在操作面 2D 单位基（`SliceToRAS` 第 0/1 列归一化 `op_xhat/op_yhat`）里记下 `start_angle=atan2(dot(d0,op_yhat),dot(d0,op_xhat))`；拖拽中操作面自身不转、其 `XYToRAS` 恒定，把当前像素映射回 RAS 求 `cur`，`angle=cur-start_angle` 收敛到 (-π,π]（线 180° 对称，取最短弧不翻半圈）。**旋转轴用 `op_axis=op_xhat×op_yhat`（该 2D 基自身的右手法线），不是 `SliceToRAS` 第 2 列法线**——因为默认轴位/矢状的 `SliceToRAS` 是左手系（第 2 列 = −(col0×col1)），若绕第 2 列转，红视图里绿/黄线会与光标反向；用 `op_axis` 保证"在 (xhat,yhat) 里 CCW 测得的方位角"＝"`rotate_slice_view` 绕 `op_axis` 的 CCW 旋转"，对所有视图（含斜位）都 1:1 跟手。目标切片绕 `op_axis` 转 Δ 会让该交叉线也精确转 Δ。复用扩展后的 `rotate_slice_view(target, axis=操作面法线, angle, base_matrix=按下时姿态, center_ras=三面公共交点)`——`center_ras` 锚点让线绕十字交点转而非绕切片自身中心；写矩阵后 `SetOrientationToOblique()` 防 Slicer 自动回正。靠近锚点（`<LOCATOR_AZIMUTH_MIN_MM`，方位角不稳）时跳过该帧防抖。目标视图记入 `_manual_rotated_views` → 自动复用 §3.x 的滚轮逐层分支。base 只存于 `_locator_drag`、不污染滑块的 `_rotate_base_matrices`。三面公共交点由三平面方程组（Cramer）解出（`_three_plane_intersection`），退化时回退到 P。
 - **视角锁定 `_view_rotation_locked`**：任何手动旋转（滑块或定位线拖拽）后置 True；`_rotate_camera_to_view` 与 `_align_views_to_volume_planes` **函数开头**早退 → 套索/点/框、装吸附观察者、应用平面背景都不再重定向视图。`reset_view_to_standard` 把视图还原标准 Ax/Cor/Sag 并 `JumpSliceByCentering` 居中、按剩余旋转视图重算锁标志（全复位即解锁）。进入三平面模式：自动取消勾选并禁用按钮（`pbLocatorRotateMode`）、清锁、复位。`cleanup`/场景关闭移除观察者并清锁。
 
 ---
@@ -430,6 +437,12 @@
   ├─ 闭合曲线裁剪：前景体素投到冻结相机屏幕平面 + 点在多边形内（不调用 AI）
   └─ 结果经 show_segmentation -> 立即上传同步
 
+涂鸦「单层不计算模式」（cbScribbleDirectWrite，默认关）
+  ├─ 复用：涂鸦差分管线（on_scribble_finished 的 diff_mask）
+  ├─ 复用：_resample_mask_between_volumes + compute_boolean_mask（正向 OR / 负向 ANDNOT）+ show_segmentation
+  ├─ 跳过：服务端 / @ensure_synched / tri-planar 路由 / 全序列融合
+  └─ 同步：写回后置 previous_states["segment_data"]=None → 下次 AI 交互重传分段
+
 逐层编辑（跨层复制 / 层间插值）
   ├─ 依赖：输出网格（取整面 / 求层号 / 轴向）+ 当前作用视图轴对齐判定
   ├─ 复用：选区运算撤销栈 + 写回链（_commit_layer_edit），共用「撤销」按钮
@@ -446,6 +459,7 @@
 | 三平面逐视图重传 | 每路由到不同序列都要重传图像+分割，无法在跨视图同一会话内迭代细化 |
 | 全序列融合耗时 | 每次交互对全部序列串行推理（各自重传图像+分割），约单次 2.5-3x；套索/涂鸦在正交序列退化为点种子，细节略逊于来源序列 |
 | Scribble 分辨率 | 涂鸦在源体积分辨率绘制，再重采样到路由序列 |
+| 涂鸦直接写入不参与融合 | 「单层不计算模式」是对当前选中段的纯手动 2D 笔刷编辑，跳过服务端与 tri-planar 路由/全序列融合；仅作用于当前选中段，且依赖正/负极性区分加/擦 |
 | 斜采集融合近似 | 方向性融合的穿层方向 `t_s` 由最厚 IJK 轴投影到输出三轴 RAS 基（连续向量，优于旧法 snap 单轴），但强成角下仍是近似 |
 | 方向性融合法向估计 | 边界法向取各序列等权 SDF 均值的梯度；平坦区（远离边界）法向不稳，此处由 `w_floor` 兜底退化为等权，不影响内外 sign |
 | BRAINSFit 依赖 | 自动配准需 Slicer 内置 BRAINSFit；非 DICOM 导入无 Frame-of-Reference UID，需手动确认对齐 |
@@ -454,7 +468,7 @@
 | 闭合曲线裁剪沿视线 | Draw Crop Region 按"绘制结束瞬间"的视线方向拉伸成无限棱柱；该方向冻结后旋转视角不改变结果。透视相机用近似投影，平行相机精确 |
 | 手动旋转仅单序列 | 手动旋转观察平面只对单序列有意义，三平面模式下禁用；滚轮逐层步进依赖 `Snap slices to voxel grid` 勾选（关掉则旋转后滚轮回到 Slicer 默认连续滚动）；非联动时以鼠标所在视图为目标，鼠标不在任一切片视图上时回退红视图 |
 | 视角锁定后自动回正/Face 失效 | 手动旋转（滑块或定位线拖拽）后 `_view_rotation_locked=True`，`_rotate_camera_to_view`/`_align_views_to_volume_planes` 一律早退——副作用是锁定期间「Face 红/黄/绿」按钮与三平面自动相机旋转也不生效；点「复位标准正位」解锁后恢复（设计取舍：彻底锁死视角优先） |
-| 定位线拾取为近似 | 拾取用「点到候选面的垂距」近似「点到交叉线距离」，强斜面下二者有 1/sin(二面角) 的偏差（容差实际略放宽，不影响命中最近线）；阈值 `LOCATOR_PICK_TOL_MM`(3mm) 可调 |
+| 定位线拾取为近似 | 拾取用「点到候选面的垂距」近似「点到交叉线距离」，强斜面下二者有 1/sin(二面角) 的偏差（容差实际略放宽，不影响命中最近线）；阈值 `LOCATOR_PICK_TOL_MM`(3mm) 可调。注：仅**拾取判定**为近似；命中后的**旋转角已是光标相对十字交点的方位角**，被拖的线精确跟手（非旧的像素增量灵敏度） |
 | 内嵌分段编辑器不随插件本地化 | 嵌入的 `qMRMLSegmentEditorWidget`（各 Effect 名、分段表头、Add/Remove 等）与 `qMRMLNodeComboBox` 的 None/节点名由 Slicer 本体提供，**跟随 Slicer 应用语言**，本插件的 `.ui` 直译与 `zh_CN.json` 改不到它们；要它们中文需把 Slicer 应用语言设为中文（见第十九节） |
 | 逐层编辑仅轴对齐视图 | 跨层复制/层间插值把「层」当作输出网格上的一个 numpy 整面，故只在作用视图的切片法向贴近某输出轴（`OBLIQUE_COS_THRESHOLD`）且非手动旋转时可用，否则提示并拒绝；三平面下若序列采集面与输出网格斜交多半判为未对齐；作用视图取「鼠标所在视图→最近滚动视图→红」，滚轮吸附关闭时无滚动观察者，回退红视图（见第二十节） |
 
