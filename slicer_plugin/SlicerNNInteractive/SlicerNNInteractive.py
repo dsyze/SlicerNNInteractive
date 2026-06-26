@@ -1559,6 +1559,29 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._plane_display_reapply_pending = True
         qt.QTimer.singleShot(0, self._reapply_plane_display_volumes_if_active)
 
+    def _restore_slice_backgrounds_after_hidden_editor_source(self):
+        """Undo slice-background resets caused by a hidden Segment Editor."""
+        if self._plane_display_volumes_active:
+            self._schedule_plane_display_reapply()
+            return
+
+        source_volume = self.get_volume_node()
+        if source_volume is None:
+            return
+
+        def _restore():
+            missing = [
+                view_name
+                for view_name in PLANE_DISPLAY_SELECTOR_NAMES
+                if not self._set_slice_view_background(view_name, source_volume)
+            ]
+            if missing:
+                return
+            if self._get_snap_slices_setting():
+                self._align_views_to_volume_planes()
+
+        qt.QTimer.singleShot(0, _restore)
+
     def on_reset_plane_display_volumes_clicked(self, checked=False):
         """Restore the Segment Editor source volume in all standard slice views."""
         source_volume = self.get_volume_node()
@@ -5557,34 +5580,61 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.scribble_segment_node = slicer.mrmlScene.AddNewNodeByClass(
             "vtkMRMLSegmentationNode"
         )
-        self.scribble_segment_node.SetReferenceImageGeometryParameterFromVolumeNode(
-            self.get_volume_node()
-        )
         self.scribble_segment_node.SetName(self.scribble_segment_node_name)
+        self.scribble_segment_node.HideFromEditorsOn()
 
         # Make sure the node exists and is set
         self.scribble_editor_widget.setSegmentationNode(self.scribble_segment_node)
 
         self.scribble_segment_node.CreateDefaultDisplayNodes()
-        self.scribble_segment_node.GetSegmentation().AddEmptySegment(
-            "bg", "bg", [0.0, 0.0, 1.0]
-        )
-        self.scribble_segment_node.GetSegmentation().AddEmptySegment(
-            "fg", "fg", [0.0, 0.0, 1.0]
-        )
-        dn = self.scribble_segment_node.GetDisplayNode()
-
-        opacity = 0.2
-        dn.SetSegmentOpacity2DFill("bg", opacity)
-        dn.SetSegmentOpacity2DOutline("bg", opacity)
-        dn.SetSegmentOpacity2DFill("fg", opacity)
-        dn.SetSegmentOpacity2DOutline("fg", opacity)
-
-        self._prev_scribble_mask = None
+        self._reset_scribble_scratch_segments()
+        self._active_scribble_volume_node = None
             
         light_dark_mode = self.is_ui_dark_or_light_mode()
         icon = qt.QIcon(self.resourcePath(f"Icons/prompts/{light_dark_mode}/scribble_icon.svg"))
         self.ui.pbInteractionScribble.setIcon(icon)
+
+    def _get_scribble_volume_node(self):
+        """Volume geometry used by the hidden scribble paint scratch node."""
+        return self.get_output_volume_node() or self.get_volume_node()
+
+    def _reset_scribble_scratch_segments(self, volume_node=None):
+        """Rebuild the hidden bg/fg scribble segments on the requested grid."""
+        node = getattr(self, "scribble_segment_node", None)
+        if node is None or not slicer.mrmlScene.IsNodePresent(node):
+            return None
+        volume_node = volume_node or self._get_scribble_volume_node()
+        if volume_node is None:
+            return None
+
+        self._set_segmentation_reference_volume(node, volume_node)
+        segmentation = node.GetSegmentation()
+        for segment_id in ("bg", "fg"):
+            if segmentation.GetSegment(segment_id):
+                segmentation.RemoveSegment(segment_id)
+        segmentation.AddEmptySegment("bg", "bg", [0.0, 0.0, 1.0])
+        segmentation.AddEmptySegment("fg", "fg", [0.0, 0.0, 1.0])
+
+        display_node = node.GetDisplayNode()
+        if display_node is not None:
+            opacity = 0.2
+            for segment_id in ("bg", "fg"):
+                display_node.SetSegmentOpacity2DFill(segment_id, opacity)
+                display_node.SetSegmentOpacity2DOutline(segment_id, opacity)
+
+        self._prev_scribble_mask = None
+        node.Modified()
+        return volume_node
+
+    def _scribble_direct_write_can_use_visible_editor(self):
+        """True when the fast visible-editor Paint path will not clip scribbles."""
+        source_volume = self.get_volume_node()
+        scribble_volume = self._get_scribble_volume_node()
+        return (
+            source_volume is not None
+            and scribble_volume is not None
+            and source_volume.GetID() == scribble_volume.GetID()
+        )
 
     def is_ui_dark_or_light_mode(self):
         # Returns whether the current appearance of the UI is dark mode (will return "dark")
@@ -6147,6 +6197,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             # If direct-write retargeted the hidden editor at the real segment,
             # point it back at the scratch node so normal (server) scribble works.
             self._restore_scribble_editor_target()
+            self._active_scribble_volume_node = None
 
             return
 
@@ -6159,22 +6210,32 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if (
             self._get_scribble_direct_write_enabled()
             and self._get_scribble_thickness() <= 1
+            and self._scribble_direct_write_can_use_visible_editor()
         ):
             self._begin_direct_write_paint()
             return
 
         segment_id = "fg" if self.is_positive else "bg"
+        scribble_volume = self._reset_scribble_scratch_segments()
+        if scribble_volume is None:
+            _status(_cn("Load a volume before scribbling."), 4000)
+            blocked = self.ui.pbInteractionScribble.blockSignals(True)
+            self.ui.pbInteractionScribble.setChecked(False)
+            self.ui.pbInteractionScribble.blockSignals(blocked)
+            return
+        self._active_scribble_volume_node = scribble_volume
 
         # Set segmentation and segment
         self.scribble_editor_widget.setSegmentationNode(self.scribble_segment_node)
         self.scribble_editor_node.SetSelectedSegmentID(segment_id)
 
-        # Set reference volume
-        volume_node = self.get_volume_node()
-        self.scribble_editor_widget.setSourceVolumeNode(volume_node)
-        # setSourceVolumeNode resets every slice background to the source volume,
-        # so restore the sticky per-plane display selections afterward.
-        self._schedule_plane_display_reapply()
+        # Set reference volume. In high-res / tri-planar mode this is the
+        # canonical output grid, so Paint can draw anywhere the final segment can
+        # exist instead of being clipped by the smaller Segment Editor source.
+        self.scribble_editor_widget.setSourceVolumeNode(scribble_volume)
+        # setSourceVolumeNode resets slice backgrounds to its source. Restore
+        # either sticky per-plane backgrounds or the normal source volume.
+        self._restore_slice_backgrounds_after_hidden_editor_source()
 
         # Activate paint effect
         self.scribble_editor_widget.setActiveEffectByName("Paint")
@@ -6343,13 +6404,22 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         else:
             return
 
+        source_volume = getattr(self, "_active_scribble_volume_node", None)
+        if source_volume is None or not slicer.mrmlScene.IsNodePresent(source_volume):
+            source_volume = self._get_scribble_volume_node()
+        if source_volume is None:
+            return
+
         mask = slicer.util.arrayFromSegmentBinaryLabelmap(
-            self.scribble_segment_node, label_name, self.get_volume_node()
+            self.scribble_segment_node, label_name, source_volume
         )
+        if mask is None:
+            return
 
         if (
             hasattr(self, "_prev_scribble_mask")
             and self._prev_scribble_mask is not None
+            and tuple(self._prev_scribble_mask.shape) == tuple(mask.shape)
         ):
             prev_scribble_mask = self._prev_scribble_mask
         else:
@@ -6358,12 +6428,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         diff_mask = mask - prev_scribble_mask
         self._prev_scribble_mask = mask
 
-        source_volume = self.get_volume_node()
-
         # Single-layer direct-write with slab thickness > 1: extrude this stroke
         # through-plane to N slices and merge straight into the current segment,
         # skipping the server. (Thickness == 1 uses the native instant path and
-        # never reaches here.)
+        # never reaches here unless the visible-editor source grid would clip
+        # the output-grid scribble.)
         if self._get_scribble_direct_write_enabled():
             self._apply_thick_direct_write(diff_mask, source_volume)
             self.ui.pbInteractionScribble.click()  # turn it off

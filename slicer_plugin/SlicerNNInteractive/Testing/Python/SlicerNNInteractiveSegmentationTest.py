@@ -149,6 +149,7 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
             self._test_multi_plane_display_volumes(widget, volume_node)
             self._test_native_series_inference_sync(widget, volume_node)
             self._test_high_res_output_geometry(widget, volume_node)
+            self._test_scribble_scratch_output_geometry(widget, volume_node)
             self._test_smooth_interpolation(widget, volume_node)
             self._test_smooth_current_segment(widget, volume_node)
             missing = [name for name, _ in self.PROMPTS if not self._reference_path(name).exists()]
@@ -531,6 +532,51 @@ class SlicerNNInteractiveSegmentationTest(ScriptedLoadableModuleTest):
             slicer.app.processEvents()
 
         print("[PASS] high-resolution output geometry")
+
+    def _test_scribble_scratch_output_geometry(self, widget, source_volume):
+        print("Testing scribble scratch output geometry...")
+        iso = max(0.3, 0.75 * min(source_volume.GetSpacing()))
+        try:
+            widget.ui.cbScribbleDirectWrite.setChecked(False)
+            widget.ui.sbOutputSpacing.setValue(iso)
+            widget.ui.cbEnableHighResOutput.setChecked(True)
+            slicer.app.processEvents()
+
+            output_volume = widget.get_output_volume_node()
+            self.assertIsNotNone(output_volume)
+            self.assertNotEqual(
+                output_volume.GetID(),
+                source_volume.GetID(),
+                msg="Test requires a distinct high-resolution output grid.",
+            )
+
+            scribble_volume = widget._reset_scribble_scratch_segments()
+            self.assertEqual(
+                scribble_volume.GetID(),
+                output_volume.GetID(),
+                msg="Scribble scratch must use the canonical output grid.",
+            )
+            self.assertFalse(
+                widget._scribble_direct_write_can_use_visible_editor(),
+                msg="Visible-editor direct-write would clip an output-grid scribble.",
+            )
+
+            widget.on_scribble_clicked(True)
+            slicer.app.processEvents()
+            self.assertEqual(
+                widget.scribble_editor_widget.sourceVolumeNode().GetID(),
+                output_volume.GetID(),
+                msg="Hidden Paint source must match the output grid.",
+            )
+        finally:
+            widget.on_scribble_clicked(False)
+            widget.ui.cbEnableHighResOutput.setChecked(False)
+            widget.ui.sbOutputSpacing.setValue(0.0)
+            widget._remove_output_geometry_node()
+            slicer.util.setSliceViewerLayers(background=source_volume)
+            slicer.app.processEvents()
+
+        print("[PASS] scribble scratch output geometry")
 
     def _test_smooth_interpolation(self, widget, source_volume):
         print("Testing smooth interpolation...")
