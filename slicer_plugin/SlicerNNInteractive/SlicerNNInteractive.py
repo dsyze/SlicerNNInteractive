@@ -453,12 +453,12 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # the three-series fusion button can reuse it after the live lasso node was
         # consumed/cleared by the normal auto-submit flow.
         self._last_lasso_world_points = None
-        # Tri-planar multi-series mode: each interaction is routed to the series
-        # shown in the view it was made in, and the three directions are
-        # direction-weighted-fused after every interaction. While a prompt is
-        # routed, _active_inference_volume_override forces get_inference_volume_node
-        # to return that view's series.
+        # Tri-planar locator mode is controlled by cbTriPlanarMode. The
+        # multi-series inference part is active only when at least two distinct
+        # Red/Yellow/Green view volumes are assigned; otherwise the same UI acts
+        # as single-series locator planes and must not route/fuse prompts.
         self._triplanar_mode = False
+        self._triplanar_multiseries_active = False
         self._active_inference_volume_override = None
         # 3D locator planes for tri-planar mode: {view_name: vtkMRMLModelNode}
         # and the slice-node ModifiedEvent observers that keep them in sync,
@@ -1493,6 +1493,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             show_status=True
         )
         self._align_display_volumes()
+        if (
+            self._triplanar_mode
+            and not getattr(self, "_triplanar_setup_in_progress", False)
+        ):
+            self._refresh_triplanar_series_state("apply")
 
     def _align_display_volumes(self):
         """Auto-register each per-plane display volume to the source volume.
@@ -1510,7 +1515,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # entirely -- it is unnecessary for aligned series and the async BRAINSFit
         # CLI on large oblique series can crash Slicer. Backgrounds are still
         # applied by _apply_plane_display_volumes; only registration is skipped.
-        if self._triplanar_mode or (
+        if self._triplanar_inference_active() or (
             hasattr(self, "ui") and self.ui.cbConfirmSeriesAligned.isChecked()
         ):
             _perf_log("[DEBUG triplanar.perf] align_display: SKIP registration "
@@ -1657,7 +1662,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Coarsen to fit the voxel budget so the isotropic grid stays tractable.
         budget = (
             TRIPLANAR_MAX_OUTPUT_VOXELS
-            if getattr(self, "_triplanar_mode", False)
+            if self._triplanar_inference_active()
             else OUTPUT_GEOMETRY_HARD_VOXEL_BUDGET
         )
         image = source_volume.GetImageData() if source_volume is not None else None
@@ -1807,7 +1812,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # Tri-planar: cover the UNION of the three assigned series, not the editor
         # source (which may be a different/smaller series and would clip anatomy
         # that is visible in the views but outside the source FOV).
-        if getattr(self, "_triplanar_mode", False):
+        if self._triplanar_inference_active():
             node = self._ensure_triplanar_output_geometry_node()
             if node is not None:
                 return node
@@ -2713,10 +2718,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """Store the latest result for the active inference series, keyed by its
         volume id, so the Fuse button can SDF-average all series together.
         Masks must live on the current output grid; stale ones are dropped."""
-        # Tri-planar mode always collects per-series results for fusion, even if
-        # the cbEnableSeriesFusion checkbox got reset (it is not persisted across
-        # a module reload, unlike the tri-planar mode flag).
-        enabled = self._get_fusion_enabled() or self._triplanar_mode
+        # Real multi-series tri-planar inference always collects per-series
+        # results for fusion, even if the cbEnableSeriesFusion checkbox got reset
+        # (it is not persisted across a module reload, unlike the mode flag).
+        enabled = self._get_fusion_enabled() or self._triplanar_inference_active()
         print("[DEBUG fusion.collect] called, fusion_enabled={}".format(enabled))
         if not enabled:
             return
@@ -3520,8 +3525,19 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # 3) Ensure tri-planar prerequisites (union output grid covering all 3
         #    series + high-resolution output + fusion). Enabling the mode builds
         #    the grid, so we never clip anatomy outside the editor source FOV.
-        if not self._triplanar_mode:
-            self.ui.cbTriPlanarMode.setChecked(True)
+        if not self._triplanar_inference_active():
+            if self._triplanar_mode:
+                self._setup_triplanar_views()
+            else:
+                self.ui.cbTriPlanarMode.setChecked(True)
+        if not self._triplanar_inference_active():
+            _mb_warning(
+                slicer.util.mainWindow(),
+                "Three-series fusion",
+                "Assign distinct series to at least two of the Red/Yellow/Green "
+                "views before running three-series fusion.",
+            )
+            return
         output_volume = self.get_output_volume_node()
         if output_volume is None or self._output_grid_shape() is None:
             _mb_warning(
@@ -3635,6 +3651,33 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def _get_triplanar_enabled(self):
         """Read the persisted tri-planar mode preference. Default False."""
         return self._get_qsetting(SETTING_TRIPLANAR_ENABLED, False, cast=bool)
+
+    def _triplanar_inference_active(self):
+        """True only when tri-planar is using distinct series for inference.
+
+        A single high-resolution series may still use the tri-planar locator
+        planes, face-view camera buttons, and per-plane display UI. It must not
+        take the multi-series route/fuse/output-grid path, because that path
+        disables manual rotation and resamples scribble/lasso through unrelated
+        series machinery.
+        """
+        return bool(
+            getattr(self, "_triplanar_mode", False)
+            and getattr(self, "_triplanar_multiseries_active", False)
+        )
+
+    def _set_triplanar_multiseries_active(self, active):
+        """Switch the inference-specific half of tri-planar mode on/off."""
+        self._triplanar_multiseries_active = bool(active)
+        if not hasattr(self, "ui"):
+            return
+        if active and self.ui.pbLocatorRotateMode.isChecked():
+            self.ui.pbLocatorRotateMode.setChecked(False)
+        self.ui.pbLocatorRotateMode.setEnabled(not active)
+        self.ui.rotateViewGroup.setEnabled(not active)
+        self.ui.cbAllSeriesFusion.setEnabled(active)
+        self.ui.cbDirectionalFusion.setEnabled(active)
+        self.ui.cbShow3DTriPlanar.setEnabled(active)
 
     # -- Tri-planar 3D slice locator frames ----------------------------------
 
@@ -4073,6 +4116,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         """Persist the toggle; build the surface now when turned on, hide the 3D
         surface when turned off (2D fill and locator planes are untouched)."""
         self._set_qsetting(SETTING_SHOW_3D_TRIPLANAR, bool(checked))
+        if not self._triplanar_inference_active():
+            return
         if checked:
             self._schedule_triplanar_3d_surface()
             return
@@ -4099,7 +4144,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         tri-planar mode, or if the feature is off."""
         if token != getattr(self, "_tp3d_token", 0):
             return
-        if not self._triplanar_mode or not self._get_show_3d_triplanar():
+        if (
+            not self._triplanar_inference_active()
+            or not self._get_show_3d_triplanar()
+        ):
             return
         seg_node = self._existing_segmentation_node()
         if seg_node is None:
@@ -4380,63 +4428,28 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         locks in what they chose and turns on the prerequisites. Returns True when
         at least two views show distinct series."""
         _perf_log("[DEBUG triplanar.perf] setup_triplanar start")
-        # Tri-planar requires co-registered series, so mark them aligned up front
-        # and skip auto-registration (BRAINSFit on these series can crash Slicer).
-        if hasattr(self, "ui"):
-            blocked = self.ui.cbConfirmSeriesAligned.blockSignals(True)
-            self.ui.cbConfirmSeriesAligned.setChecked(True)
-            self.ui.cbConfirmSeriesAligned.blockSignals(blocked)
-        # Lock in / re-apply whatever the user selected in the multi-plane panel.
-        self.on_apply_plane_display_volumes_clicked()
-        _perf_log("[DEBUG triplanar.perf] setup_triplanar: after on_apply")
-        # A fine isotropic output grid sharpens the fused result; fusion must be
-        # on so each routed per-view result is collected per series.
-        self._enable_high_res_for_smoothing()
-        _perf_log("[DEBUG triplanar.perf] setup_triplanar: after enable_high_res")
-        if hasattr(self, "ui"):
-            blocked = self.ui.cbEnableSeriesFusion.blockSignals(True)
-            self.ui.cbEnableSeriesFusion.setChecked(True)
-            self.ui.cbEnableSeriesFusion.blockSignals(blocked)
-        self._fusion_results = {}
-        self._fusion_grid_shape = None
-        self._invalidate_fusion_coverage("tri-planar setup")
-        # The output grid is rebuilt to cover the union of the assigned series;
-        # force a rebuild and drop now-stale geometry-bound state (undo snapshots
-        # would no longer match the new grid shape).
-        self._output_geometry_triplanar_sig = None
-        self._clear_selection_op_undo_stack(
-            "Output grid rebuilt for tri-planar; undo history cleared.")
-        bg = {v: self._view_background_volume(v) for v in PLANE_DISPLAY_SELECTOR_NAMES}
-        view_series = {
-            v: (n.GetName() if n is not None else None) for v, n in bg.items()
+        selected_ids = {
+            getattr(self.ui, selector).currentNode().GetID()
+            for selector in PLANE_DISPLAY_SELECTOR_NAMES.values()
+            if getattr(self.ui, selector).currentNode() is not None
         }
-        print("[DEBUG triplanar.setup] view backgrounds: {}".format(view_series))
-        distinct_ids = {n.GetID() for n in bg.values() if n is not None}
-        if len(distinct_ids) < 2:
-            print("[DEBUG triplanar.setup] WARN: fewer than 2 distinct series in views")
-            # Fewer than 2 distinct series: tri-planar fusion is not set up, but
-            # the 3D reference planes are a general feature, so rebuild them for
-            # whatever single volume backs the views instead of leaving none.
-            self._disable_triplanar_slice_frames()
-            self._schedule_ensure_slice_frames("triplanar-setup-single")
-            _status(
-                "Tri-planar mode: assign your series to the Red/Yellow/Green views "
-                "in the Multi-plane display panel (and Apply) first.", 6000
-            )
-            return False
-        # Show the 3D slice locator planes (3D counterpart of the 2D
-        # intersection lines) now that the views carry distinct series. Use the
-        # ensure variant so we do not rebuild if on_apply (above) already built
-        # them via the same _ensure hook.
-        self._ensure_triplanar_slice_frames("setup")
-        # Show any existing segmentation in 3D now that we are tri-planar.
-        if self._get_show_3d_triplanar():
-            self._schedule_triplanar_3d_surface()
-        _status(
-            _cn("Tri-planar mode on: ") + ", ".join(
-                "{}={}".format(v, n) for v, n in view_series.items()), 5000
-        )
-        return True
+        # Multi-series tri-planar requires co-registered series, so mark them
+        # aligned up front and skip auto-registration (BRAINSFit on these series
+        # can crash Slicer). Single-series locator mode does not change this
+        # user preference.
+        if hasattr(self, "ui"):
+            if len(selected_ids) >= 2:
+                blocked = self.ui.cbConfirmSeriesAligned.blockSignals(True)
+                self.ui.cbConfirmSeriesAligned.setChecked(True)
+                self.ui.cbConfirmSeriesAligned.blockSignals(blocked)
+        # Lock in / re-apply whatever the user selected in the multi-plane panel.
+        self._triplanar_setup_in_progress = True
+        try:
+            self.on_apply_plane_display_volumes_clicked()
+        finally:
+            self._triplanar_setup_in_progress = False
+        _perf_log("[DEBUG triplanar.perf] setup_triplanar: after on_apply")
+        return self._refresh_triplanar_series_state("setup")
 
     def _on_triplanar_mode_toggled(self, checked):
         """Enter or leave tri-planar multi-series mode."""
@@ -4444,25 +4457,13 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self._set_qsetting(SETTING_TRIPLANAR_ENABLED, bool(checked))
         self._triplanar_mode = bool(checked)
         self._active_inference_volume_override = None
-        # Manual oblique rotation is single-series only; entering tri-planar mode
-        # undoes any manual rotation (so it does not fight the auto-assigned
-        # acquisition-plane views) and greys out the rotation panel.
-        if hasattr(self, "ui"):
-            self.ui.rotateViewGroup.setEnabled(not self._triplanar_mode)
-            # Locator-line drag rotation is single-series only: turn it off and
-            # disable it in tri-planar mode (views must stay fixed there).
-            if self._triplanar_mode and self.ui.pbLocatorRotateMode.isChecked():
-                self.ui.pbLocatorRotateMode.setChecked(False)
-            self.ui.pbLocatorRotateMode.setEnabled(not self._triplanar_mode)
         if checked:
             self._view_rotation_locked = False
-        if checked and self._manual_rotated_views:
-            self.reset_view_to_standard(
-                target_views=list(self._manual_rotated_views))
         if checked:
             ok = self._setup_triplanar_views()
             print("[DEBUG triplanar.mode] view setup returned {}".format(ok))
         else:
+            self._set_triplanar_multiseries_active(False)
             # Leaving tri-planar: the output grid reverts to the source-based one,
             # so the union-grid geometry-bound state is stale.
             self._output_geometry_triplanar_sig = None
@@ -4476,9 +4477,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             # planes persist (now a general feature) instead of vanishing.
             self._disable_triplanar_slice_frames()
             self._schedule_ensure_slice_frames("left-triplanar")
-        # The all-series-fusion sub-option only applies inside tri-planar mode.
-        if hasattr(self, "ui"):
-            self.ui.cbAllSeriesFusion.setEnabled(self._triplanar_mode)
+        # The all-series-fusion sub-option only applies to real multi-series
+        # inference, not single-series locator mode.
+        self._set_triplanar_multiseries_active(
+            self._triplanar_inference_active())
         self._refresh_native_series_inference_ui()
 
     def _get_allseries_fusion_enabled(self):
@@ -4495,9 +4497,67 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
     def _allseries_fusion_active(self):
         """True when every prompt should be run against all assigned series and
         fused, i.e. tri-planar mode is on and the sub-option is checked."""
-        if not self._triplanar_mode or not hasattr(self, "ui"):
+        if not self._triplanar_inference_active() or not hasattr(self, "ui"):
             return False
         return self.ui.cbAllSeriesFusion.isChecked()
+
+    def _refresh_triplanar_series_state(self, reason=""):
+        """Refresh whether tri-planar is locator-only or multi-series inference.
+
+        This is called after view backgrounds are applied. It must not re-apply
+        backgrounds itself, otherwise the Apply button and setup path recurse.
+        """
+        bg = {v: self._view_background_volume(v) for v in PLANE_DISPLAY_SELECTOR_NAMES}
+        view_series = {
+            v: (n.GetName() if n is not None else None) for v, n in bg.items()
+        }
+        print("[DEBUG triplanar.setup] view backgrounds: {}".format(view_series))
+        distinct_ids = {n.GetID() for n in bg.values() if n is not None}
+        if len(distinct_ids) < 2:
+            print("[DEBUG triplanar.setup] WARN: fewer than 2 distinct series in views")
+            self._set_triplanar_multiseries_active(False)
+            self._active_inference_volume_override = None
+            self._fusion_results = {}
+            self._fusion_grid_shape = None
+            self._output_geometry_triplanar_sig = None
+            self._invalidate_fusion_coverage("single-series locator")
+            self._disable_triplanar_slice_frames()
+            self._schedule_ensure_slice_frames("triplanar-single-%s" % reason)
+            _status(
+                "Single-series locator mode: using the same volume in the "
+                "Red/Yellow/Green views; inference remains single-volume.",
+                6000,
+            )
+            return False
+
+        self._set_triplanar_multiseries_active(True)
+        if self._manual_rotated_views:
+            self.reset_view_to_standard(
+                target_views=list(self._manual_rotated_views))
+        # A fine isotropic output grid sharpens the fused result; fusion must be
+        # on so each routed per-view result is collected per series.
+        self._enable_high_res_for_smoothing()
+        _perf_log("[DEBUG triplanar.perf] setup_triplanar: after enable_high_res")
+        if hasattr(self, "ui"):
+            blocked = self.ui.cbEnableSeriesFusion.blockSignals(True)
+            self.ui.cbEnableSeriesFusion.setChecked(True)
+            self.ui.cbEnableSeriesFusion.blockSignals(blocked)
+        self._fusion_results = {}
+        self._fusion_grid_shape = None
+        self._invalidate_fusion_coverage("tri-planar setup")
+        # The output grid is rebuilt to cover the union of the assigned series;
+        # force a rebuild and drop now-stale geometry-bound state.
+        self._output_geometry_triplanar_sig = None
+        self._clear_selection_op_undo_stack(
+            "Output grid rebuilt for tri-planar; undo history cleared.")
+        self._ensure_triplanar_slice_frames("setup")
+        if self._get_show_3d_triplanar():
+            self._schedule_triplanar_3d_surface()
+        _status(
+            _cn("Tri-planar mode on: ") + ", ".join(
+                "{}={}".format(v, n) for v, n in view_series.items()), 5000
+        )
+        return True
 
     def _get_directional_fusion_enabled(self):
         """Read the persisted directional-fusion preference. Default True so
@@ -4584,6 +4644,11 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         if view is None:
             print("[DEBUG triplanar.route] no view plane matched; default volume")
             return None
+        if not self._triplanar_inference_active():
+            if self._get_auto_camera_rotation():
+                self._rotate_camera_to_view(view)
+            print("[DEBUG triplanar.route] single-series locator; no inference override")
+            return view
         series = self._view_background_volume(view)
         if series is None:
             print("[DEBUG triplanar.route] view {} has no background series".format(
@@ -4800,7 +4865,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 print("[DEBUG fuse3] captured result for '{}' sum={}".format(
                     inf_node.GetName(), int(np.asarray(out_mask).sum())))
             return
-        if self._triplanar_mode:
+        if self._triplanar_inference_active():
             # Per-view routed result: collect it for fusion and show the combined
             # direction-weighted result instead of a single-series preview.
             self._handle_triplanar_result(segmentation_mask)
@@ -4936,9 +5001,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         self.ui.pbFuseThreeSeriesRoi.clicked.connect(
             self.onFuseFromThreeSeriesWithROI
         )
-        # Tri-planar multi-series mode. Restore the persisted preference into the
-        # checkbox with signals blocked (so we do not rearrange views at startup,
-        # before series are loaded); the view setup runs when the user toggles.
+        # Tri-planar locator/multi-series mode. Restore the persisted preference
+        # into the checkbox with signals blocked (so we do not rearrange views at
+        # startup, before series are loaded); the view setup runs when the user
+        # toggles.
         self.ui.cbTriPlanarMode.toggled.connect(self._on_triplanar_mode_toggled)
         blocked = self.ui.cbTriPlanarMode.blockSignals(True)
         self.ui.cbTriPlanarMode.setChecked(self._get_triplanar_enabled())
@@ -4950,7 +5016,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         blocked = self.ui.cbAllSeriesFusion.blockSignals(True)
         self.ui.cbAllSeriesFusion.setChecked(self._get_allseries_fusion_enabled())
         self.ui.cbAllSeriesFusion.blockSignals(blocked)
-        self.ui.cbAllSeriesFusion.setEnabled(self._triplanar_mode)
+        self.ui.cbAllSeriesFusion.setEnabled(False)
         # Directional fusion (normal-aligned equal weight). Applies to every SDF
         # fusion (manual Fuse, all-series fusion, three-series ROI). Restored
         # with signals blocked so it does not run anything at startup.
@@ -4962,6 +5028,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             self._get_directional_fusion_enabled()
         )
         self.ui.cbDirectionalFusion.blockSignals(blocked)
+        self.ui.cbDirectionalFusion.setEnabled(False)
         # Lazy start: the checkbox is restored CHECKED without firing the toggle,
         # so the planes are built later by _ensure_triplanar_slice_frames when
         # the user applies their series (see _apply_plane_display_volumes).
@@ -4992,6 +5059,7 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         blocked = self.ui.cbShow3DTriPlanar.blockSignals(True)
         self.ui.cbShow3DTriPlanar.setChecked(self._get_show_3d_triplanar())
         self.ui.cbShow3DTriPlanar.blockSignals(blocked)
+        self.ui.cbShow3DTriPlanar.setEnabled(False)
         # Manual "face series in 3D" buttons (always active, ignore the toggle).
         self.ui.pbFaceRed.clicked.connect(
             lambda *a, v="Red": self._rotate_camera_to_view(v))
@@ -5050,8 +5118,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         # observers on toggle).
         self.ui.pbLocatorRotateMode.toggled.connect(
             self.on_locator_rotate_mode_toggled)
-        self.ui.pbLocatorRotateMode.setEnabled(not self._triplanar_mode)
-        self.ui.rotateViewGroup.setEnabled(not self._triplanar_mode)
+        self.ui.pbLocatorRotateMode.setEnabled(
+            not self._triplanar_inference_active())
+        self.ui.rotateViewGroup.setEnabled(
+            not self._triplanar_inference_active())
         # Closing the scene drops the manual rotation state so the next scene
         # starts at standard orientation (the views are reset by Slicer too).
         # Registered via VTKObservationMixin so removeObservers() tears it down.
@@ -5910,14 +5980,14 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             # active axis follows the draw without needing a scroll first.
             self._note_active_view_from_ras(list(np.mean(_ras_pts, axis=0)))
 
-        # Tri-planar routing: a lasso is drawn on one view's plane, so route it to
-        # that view's series BEFORE computing voxel coords / rasterizing. In
-        # tri-planar mode multi-view accumulation is bypassed (each view shows a
-        # different series), so the lasso submits immediately and routed.
-        if self._triplanar_mode and len(_ras_pts):
+        # Multi-series tri-planar routing: a lasso is drawn on one view's plane,
+        # so route it to that view's series BEFORE computing voxel coords /
+        # rasterizing. Single-series locator mode keeps the ordinary source grid.
+        if self._triplanar_inference_active() and len(_ras_pts):
             self._route_prompt_to_view(list(_ras_pts[0]))
         multiview_effective = (
-            self._get_lasso_multiview_enabled() and not self._triplanar_mode
+            self._get_lasso_multiview_enabled()
+            and not self._triplanar_inference_active()
         )
         inference_volume = self.get_inference_volume_node()
 
@@ -6333,11 +6403,10 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
             applied = self._run_allseries_fusion(send_scribble)
 
         if not applied:
-            # Tri-planar routing: send the scribble to the series shown in the
-            # view it was drawn in, detected from the painted plane's RAS
-            # centroid. The diff mask is on the source grid;
-            # lasso_or_scribble_prompt resamples it onto the routed series.
-            if self._triplanar_mode:
+            # Multi-series tri-planar routing: send the scribble to the series
+            # shown in the view it was drawn in. Single-series locator mode keeps
+            # the source grid and avoids unnecessary resampling.
+            if self._triplanar_inference_active():
                 self._route_prompt_to_view(
                     self._mask_centroid_ras(diff_mask, source_volume)
                 )
@@ -6538,20 +6607,23 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
                 selectedSegmentID,
                 self.get_output_volume_node(),
             )
-            # Tri-planar fuses + redraws after every interaction; rebuilding the
-            # closed surface (marching cubes) on the large output grid each time
-            # is a heavy CPU/GPU hit and a likely freeze/crash source, so skip it
-            # in tri-planar mode (the user can re-enable 3D when ready).
-            if was_3d_shown and not self._triplanar_mode:
+            # Multi-series tri-planar fuses + redraws after every interaction;
+            # rebuilding the closed surface (marching cubes) on the large output
+            # grid each time is a heavy CPU/GPU hit, so skip immediate rebuild
+            # only in that mode. Single-series locator mode keeps normal 3D.
+            if was_3d_shown and not self._triplanar_inference_active():
                 _perf_log("[DEBUG triplanar.perf] CreateClosedSurfaceRepresentation "
                       "start", flush=True)
                 segmentationNode.CreateClosedSurfaceRepresentation()
                 _perf_log("[DEBUG triplanar.perf] CreateClosedSurfaceRepresentation "
                       "done", flush=True)
-        # Tri-planar skips the per-interaction surface rebuild above; instead
-        # show the 3D surface via a debounced rebuild so rapid interactions only
-        # pay the heavy marching-cubes cost once, after the user pauses.
-        if self._triplanar_mode and self._get_show_3d_triplanar():
+        # Multi-series tri-planar skips the per-interaction surface rebuild
+        # above; instead show the 3D surface via a debounced rebuild so rapid
+        # interactions only pay the heavy marching-cubes cost once.
+        if (
+            self._triplanar_inference_active()
+            and self._get_show_3d_triplanar()
+        ):
             self._schedule_triplanar_3d_surface()
         _perf_log("[DEBUG triplanar.perf] show_segmentation: done", flush=True)
 
@@ -9088,7 +9160,8 @@ class SlicerNNInteractiveWidget(ScriptedLoadableModuleWidget, VTKObservationMixi
         applied once at the end. `seed_node` is ignored (kept for back-compat).
         Returns a bool numpy mask on the source grid, or None on failure."""
         series_list = (
-            self._triplanar_coverage_volumes() if self._triplanar_mode else []
+            self._triplanar_coverage_volumes()
+            if self._triplanar_inference_active() else []
         )
         if len(series_list) < 2:
             mask = self._wand_raw_source_mask()
