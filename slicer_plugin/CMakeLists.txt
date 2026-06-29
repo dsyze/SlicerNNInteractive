@@ -19,10 +19,12 @@ include(${Slicer_USE_FILE})
 #-----------------------------------------------------------------------------
 # Extension modules
 add_subdirectory(SlicerNNInteractive)
+add_subdirectory(SlicerMuscleContours)
 ## NEXT_MODULE
 
 if(BUILD_TESTING)
   add_subdirectory(SlicerNNInteractive/Testing)
+  add_subdirectory(SlicerMuscleContours/Testing)
 endif()
 
 #-----------------------------------------------------------------------------
