@@ -73,14 +73,14 @@ class SlicerMuscleContoursWidget(
         ScriptedLoadableModuleWidget.setup(self)
         self.logic = SlicerMuscleContoursLogic()
 
-        self.reloadModuleButton = qt.QPushButton("更新模块")
+        self.reloadModuleButton = qt.QPushButton("Reload module")
         self.reloadModuleButton.toolTip = (
-            "热重载 SlicerMuscleContours 的 Python 代码和界面，保留当前场景数据。"
+            "Hot-reload SlicerMuscleContours Python code and UI, keeping current scene data."
         )
         self.reloadModuleButton.connect("clicked()", self.onReloadModule)
         self.parent.layout().addWidget(self.reloadModuleButton)
 
-        parameters = qt.QGroupBox("轮廓组")
+        parameters = qt.QGroupBox("Contour group")
         form = qt.QFormLayout(parameters)
         self.referenceSelector = slicer.qMRMLNodeComboBox()
         self.referenceSelector.nodeTypes = ["vtkMRMLScalarVolumeNode"]
@@ -88,10 +88,10 @@ class SlicerMuscleContoursWidget(
         self.referenceSelector.addEnabled = False
         self.referenceSelector.removeEnabled = False
         self.referenceSelector.setMRMLScene(slicer.mrmlScene)
-        form.addRow("参考影像：", self.referenceSelector)
-        self.referenceStatusLabel = qt.QLabel("尚未选择参考影像")
+        form.addRow("Reference image:", self.referenceSelector)
+        self.referenceStatusLabel = qt.QLabel("No reference image selected")
         self.referenceStatusLabel.wordWrap = True
-        form.addRow("当前状态：", self.referenceStatusLabel)
+        form.addRow("Status:", self.referenceStatusLabel)
 
         self.segmentationSelector = slicer.qMRMLNodeComboBox()
         self.segmentationSelector.nodeTypes = ["vtkMRMLSegmentationNode"]
@@ -99,28 +99,28 @@ class SlicerMuscleContoursWidget(
         self.segmentationSelector.addEnabled = True
         self.segmentationSelector.removeEnabled = False
         self.segmentationSelector.setMRMLScene(slicer.mrmlScene)
-        form.addRow("输出分割：", self.segmentationSelector)
+        form.addRow("Output segmentation:", self.segmentationSelector)
 
         self.groupName = qt.QLineEdit("Muscle")
-        form.addRow("肌肉名称：", self.groupName)
+        form.addRow("Muscle name:", self.groupName)
         self.parent.layout().addWidget(parameters)
 
-        drawing = qt.QGroupBox("关键层轮廓")
+        drawing = qt.QGroupBox("Key-slice contours")
         drawingLayout = qt.QVBoxLayout(drawing)
         drawingViewRow = qt.QHBoxLayout()
-        drawingViewRow.addWidget(qt.QLabel("绘制视图："))
+        drawingViewRow.addWidget(qt.QLabel("Draw view:"))
         self.drawingViewComboBox = qt.QComboBox()
         self.drawingViewComboBox.addItems(list(SLICE_VIEW_NAMES))
         drawingViewRow.addWidget(self.drawingViewComboBox)
         drawingLayout.addLayout(drawingViewRow)
-        self.drawButton = qt.QPushButton("在当前切片绘制闭合轮廓")
+        self.drawButton = qt.QPushButton("Draw closed contour on current slice")
         self.drawButton.checkable = True
-        self.drawButton.toolTip = "每次左键单击生成一个点；鼠标移动不会采样；右键结束。"
-        self.insertButton = qt.QPushButton("在选中曲线上插入控制点")
+        self.drawButton.toolTip = "Each left click adds one point; mouse movement is not sampled; right click finishes."
+        self.insertButton = qt.QPushButton("Insert control point on selected curve")
         self.insertButton.checkable = True
-        self.insertButton.toolTip = "启用后，在曲线附近单击即可插入新的可拖动控制点。"
-        self.copyButton = qt.QPushButton("复制最近轮廓到当前切片")
-        self.deleteButton = qt.QPushButton("删除选中轮廓")
+        self.insertButton.toolTip = "When enabled, click near a curve to insert a new draggable control point."
+        self.copyButton = qt.QPushButton("Copy nearest contour to current slice")
+        self.deleteButton = qt.QPushButton("Delete selected contour")
         drawingLayout.addWidget(self.drawButton)
         drawingLayout.addWidget(self.insertButton)
         drawingLayout.addWidget(self.copyButton)
@@ -130,78 +130,78 @@ class SlicerMuscleContoursWidget(
         self.contourList.setSelectionMode(qt.QAbstractItemView.SingleSelection)
         drawingLayout.addWidget(self.contourList)
         self.hintLabel = qt.QLabel(
-            "左键单击逐点绘制，右键闭合；二维仅显示当前层轮廓，三维显示全部轮廓。"
+            "Left click to add points, right click to close; 2D shows only the current-slice contour, 3D shows all contours."
         )
         self.hintLabel.wordWrap = True
         drawingLayout.addWidget(self.hintLabel)
         self.parent.layout().addWidget(drawing)
 
-        positioning = qt.QGroupBox("单序列旋转定位")
+        positioning = qt.QGroupBox("Single-series rotation")
         positioningLayout = qt.QVBoxLayout(positioning)
-        self.locatorRotateButton = qt.QPushButton("拖动定位线旋转切片")
+        self.locatorRotateButton = qt.QPushButton("Drag locator line to rotate slice")
         self.locatorRotateButton.checkable = True
         self.locatorRotateButton.toolTip = (
-            "启用后，在任一二维视图中抓住彩色切片交线并拖动。"
+            "When enabled, grab the colored slice intersection line in any 2D view and drag."
         )
         positioningLayout.addWidget(self.locatorRotateButton)
-        self.alignAcquisitionButton = qt.QPushButton("对齐影像采集平面")
+        self.alignAcquisitionButton = qt.QPushButton("Align to acquisition plane")
         self.alignAcquisitionButton.toolTip = (
-            "使切片视图与 DICOM 原始采集切片方向一致。"
+            "Align slice views to the original DICOM acquisition slice orientation."
         )
-        self.resetOrientationButton = qt.QPushButton("恢复标准解剖方向")
+        self.resetOrientationButton = qt.QPushButton("Restore standard anatomical orientation")
         self.resetOrientationButton.toolTip = (
-            "恢复 Red=轴向、Yellow=矢状、Green=冠状。"
+            "Restore Red=axial, Yellow=sagittal, Green=coronal."
         )
         positioningLayout.addWidget(self.alignAcquisitionButton)
         positioningLayout.addWidget(self.resetOrientationButton)
-        self.showLocatorPlanesCheckBox = qt.QCheckBox("显示 3D 定位面")
+        self.showLocatorPlanesCheckBox = qt.QCheckBox("Show 3D locator planes")
         self.showLocatorPlanesCheckBox.checked = True
         positioningLayout.addWidget(self.showLocatorPlanesCheckBox)
         brightnessRow = qt.QHBoxLayout()
-        brightnessRow.addWidget(qt.QLabel("定位面亮度/透明度："))
+        brightnessRow.addWidget(qt.QLabel("Locator plane brightness/opacity:"))
         self.locatorPlaneBrightnessSlider = qt.QSlider(qt.Qt.Horizontal)
         self.locatorPlaneBrightnessSlider.minimum = 0
         self.locatorPlaneBrightnessSlider.maximum = 100
         self.locatorPlaneBrightnessSlider.value = 25
         self.locatorPlaneBrightnessSlider.toolTip = (
-            "调整三维定位面的填充强度；0 为仅显示边框。"
+            "Adjust 3D locator plane fill intensity; 0 shows only the border."
         )
         brightnessRow.addWidget(self.locatorPlaneBrightnessSlider)
         positioningLayout.addLayout(brightnessRow)
         self.parent.layout().addWidget(positioning)
 
-        output = qt.QGroupBox("体积生成")
+        output = qt.QGroupBox("Volume generation")
         outputLayout = qt.QVBoxLayout(output)
-        self.generateButton = qt.QPushButton("插值并生成分割")
+        self.generateButton = qt.QPushButton("Interpolate and generate segmentation")
         self.generateButton.toolTip = (
-            "支持同方向的轴对齐或平行斜切关键层轮廓。"
+            "Supports axis-aligned or parallel oblique key-slice contours in the same direction."
         )
         outputLayout.addWidget(self.generateButton)
         refineRow = qt.QHBoxLayout()
-        refineRow.addWidget(qt.QLabel("调整轮廓所在视图："))
+        refineRow.addWidget(qt.QLabel("Refinement contour view:"))
         self.refineViewComboBox = qt.QComboBox()
         self.refineViewComboBox.addItems(list(SLICE_VIEW_NAMES))
         refineRow.addWidget(self.refineViewComboBox)
         outputLayout.addLayout(refineRow)
         self.addRefinementContourButton = qt.QPushButton(
-            "添加当前层插值调整轮廓"
+            "Add refinement contour on current slice"
         )
         self.addRefinementContourButton.toolTip = (
-            "从已生成分割截取所选视图当前层的边界，转换为可拖动闭合曲线。"
+            "Extract the boundary of the generated segmentation on the selected view's current slice and convert it into a draggable closed curve."
         )
         outputLayout.addWidget(self.addRefinementContourButton)
-        self.showOutput3DCheckBox = qt.QCheckBox("显示当前输出 3D 模型")
+        self.showOutput3DCheckBox = qt.QCheckBox("Show current output 3D model")
         self.showOutput3DCheckBox.checked = True
         outputLayout.addWidget(self.showOutput3DCheckBox)
         self.deleteOutputModelsButton = qt.QPushButton(
-            "删除当前输出的全部 3D 结果"
+            "Delete all 3D results in current output"
         )
         self.deleteOutputModelsButton.toolTip = (
-            "删除当前输出 Segmentation 中的全部 Segment；"
-            "保留轮廓和 Segmentation 节点，可稍后重新生成。"
+            "Delete all segments in the current output segmentation; "
+            "contours and the segmentation node are kept and can be regenerated later."
         )
         outputLayout.addWidget(self.deleteOutputModelsButton)
-        self.outputStatusLabel = qt.QLabel("等待生成")
+        self.outputStatusLabel = qt.QLabel("Waiting to generate")
         self.outputStatusLabel.wordWrap = True
         outputLayout.addWidget(self.outputStatusLabel)
         self.parent.layout().addWidget(output)
@@ -255,7 +255,7 @@ class SlicerMuscleContoursWidget(
         )
         self._drawShortcut.setContext(qt.Qt.ApplicationShortcut)
         self._drawShortcut.connect("activated()", self.toggleDrawShortcut)
-        self.drawButton.toolTip += "　快捷键：D"
+        self.drawButton.toolTip += "  Shortcut: D"
 
         self.addObserver(
             slicer.mrmlScene,
@@ -285,6 +285,8 @@ class SlicerMuscleContoursWidget(
         self.removeThreeDPointPickObservers()
         self.removeSliceObservers()
         self.removeObservers()
+        if self.logic is not None:
+            self.logic.cleanup()
         if self._drawShortcut is not None:
             self._drawShortcut.setParent(None)
             self._drawShortcut = None
@@ -294,14 +296,36 @@ class SlicerMuscleContoursWidget(
         self.installSliceObservers()
         self.ensureLocatorPlanes()
         self.installThreeDPointPickObservers()
+        if self._drawShortcut is not None:
+            self._drawShortcut.setEnabled(True)
         self.refreshContourList()
         self.updateContourVisibility()
 
     def exit(self):
-        pass
+        # Slicer calls exit() on every module switch, but cleanup() only on
+        # widget destruction. Tear down all interactor observers, cancel any
+        # in-progress placement and reset the toggle buttons here so this
+        # module does not keep intercepting left clicks or the "D" hotkey
+        # while the user is working in another module (e.g. SlicerNNInteractive).
+        self.endClickPlacement(cancelIncomplete=True)
+        self.removeInsertObservers()
+        self.removeLocatorRotationObservers()
+        self.removeThreeDPointPickObservers()
+        self.removeSliceObservers()
+        self.removeLocatorPlanes()
+        for button in (
+            self.drawButton,
+            self.insertButton,
+            self.locatorRotateButton,
+        ):
+            blocked = button.blockSignals(True)
+            button.checked = False
+            button.blockSignals(blocked)
+        if self._drawShortcut is not None:
+            self._drawShortcut.setEnabled(False)
 
     def onReloadModule(self):
-        slicer.util.showStatusMessage("正在更新 Muscle Contours 模块…", 2000)
+        slicer.util.showStatusMessage("Reloading Muscle Contours module...", 2000)
         slicer.util.reloadScriptedModule("SlicerMuscleContours")
 
     def installSliceObservers(self):
@@ -449,18 +473,18 @@ class SlicerMuscleContoursWidget(
         if not hasattr(self, "referenceStatusLabel"):
             return
         if volume is None:
-            self.referenceStatusLabel.text = "尚未选择参考影像"
+            self.referenceStatusLabel.text = "No reference image selected"
             self.refreshContourList()
             return
         imageData = volume.GetImageData()
         if imageData is None:
-            self.referenceStatusLabel.text = "所选节点没有可用的体素数据"
+            self.referenceStatusLabel.text = "The selected node has no usable voxel data"
             self.refreshContourList()
             return
         dimensions = imageData.GetDimensions()
         spacing = volume.GetSpacing()
         self.referenceStatusLabel.text = (
-            "已选择：{}　尺寸：{}×{}×{}　间距：{:.3g}×{:.3g}×{:.3g} mm"
+            "Selected: {}  Dimensions: {}x{}x{}  Spacing: {:.3g}x{:.3g}x{:.3g} mm"
         ).format(
             volume.GetName(),
             dimensions[0],
@@ -473,8 +497,9 @@ class SlicerMuscleContoursWidget(
 
         applicationLogic = slicer.app.applicationLogic()
         selectionNode = applicationLogic.GetSelectionNode()
-        selectionNode.SetReferenceActiveVolumeID(volume.GetID())
-        applicationLogic.PropagateVolumeSelection(0)
+        if selectionNode is not None:
+            selectionNode.SetReferenceActiveVolumeID(volume.GetID())
+            applicationLogic.PropagateVolumeSelection(0)
 
         layoutManager = slicer.app.layoutManager()
         for viewName in SLICE_VIEW_NAMES:
@@ -495,7 +520,7 @@ class SlicerMuscleContoursWidget(
         self.refreshContourList()
         self.updateContourVisibility()
         slicer.util.showStatusMessage(
-            "参考影像已切换为：{}".format(volume.GetName()), 3000
+            "Reference image switched to: {}".format(volume.GetName()), 3000
         )
 
     def ensureOutputSegmentation(self, volume):
@@ -547,24 +572,24 @@ class SlicerMuscleContoursWidget(
         if displayNode is not None:
             displayNode.SetVisibility3D(bool(visible))
         self.outputStatusLabel.text = (
-            "当前输出 3D 模型已显示"
+            "Current output 3D model shown"
             if visible
-            else "当前输出 3D 模型已隐藏"
+            else "Current output 3D model hidden"
         )
 
     def onDeleteAllOutputModels(self):
         segmentation = self.segmentationSelector.currentNode()
         if segmentation is None:
-            slicer.util.errorDisplay("请先选择要清理的输出 Segmentation。")
+            slicer.util.errorDisplay("Please select the output segmentation to clear first.")
             return
         segmentIds = vtk.vtkStringArray()
         segmentation.GetSegmentation().GetSegmentIDs(segmentIds)
         if segmentIds.GetNumberOfValues() == 0:
-            self.outputStatusLabel.text = "当前输出中没有可删除的 3D 结果。"
+            self.outputStatusLabel.text = "No 3D results to delete in the current output."
             return
         if not slicer.util.confirmYesNoDisplay(
-            "确定删除当前输出 Segmentation 中的全部生成结果吗？\n"
-            "绘制轮廓会保留，可稍后重新生成。"
+            "Delete all generated results in the current output segmentation?\n"
+            "Drawn contours are kept and can be regenerated later."
         ):
             return
         idsToRemove = [
@@ -575,7 +600,7 @@ class SlicerMuscleContoursWidget(
             segmentation.GetSegmentation().RemoveSegment(segmentId)
         segmentation.Modified()
         self.outputStatusLabel.text = (
-            "已删除当前输出的全部 3D 结果；绘制轮廓仍保留。"
+            "Deleted all 3D results in the current output; drawn contours are kept."
         )
 
     @staticmethod
@@ -606,7 +631,7 @@ class SlicerMuscleContoursWidget(
         volume = self.referenceSelector.currentNode()
         if volume is None:
             if showStatus:
-                slicer.util.errorDisplay("请先选择参考影像。")
+                slicer.util.errorDisplay("Please select a reference image first.")
             return
         layoutManager = slicer.app.layoutManager()
         if self.volumeIsOblique(volume):
@@ -626,7 +651,7 @@ class SlicerMuscleContoursWidget(
             self.resetViewsToStandardOrientation(showStatus=False)
         self.enableSliceIntersections()
         if showStatus:
-            slicer.util.showStatusMessage("切片视图已对齐影像采集平面。", 3000)
+            slicer.util.showStatusMessage("Slice views aligned to the acquisition plane.", 3000)
 
     def resetViewsToStandardOrientation(self, showStatus=True):
         """Discard manual locator rotations and restore anatomical views."""
@@ -657,7 +682,7 @@ class SlicerMuscleContoursWidget(
                 pass
         self.enableSliceIntersections()
         if showStatus:
-            slicer.util.showStatusMessage("已恢复标准解剖方向。", 3000)
+            slicer.util.showStatusMessage("Restored standard anatomical orientation.", 3000)
 
     def ensureLocatorPlanes(self):
         """Create one translucent 3D model for each standard slice plane."""
@@ -671,9 +696,15 @@ class SlicerMuscleContoursWidget(
                 model = slicer.mrmlScene.AddNewNodeByClass(
                     "vtkMRMLModelNode", LOCATOR_PLANE_MODEL_NAMES[viewName]
                 )
+            # A model restored from a saved scene (found by name above) may have
+            # no display node, so ensure one exists on every branch.
+            if model.GetDisplayNode() is None:
                 model.CreateDefaultDisplayNodes()
-                model.SetHideFromEditors(True)
+            model.SetHideFromEditors(True)
             display = model.GetDisplayNode()
+            if display is None:
+                self._locatorPlaneModels[viewName] = model
+                continue
             color = LOCATOR_PLANE_COLORS[viewName]
             display.SetColor(*color)
             display.SetEdgeColor(*color)
@@ -785,18 +816,18 @@ class SlicerMuscleContoursWidget(
             self.locatorRotateButton.checked = False
         volume = self.referenceSelector.currentNode()
         if not volume:
-            slicer.util.errorDisplay("请先选择参考影像。")
+            slicer.util.errorDisplay("Please select a reference image first.")
             self.drawButton.checked = False
             return
         group = self.groupName.text.strip()
         if not group:
-            slicer.util.errorDisplay("请输入肌肉名称。")
+            slicer.util.errorDisplay("Please enter a muscle name.")
             self.drawButton.checked = False
             return
         segmentation = self.ensureOutputSegmentation(volume)
         viewName, sliceNode = self.activeSlice()
         if not sliceNode:
-            slicer.util.errorDisplay("未找到可用的二维切片视图。")
+            slicer.util.errorDisplay("No usable 2D slice view found.")
             self.drawButton.checked = False
             return
         try:
@@ -836,7 +867,7 @@ class SlicerMuscleContoursWidget(
         self.drawButton.checked = False
         self.drawButton.blockSignals(blocked)
         slicer.util.showStatusMessage(
-            "切片已翻页，闭合轮廓绘制模式已自动关闭。", 3000
+            "Slice changed; closed-contour drawing mode was turned off automatically.", 3000
         )
 
     def beginClickPlacement(self, node, viewName):
@@ -846,7 +877,7 @@ class SlicerMuscleContoursWidget(
         widget = layoutManager.sliceWidget(viewName) if layoutManager else None
         interactor = widget.sliceView().interactor() if widget else None
         if interactor is None:
-            raise ValueError("当前二维视图没有可用的鼠标交互器。")
+            raise ValueError("The current 2D view has no usable mouse interactor.")
         self._placingNode = node
         self._placingViewName = viewName
         leftHolder, rightHolder = {}, {}
@@ -873,7 +904,7 @@ class SlicerMuscleContoursWidget(
         interactionNode = slicer.app.applicationLogic().GetInteractionNode()
         interactionNode.SetCurrentInteractionMode(interactionNode.ViewTransform)
         slicer.util.showStatusMessage(
-            "左键单击逐点绘制，右键结束闭合轮廓。", 5000
+            "Left click to add points, right click to close the contour.", 5000
         )
 
     def onPlacementClick(self, caller, tag):
@@ -917,6 +948,7 @@ class SlicerMuscleContoursWidget(
             and node.GetNumberOfControlPoints() < 3
             and node.GetScene() is not None
         ):
+            self.logic.unobserveContour(node)
             slicer.mrmlScene.RemoveNode(node)
         self.refreshContourList()
 
@@ -933,7 +965,7 @@ class SlicerMuscleContoursWidget(
             self.locatorRotateButton.checked = False
         node = self.selectedContour()
         if node is None:
-            slicer.util.errorDisplay("请先在列表中选择一个轮廓。")
+            slicer.util.errorDisplay("Please select a contour in the list first.")
             self.insertButton.checked = False
             return
         layoutManager = slicer.app.layoutManager()
@@ -952,7 +984,7 @@ class SlicerMuscleContoursWidget(
             )
             holder["tag"] = tag
             self._insertObservers.append((interactor, tag))
-        slicer.util.showStatusMessage("请在选中轮廓的曲线附近单击。", 4000)
+        slicer.util.showStatusMessage("Click near the selected contour's curve.", 4000)
 
     def removeInsertObservers(self):
         for interactor, tag in self._insertObservers:
@@ -992,7 +1024,7 @@ class SlicerMuscleContoursWidget(
             )
             source = contours[-1] if contours else None
         if not volume or not source:
-            slicer.util.errorDisplay("请先选择或绘制一个源轮廓。")
+            slicer.util.errorDisplay("Please select or draw a source contour first.")
             return
         viewName, sliceNode = self.activeSlice()
         if not sliceNode:
@@ -1020,6 +1052,7 @@ class SlicerMuscleContoursWidget(
                     and displayNode.GetAttribute(self.logic.ATTR_3D_DISPLAY) == "1"
                 ):
                     auxiliaryDisplays.append(displayNode)
+            self.logic.unobserveContour(node)
             slicer.mrmlScene.RemoveNode(node)
             for displayNode in auxiliaryDisplays:
                 if displayNode.GetScene() is not None:
@@ -1044,7 +1077,7 @@ class SlicerMuscleContoursWidget(
         if removed:
             segmentation.Modified()
             self.outputStatusLabel.text = (
-                "已删除轮廓及旧的“{}”三维分割，请按需重新生成。".format(group)
+                "Deleted the contour and the old '{}' 3D segmentation; regenerate as needed.".format(group)
             )
 
     @staticmethod
@@ -1109,7 +1142,7 @@ class SlicerMuscleContoursWidget(
                 ]
             )
         slicer.util.showStatusMessage(
-            "抓住二维视图中的彩色定位线并拖动旋转。", 5000
+            "Grab the colored locator line in a 2D view and drag to rotate.", 5000
         )
 
     def removeLocatorRotationObservers(self):
@@ -1293,10 +1326,10 @@ class SlicerMuscleContoursWidget(
         volume = self.referenceSelector.currentNode()
         group = self.groupName.text.strip()
         if not volume or not group:
-            slicer.util.errorDisplay("请选择参考影像并输入肌肉名称。")
+            slicer.util.errorDisplay("Please select a reference image and enter a muscle name.")
             return
         self.generateButton.enabled = False
-        self.outputStatusLabel.text = "正在栅格化轮廓并生成分割…"
+        self.outputStatusLabel.text = "Rasterizing contours and generating segmentation..."
         slicer.app.processEvents()
         try:
             segmentation = self.ensureOutputSegmentation(volume)
@@ -1311,15 +1344,15 @@ class SlicerMuscleContoursWidget(
             segmentation.GetDisplayNode().SetSegmentVisibility(segmentId, True)
             if self.logic.lastFusionUsedFallback:
                 self.outputStatusLabel.text = (
-                    "生成完成：{}（方向交集为空，已使用并集融合）".format(group)
+                    "Generated: {} (direction consensus empty, used union fusion)".format(group)
                 )
             else:
-                self.outputStatusLabel.text = "生成完成：{}".format(group)
+                self.outputStatusLabel.text = "Generated: {}".format(group)
             slicer.util.showStatusMessage(
-                "已生成分割：{}".format(group), 4000
+                "Segmentation generated: {}".format(group), 4000
             )
         except (ValueError, RuntimeError) as exc:
-            self.outputStatusLabel.text = "生成失败：{}".format(exc)
+            self.outputStatusLabel.text = "Generation failed: {}".format(exc)
             slicer.util.errorDisplay(str(exc))
         finally:
             self.generateButton.enabled = True
@@ -1332,14 +1365,14 @@ class SlicerMuscleContoursWidget(
         viewName = self.refineViewComboBox.currentText
         if volume is None or segmentation is None or not group:
             slicer.util.errorDisplay(
-                "请先选择参考影像、输出分割，并完成一次插值生成。"
+                "Please select a reference image and output segmentation, and run interpolation once first."
             )
             return
         layoutManager = slicer.app.layoutManager()
         sliceWidget = layoutManager.sliceWidget(viewName) if layoutManager else None
         sliceNode = sliceWidget.mrmlSliceNode() if sliceWidget else None
         if sliceNode is None:
-            slicer.util.errorDisplay("所选二维视图不可用。")
+            slicer.util.errorDisplay("The selected 2D view is unavailable.")
             return
         try:
             existing = self.logic.findContourOnPlane(
@@ -1347,7 +1380,7 @@ class SlicerMuscleContoursWidget(
             )
             if existing is not None:
                 self.selectNode(existing, navigate=False)
-                self.outputStatusLabel.text = "当前层已有关键轮廓，已选中。"
+                self.outputStatusLabel.text = "The current slice already has a key contour; it is now selected."
                 return
             index, origin, normal = self.logic.sliceDescription(volume, sliceNode)
             node = self.logic.createRefinementContour(
@@ -1363,10 +1396,10 @@ class SlicerMuscleContoursWidget(
             self.selectNode(node, navigate=False)
             self.updateContourVisibility()
             self.outputStatusLabel.text = (
-                "调整轮廓已添加；拖动控制点后再次点击“插值并生成分割”。"
+                "Refinement contour added; after dragging control points, click 'Interpolate and generate segmentation' again."
             )
         except (ValueError, RuntimeError) as exc:
-            self.outputStatusLabel.text = "添加调整轮廓失败：{}".format(exc)
+            self.outputStatusLabel.text = "Failed to add refinement contour: {}".format(exc)
             slicer.util.errorDisplay(str(exc))
 
     def selectedContour(self):
@@ -1493,7 +1526,10 @@ class SlicerMuscleContoursWidget(
         self.jumpToContourPlane(bestNode)
         self.abortInteractorEvent(caller, tag)
 
+    @vtk.calldata_type(vtk.VTK_OBJECT)
     def onSceneNodeChanged(self, caller=None, event=None, node=None):
+        # Without the calldata_type decorator, node is always None and the
+        # IsA() filter is dead, refreshing on every scene change.
         if node is None or node.IsA("vtkMRMLMarkupsClosedCurveNode"):
             qt.QTimer.singleShot(0, self.refreshContourList)
 
@@ -1510,7 +1546,7 @@ class SlicerMuscleContoursWidget(
         )
         for node in contourNodes:
             item = qt.QListWidgetItem(
-                "{} · {} · 第 {} 层".format(
+                "{} - {} - slice {}".format(
                     node.GetAttribute(self.logic.ATTR_GROUP),
                     node.GetAttribute(self.logic.ATTR_VIEW),
                     node.GetAttribute(self.logic.ATTR_SLICE_INDEX),
@@ -1519,7 +1555,9 @@ class SlicerMuscleContoursWidget(
             item.setData(qt.Qt.UserRole, node.GetID())
             self.contourList.addItem(item)
             if node.GetID() == selectedId:
+                blocked = self.contourList.blockSignals(True)
                 self.contourList.setCurrentItem(item)
+                self.contourList.blockSignals(blocked)
 
     def updateContourVisibility(self):
         self.logic.updateContourVisibility(
@@ -1562,7 +1600,7 @@ class SlicerMuscleContoursLogic(
         vector = np.asarray(vector, dtype=float)
         length = np.linalg.norm(vector)
         if length < 1e-9:
-            raise ValueError("切片平面法向量无效。")
+            raise ValueError("Invalid slice plane normal vector.")
         return vector / length
 
     def volumeDirectionAxes(self, volume):
@@ -1591,14 +1629,14 @@ class SlicerMuscleContoursLogic(
         index = int(round(ijk[axis]))
         dims = volume.GetImageData().GetDimensions()
         if index < 0 or index >= dims[axis]:
-            raise ValueError("当前切片位于参考影像范围之外。")
+            raise ValueError("The current slice is outside the reference image extent.")
         return index, origin, normal
 
     def insertControlPointNearCurve(self, node, worldPosition):
         """Insert a control point into the nearest control-polygon segment."""
         count = node.GetNumberOfControlPoints()
         if count < 3:
-            raise ValueError("轮廓尚未完成，不能插入控制点。")
+            raise ValueError("The contour is not finished; cannot insert a control point.")
         origin = self._parseVector(node.GetAttribute(self.ATTR_PLANE_ORIGIN))
         normal = self._normalize(
             self._parseVector(node.GetAttribute(self.ATTR_PLANE_NORMAL))
@@ -1631,7 +1669,7 @@ class SlicerMuscleContoursLogic(
                 bestIndex = index + 1
                 bestPoint = click
         if bestDistance is None or bestDistance > INSERT_POINT_TOLERANCE_MM:
-            raise ValueError("点击位置离选中曲线太远，请靠近曲线后重试。")
+            raise ValueError("The click is too far from the selected curve; move closer and retry.")
 
         vector = vtk.vtkVector3d(
             float(bestPoint[0]), float(bestPoint[1]), float(bestPoint[2])
@@ -1750,6 +1788,30 @@ class SlicerMuscleContoursLogic(
             self.onContourPointModified,
         )
         self._pointObservers[node.GetID()] = (node, tag)
+
+    def unobserveContour(self, node):
+        if node is None:
+            return
+        entry = self._pointObservers.pop(node.GetID(), None)
+        if entry is None:
+            return
+        observed, tag = entry
+        try:
+            observed.RemoveObserver(tag)
+        except Exception:
+            pass
+
+    def cleanup(self):
+        # These observers are added via raw node.AddObserver (not the
+        # VTKObservationMixin), so removeObservers() does not cover them.
+        # Without this, reloadScriptedModule leaks the old logic via the
+        # surviving contour nodes and projection callbacks stack up.
+        for observed, tag in list(self._pointObservers.values()):
+            try:
+                observed.RemoveObserver(tag)
+            except Exception:
+                pass
+        self._pointObservers = {}
 
     def onContourPointModified(self, node, event=None):
         nodeId = node.GetID()
@@ -1896,7 +1958,7 @@ class SlicerMuscleContoursLogic(
         segmentId = self.findSegmentId(segmentation, segmentName)
         if not segmentId:
             raise ValueError(
-                "输出分割中找不到名为“{}”的片段。".format(segmentName)
+                "No segment named '{}' found in the output segmentation.".format(segmentName)
             )
         representationName = (
             slicer.vtkSegmentationConverter
@@ -1909,7 +1971,7 @@ class SlicerMuscleContoursLogic(
         segment = segmentation.GetSegmentation().GetSegment(segmentId)
         surface = segment.GetRepresentation(representationName)
         if surface is None or surface.GetNumberOfPoints() == 0:
-            raise RuntimeError("生成的分割没有可截取的闭合表面。")
+            raise RuntimeError("The generated segmentation has no closed surface to extract.")
 
         worldSurface = surface
         parentTransform = segmentation.GetParentTransformNode()
@@ -1938,7 +2000,7 @@ class SlicerMuscleContoursLogic(
         intersection = stripper.GetOutput()
         if intersection.GetNumberOfCells() == 0:
             raise ValueError(
-                "当前层没有插值分割边界，请将切片移动到分割体积内部。"
+                "No interpolated segmentation boundary on the current slice; move the slice inside the segmentation volume."
             )
 
         bestLoop = None
@@ -1963,7 +2025,7 @@ class SlicerMuscleContoursLogic(
                 bestLength = length
                 bestLoop = loop
         if bestLoop is None:
-            raise RuntimeError("当前层交线无法组成闭合调整轮廓。")
+            raise RuntimeError("The current-slice intersection cannot form a closed refinement contour.")
 
         controlPoints = self._resampleClosedCurve(bestLoop, 24)
         node = self.createContourNode(
@@ -2073,10 +2135,10 @@ class SlicerMuscleContoursLogic(
     def _contourSliceMask(self, node, volume, axis, index):
         dimensions = volume.GetImageData().GetDimensions()
         if node.GetNumberOfControlPoints() < 3:
-            raise ValueError("轮廓至少需要三个控制点。")
+            raise ValueError("A contour needs at least three control points.")
         curve = node.GetCurveWorld()
         if not curve or curve.GetNumberOfPoints() < 3:
-            raise ValueError("轮廓曲线尚未完成。")
+            raise ValueError("The contour curve is not finished.")
         rasToIjk = vtk.vtkMatrix4x4()
         volume.GetRASToIJKMatrix(rasToIjk)
         points = []
@@ -2127,7 +2189,7 @@ class SlicerMuscleContoursLogic(
     def _resampleClosedCurve(points, sampleCount):
         points = np.asarray(points, dtype=float)
         if len(points) < 3:
-            raise ValueError("闭合曲线采样点不足。")
+            raise ValueError("Not enough sampled points on the closed curve.")
         if np.linalg.norm(points[0] - points[-1]) < 1e-6:
             points = points[:-1]
         closed = np.vstack([points, points[0]])
@@ -2135,7 +2197,7 @@ class SlicerMuscleContoursLogic(
         cumulative = np.concatenate([[0.0], np.cumsum(lengths)])
         total = cumulative[-1]
         if total < 1e-6:
-            raise ValueError("闭合曲线长度无效。")
+            raise ValueError("Invalid closed curve length.")
         targets = np.linspace(0.0, total, sampleCount, endpoint=False)
         result = np.zeros((sampleCount, 3), dtype=float)
         segmentIndex = 0
@@ -2180,20 +2242,20 @@ class SlicerMuscleContoursLogic(
                 math.radians(2.5)
             ):
                 raise ValueError(
-                    "斜切体积生成要求所有关键层互相平行；请保持同一旋转角度后滚动切片。"
+                    "Oblique volume generation requires all key slices to be parallel; keep the same rotation angle and scroll slices."
                 )
             origin = self._parseVector(node.GetAttribute(self.ATTR_PLANE_ORIGIN))
             ordered.append((float(np.dot(origin, referenceNormal)), node))
         ordered.sort(key=lambda item: item[0])
         if ordered[-1][0] - ordered[0][0] < 1e-3:
-            raise ValueError("至少需要两个空间位置不同的关键层轮廓。")
+            raise ValueError("At least two key-slice contours at different spatial positions are required.")
 
         sampleCount = 128
         rings = []
         for _position, node in ordered:
             curve = node.GetCurveWorld()
             if curve is None or curve.GetNumberOfPoints() < 3:
-                raise ValueError("存在尚未完成的轮廓。")
+                raise ValueError("There is an unfinished contour.")
             points = np.asarray(
                 [curve.GetPoint(index) for index in range(curve.GetNumberOfPoints())],
                 dtype=float,
@@ -2306,7 +2368,7 @@ class SlicerMuscleContoursLogic(
             dimensions[2], dimensions[1], dimensions[0]
         )
         if not np.any(mask):
-            raise RuntimeError("斜切轮廓放样后得到空体积，请检查轮廓是否闭合且位于影像范围内。")
+            raise RuntimeError("Lofting the oblique contours produced an empty volume; check that contours are closed and inside the image extent.")
         return np.asarray(mask, dtype=np.uint8)
 
     def _generateDirectionMask(self, contours, volume, axis):
@@ -2332,8 +2394,8 @@ class SlicerMuscleContoursLogic(
         if len(contours) == 1:
             if oblique:
                 raise ValueError(
-                    "单个斜切面轮廓不能独立生成空间约束；"
-                    "请在相同斜切方向再绘制一个层面。"
+                    "A single oblique-plane contour cannot define a spatial constraint on its own; "
+                    "draw another slice in the same oblique direction."
                 )
             node = contours[0]
             index = int(node.GetAttribute(self.ATTR_SLICE_INDEX))
@@ -2354,7 +2416,7 @@ class SlicerMuscleContoursLogic(
                 )
             ordered = sorted(keyMasks)
             if len(ordered) < 2:
-                raise ValueError("至少需要两个不同层面的轮廓。")
+                raise ValueError("At least two contours on different slices are required.")
 
             volumeNumpyShape = tuple(reversed(dimensions))
             mask = np.zeros(volumeNumpyShape, dtype=np.uint8)
@@ -2384,7 +2446,7 @@ class SlicerMuscleContoursLogic(
         self.lastFusionUsedFallback = False
         contours = self.contourNodes(volume, group, segmentation)
         if len(contours) < 2:
-            raise ValueError("至少需要绘制两个关键层轮廓。")
+            raise ValueError("At least two key-slice contours must be drawn.")
 
         contoursByAxis = {}
         for node in contours:
@@ -2442,7 +2504,7 @@ class SlicerMuscleContoursLogic(
                 labelmap, segmentation
             )
             if not success:
-                raise RuntimeError("无法将插值标签图导入分割节点。")
+                raise RuntimeError("Failed to import the interpolated labelmap into the segmentation node.")
             segmentIds = vtk.vtkStringArray()
             segmentation.GetSegmentation().GetSegmentIDs(segmentIds)
             newIds = [
@@ -2451,7 +2513,7 @@ class SlicerMuscleContoursLogic(
                 if segmentIds.GetValue(index) not in idsBefore
             ]
             if not newIds:
-                raise RuntimeError("标签图已导入，但没有创建新的分割片段。")
+                raise RuntimeError("The labelmap was imported but no new segment was created.")
             segmentId = newIds[-1]
             segment = segmentation.GetSegmentation().GetSegment(segmentId)
             segment.SetName(group)

@@ -456,6 +456,12 @@
   ├─ 依赖：输出网格（取整面 / 求层号 / 轴向）+ 当前作用视图轴对齐判定
   ├─ 复用：选区运算撤销栈 + 写回链（_commit_layer_edit），共用「撤销」按钮
   └─ 层间插值复用 SDF 范式（distance_transform_edt）
+
+肌肉轮廓（独立模块 SlicerMuscleContours，与主模块无共享节点）
+  ├─ 隔离：自有持久 MRML 轮廓（ATTR_MANAGED / ROLE_REFERENCE / ROLE_OUTPUT_SEGMENTATION），contourNodes() 不误抓 NN 的 prompt markups
+  ├─ 观察者：绘制 / 插入 / 定位线 / 3D 拾取交互器（priority 10 + abortInteractorEvent）与应用级「D」快捷键，在 enter() 装、exit() 拆/禁用（不泄漏到其他模块）
+  ├─ Logic 自带 cleanup() / unobserveContour()：拆除 raw node.AddObserver 的 PointModified 投影观察者（removeObservers() 不覆盖）
+  └─ 生成：每方向 SDF 插值（distance_transform_edt，numpyAxis = 2 - axis 保证 z,y,x↔x,y,z）→ 多数票共识 / 并集回退 → 导入 Segmentation
 ```
 
 ---
@@ -481,6 +487,8 @@
 | 定位线拾取为近似 | 拾取用「点到候选面的垂距」近似「点到交叉线距离」，强斜面下二者有 1/sin(二面角) 的偏差（容差实际略放宽，不影响命中最近线）；阈值 `LOCATOR_PICK_TOL_MM`(3mm) 可调。注：仅**拾取判定**为近似；命中后的**旋转角已是光标相对十字交点的方位角**，被拖的线精确跟手（非旧的像素增量灵敏度） |
 | 内嵌分段编辑器不随插件本地化 | 嵌入的 `qMRMLSegmentEditorWidget`（各 Effect 名、分段表头、Add/Remove 等）与 `qMRMLNodeComboBox` 的 None/节点名由 Slicer 本体提供，**跟随 Slicer 应用语言**，本插件的 `.ui` 直译与 `zh_CN.json` 改不到它们；要它们中文需把 Slicer 应用语言设为中文（见第十九节） |
 | 逐层编辑仅轴对齐视图 | 跨层复制/层间插值把「层」当作输出网格上的一个 numpy 整面，故只在作用视图的切片法向贴近某输出轴（`OBLIQUE_COS_THRESHOLD`）且非手动旋转时可用，否则提示并拒绝；三平面下若序列采集面与输出网格斜交多半判为未对齐；作用视图取「鼠标所在视图→最近滚动视图→红」，滚轮吸附关闭时无滚动观察者，回退红视图（见第二十节） |
+| 肌肉轮廓模块界面为英文 | 独立模块 `SlicerMuscleContours` 的界面文本/提示/异常**直接英文**，不接入主模块的 `_cn` / `zh_CN.json` 本地化通路；早期内联的中文已转为 ASCII 英文以满足 `check-utf8.yml`。若要中文，应仿主模块迁到 `.ui` + 字符串表（见第二十一节） |
+| 肌肉轮廓插值要求关键层平行 | 斜切方向生成要求同方向所有关键层互相平行（同一旋转角），单个斜切轮廓不能独立约束、至少两层；仅轴对齐方向支持单方向多关键层 SDF 插值。模块在单一参考体积上工作，不参与多序列融合/配准/三平面路由 |
 
 ---
 
@@ -533,6 +541,35 @@
 - `_active_layer_axis` / `_slice_plane_index` / `_commit_layer_edit` / `_copy_adjacent_layer` / `on_copy_from_prev_slice_clicked` / `on_copy_from_next_slice_clicked` / `_fill_between_key_slices` / `on_fill_between_slices_clicked`（`SlicerNNInteractive.py`）
 - UI：`pbCopyFromPrevSlice` / `pbCopyFromNextSlice` / `pbFillBetweenSlices`（`Resources/UI/SlicerNNInteractive.ui`，独立的「逐层编辑」分组 `sliceEditGroup`，位于选区运算组与上传进度组之间）
 - 设计稿：[[slice_by_slice_editing]]
+
+---
+
+## 二十一、独立模块：肌肉轮廓（Muscle Contours） — [[muscle_contours_development]]
+
+### 能做什么
+
+- 一个**独立的 Slicer 脚本模块** `SlicerMuscleContours`（Segmentation 类别，标题 "Muscle Contours"），与 `SlicerNNInteractive` 完全分离、不共用任何节点或推理会话。
+- 在 2D 切片视图（Red/Yellow/Green）逐点单击绘制**可编辑、平滑的闭合轮廓**：每个关键层一个 `vtkMRMLMarkupsClosedCurveNode`，Cardinal Spline 平滑；支持「插入控制点」、控制点拖动后自动投影回创建时的切片平面。
+- 3D 视图显示全部轮廓与只读控制点（屏幕空间 12px 容差拾取 → 选中所属轮廓并跳到对应 2D 层）；轮廓列表与视图双向联动。
+- 单序列定位线拖拽旋转 + 3D 半透明定位面（与主模块同类交互一致）。
+- 在多个关键层之间用**有符号距离场（SDF）插值**生成分割体；多采集方向时按多数票共识融合（共识为空则并集回退）。段颜色按「Segmentation 节点 + 肌肉名」持久化。
+
+### 解决什么问题
+
+- 需要一种**不依赖 AI、纯手动且持久**的关键层轮廓标注 + 体积生成手段：轮廓是持久 MRML 数据，保存场景后可继续编辑，不会被 nnInteractive 的推理清理流程删除；作为 AI 交互之外的补充。
+
+### 实现原理
+
+- **节点隔离**：轮廓按 `ATTR_MANAGED` / `ROLE_REFERENCE` / `ROLE_OUTPUT_SEGMENTATION` 属性与引用归属，`contourNodes()` 只取本模块自己的轮廓，**绝不误抓 NN 的 prompt markups**；临时 labelmap 在 `finally` 清理。
+- **观察者生命周期**：绘制/插入/定位线/3D 拾取都装在 slice/3D 交互器上（priority 10、`abortInteractorEvent`）；这些交互器观察者与**应用级 "D" 快捷键**在 `enter()` 安装、`exit()` 拆除/禁用（`exit()` 不再是空操作），避免切到其他模块后继续拦截左键/热键。控制点投影用 raw `node.AddObserver(PointModifiedEvent)`，不被 `VTKObservationMixin.removeObservers()` 覆盖，故 Logic 自带 `cleanup()` / `unobserveContour()` 显式拆除（widget `cleanup()` 调用 + 删除轮廓时调用），避免 `reloadScriptedModule` 后回调叠加与节点泄漏。
+- **生成管线**：每方向轮廓 → `_contourSliceMask` 栅格化（轴对齐）或 `_loftContoursToMask` 放样（斜切）→ 相邻关键层 2D SDF 线性插值（`scipy.ndimage.distance_transform_edt`，坐标 `numpyAxis = 2 - axis` + `np.moveaxis` 保证 numpy `z,y,x` 与 IJK `x,y,z` 一致）→ `ImportLabelmapToSegmentationNode` 导入 Segmentation。
+
+### 关键入口/跳转
+
+- 模块实现：`slicer_plugin/SlicerMuscleContours/SlicerMuscleContours.py`（`SlicerMuscleContoursWidget` / `SlicerMuscleContoursLogic`）
+- 注册：`slicer_plugin/CMakeLists.txt`（`add_subdirectory(SlicerMuscleContours)` 与对应 `Testing`）
+- 测试：`SlicerMuscleContours/Testing/Python/SlicerMuscleContoursTest.py`（单元）、`SlicerMuscleContoursIntegrationTest.py`（Slicer 内集成，含 SDF 插值/平面约束/复制等断言）
+- 设计稿：[[muscle_contours_development]]
 
 ---
 
